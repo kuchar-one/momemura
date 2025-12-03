@@ -18,7 +18,8 @@ Usage:
 import argparse
 import math
 import numpy as np
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -66,11 +67,14 @@ def decode_genotype(
 
     idx = 0
     # Discrete modes
-    u_sig = np.clip(g[idx], 0.0, 1.0)
+    # u_sig = np.clip(g[idx], 0.0, 1.0) # Unused since n_signal forced to 1
     idx += 1
     u_ctrl = np.clip(g[idx], 0.0, 1.0)
     idx += 1
-    n_signal = int(1 + math.floor(u_sig * (max_signal - 1))) if max_signal > 1 else 1
+
+    # FORCE pure-state pipeline single signal
+    # Note: genotype bits for n_signal are ignored to keep genotype length stable.
+    n_signal = 1
     n_control = (
         int(1 + math.floor(u_ctrl * (max_control - 1))) if max_control > 1 else 1
     )
@@ -188,8 +192,13 @@ def decode_genotype(
 def gaussian_block_builder_from_params(
     params: Dict[str, Any], cutoff: int = DEFAULT_CUTOFF
 ) -> Tuple[np.ndarray, float]:
-    """Build GaussianHeraldCircuit and return signal vector + herald probability."""
-    n_signal = int(params["n_signal"])
+    """
+    Build GaussianHeraldCircuit and return *single-mode* signal vector (length cutoff, complex, normalized)
+    and herald probability. This function enforces n_signal == 1 for pure pipeline.
+    Raises ValueError when herald probability is too small or output isn't a pure vector.
+    """
+    # enforce single signal
+    n_signal = 1
     n_control = int(params["n_control"])
 
     circ = GaussianHeraldCircuit(
@@ -210,46 +219,37 @@ def gaussian_block_builder_from_params(
     state, prob = circ.herald(
         pnr_outcome=params.get("pnr_outcome", None),
         signal_cutoff=int(params.get("signal_cutoff", cutoff)),
-        check_purity=False,
+        check_purity=True,  # ensure walrus can compute pure amplitudes if present
     )
 
-    # Reduce to single-mode vector
-    if n_signal == 1:
-        vec = state.reshape(-1)
-    else:
-        # Multi-mode: marginalize to first mode
-        arr = np.asarray(state)
-        if arr.ndim == 1:
-            vec = arr[:cutoff]
-        else:
-            amp_flat = arr.flatten()
-            probs = np.abs(amp_flat) ** 2
-            c = cutoff
-            marg = np.zeros(c)
-            shape = arr.shape
-            for idx0, p in enumerate(probs):
-                x = idx0 // (c ** (len(shape) - 1))
-                if x < c:
-                    marg[x] += p
-            if marg.sum() > 0:
-                vec = np.sqrt(marg / marg.sum())
-            else:
-                vec = np.zeros(c, dtype=complex)
+    # Expect walrus to return normalized complex amplitudes for signal basis (pure amplitudes).
+    # state may be: 1D amplitude vector (len=cutoff) OR shaped array for multi-mode signals.
+    arr = np.asarray(state)
 
-    vec = np.asarray(vec, dtype=complex)
+    # For pure pipeline we expect 1D amplitude vector for the single signal mode.
+    if arr.ndim == 0:
+        # empty or trivial — treat as invalid
+        raise ValueError("Empty herald output")
+    if arr.ndim > 1:
+        # multi-mode amplitude returned (rare because we set n_signal=1) — error
+        raise ValueError("Herald produced multi-mode amplitudes but n_signal==1")
+
+    vec = arr.reshape(-1)
+    # normalize (numeric safety)
+    norm = np.linalg.norm(vec)
+    if norm <= 0 or prob <= 1e-12:
+        # too-small probability or zero amplitude -> invalid for pure pipeline
+        raise ValueError(f"Herald returned zero or tiny probability: prob={prob:.3e}")
+
+    vec = vec / norm
+
+    # ensure length = cutoff
     if vec.size < cutoff:
         vec = np.concatenate([vec, np.zeros(cutoff - vec.size, dtype=complex)])
-    else:
+    elif vec.size > cutoff:
         vec = vec[:cutoff]
 
-    # Normalize
-    nrm = np.linalg.norm(vec)
-    if nrm > 0:
-        vec = vec / nrm
-    else:
-        vec = np.zeros(cutoff, dtype=complex)
-        vec[0] = 1.0
-    return vec, float(prob)
+    return vec.astype(complex), float(prob)
 
 
 # -------------------------
@@ -264,36 +264,64 @@ class HanamuraMOMEAdapter:
         topology: SuperblockTopology,
         operator: np.ndarray,
         cutoff: int = DEFAULT_CUTOFF,
+        mode: str = "pure",
+        homodyne_resolution: float = 0.01,
     ):
         self.composer = composer
         self.topology = topology
-        self.operator = np.asarray(operator, dtype=complex)
+        self.operator = operator
         self.cutoff = int(cutoff)
+        self.mode = mode
+        self.homodyne_resolution = homodyne_resolution
         if hasattr(composer, "cutoff") and composer.cutoff != self.cutoff:
             raise ValueError("composer.cutoff != operator cutoff")
 
     def evaluate_one(self, genotype: np.ndarray) -> Dict[str, Any]:
         """Evaluate a single genotype and return metrics."""
         params = decode_genotype(genotype, cutoff=self.cutoff)
-        vec, prob_block = gaussian_block_builder_from_params(params, cutoff=self.cutoff)
+
+        # If pure mode, we can optionally enforce n_signal=1 in decode or builder
+        # For now, builder enforces it.
+
+        try:
+            vec, prob_block = gaussian_block_builder_from_params(
+                params, cutoff=self.cutoff
+            )
+        except Exception as e:
+            # invalid genotype: too small prob or other failure -> mark as invalid
+            raise ValueError(f"Invalid block (herald/purity): {e}")
 
         # Replicate per leaf
         n_leaves = self.topology._count_leaves(self.topology.plan)
         fock_vecs = [vec.copy() for _ in range(n_leaves)]
         p_heralds = [prob_block for _ in range(n_leaves)]
 
-        # Evaluate topology
-        final_state, joint_prob = self.topology.evaluate_topology(
-            composer=self.composer,
-            fock_vecs=fock_vecs,
-            p_heralds=p_heralds,
-            homodyne_x=params.get("homodyne_x", None),
-            homodyne_window=params.get("homodyne_window", None),
-            theta=params.get("mix_theta", math.pi / 4.0),
-            phi=params.get("mix_phi", 0.0),
-            exact_mixed=params.get("exact_mixed", False),
-            n_hom_points=201,
-        )
+        # Configure topology evaluation based on mode
+        is_pure_mode = self.mode == "pure"
+
+        # In pure mode, force window to None to ensure pure path
+        h_window = params.get("homodyne_window", None)
+        if is_pure_mode:
+            h_window = None
+
+        try:
+            # Force pure_only True to ensure whole topology remains pure
+            final_state, joint_prob = self.topology.evaluate_topology(
+                composer=self.composer,
+                fock_vecs=fock_vecs,
+                p_heralds=p_heralds,
+                homodyne_x=params.get("homodyne_x", None),
+                homodyne_window=h_window,
+                homodyne_resolution=self.homodyne_resolution if is_pure_mode else None,
+                theta=params.get("mix_theta", math.pi / 4.0),
+                phi=params.get("mix_phi", 0.0),
+                exact_mixed=False,  # allow fast path
+                n_hom_points=201,
+                pure_only=is_pure_mode,
+            )
+        except Exception as e:
+            # topology required mixed-state propagation -> mark invalid
+            raise ValueError(f"Topology not pure for genotype: {e}")
 
         # Apply final rotation
         final_rot = params.get("final_rotation", 0.0)
@@ -345,43 +373,71 @@ class HanamuraMOMEAdapter:
         }
 
     def scoring_fn_batch(
-        self, genotypes: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-        """Batch scoring function returning (fitnesses, descriptors, extras)."""
-        B = genotypes.shape[0]
-        fitnesses = np.zeros((B, 4), dtype=float)  # 4 objectives
-        descriptors = np.zeros((B, 3), dtype=float)  # 3 descriptors
+        self,
+        genotypes: np.ndarray,
+        rng_key: Any,  # jax.random.PRNGKey
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Batched scoring function.
+        Returns:
+          fitnesses: (batch_size, N_objectives)
+          descriptors: (batch_size, N_descriptors)
+          extra_scores: dict of arrays
+        """
+        batch_size = genotypes.shape[0]
+        fitnesses = np.zeros((batch_size, 4))  # 4 objectives
+        descriptors = np.zeros((batch_size, 3))  # 3 descriptors
         extras = []
 
-        for i in range(B):
+        # Parallel evaluation
+        def eval_single(i):
             try:
                 metrics = self.evaluate_one(genotypes[i, :])
+                return i, metrics, None
             except Exception as e:
-                fitnesses[i, :] = -1e12
-                descriptors[i, :] = np.array([9999, 9999, 9999], dtype=float)
-                extras.append({"error": str(e)})
+                return i, None, str(e)
+
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(eval_single, range(batch_size)))
+
+        for i, metrics, error in results:
+            if error:
+                # invalid genotype — mark with -inf fitness so the repertoire cell stays empty
+                # print(f"DEBUG: Genotype invalid: {error}") # Uncomment for debugging
+                fitnesses[i, :] = -np.inf
+                # use a descriptor sentinel outside grid bounds so it cannot populate centroids
+                descriptors[i, :] = np.array([-9999.0, -9999.0, -9999.0], dtype=float)
+                extras.append({"error": error})
                 continue
 
-            expv = metrics["expectation"]
-            log_prob = metrics["log_prob"]
-            complexity = metrics["complexity"]
-            total_ph = metrics["total_measured_photons"]
-            perdet = metrics["per_detector_max"]
+            # Objectives (minimize all)
+            # 1. Expectation (minimize)
+            f_expect = metrics["expectation"]
+            # 2. Log Prob (minimize -logP)
+            f_prob = metrics["log_prob"]
+            # 3. Complexity (minimize)
+            f_complex = float(metrics["complexity"])
+            # 4. Total Photons (minimize)
+            f_photons = float(metrics["total_measured_photons"])
 
-            # QDax maximizes fitness, so we negate minimization objectives
-            # Objectives: [O_expect, O_prob, O_complex, O_photons] (all minimize)
-            f0 = -expv
-            f1 = -log_prob  # Minimize negative log prob (maximize prob)
-            f2 = -complexity
-            f3 = -total_ph
+            fitnesses[i, :] = np.array(
+                [-f_expect, -f_prob, -f_complex, -f_photons]
+            )  # QDax maximizes, so negate to minimize
 
-            fitnesses[i, :] = np.array([f0, f1, f2, f3], dtype=float)
+            # Descriptors (for map)
+            # 1. Total Photons
+            d_total = float(metrics["total_measured_photons"])
+            # 2. Max Photons
+            d_max = float(metrics["per_detector_max"])
+            # 3. Complexity
+            d_complex = float(metrics["complexity"])
 
-            # Descriptors: [total_ph, max_ph, complexity]
-            descriptors[i, :] = np.array([total_ph, perdet, complexity], dtype=float)
+            descriptors[i, :] = np.array([d_total, d_max, d_complex])
             extras.append(metrics)
 
-        return fitnesses, descriptors, extras
+        # Convert extras to dict of arrays (for QDax compatibility if needed, though QDax ignores extras usually)
+        # We just return empty dict or minimal info as QDax MOME doesn't store extras in repertoire
+        return fitnesses, descriptors, {}
 
 
 # -------------------------
@@ -489,7 +545,10 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
     composer = Composer(cutoff=cutoff)
     topology = SuperblockTopology.build_layered(2)
     operator = np.diag(np.arange(cutoff, dtype=float))
-    adapter = HanamuraMOMEAdapter(composer, topology, operator, cutoff=cutoff)
+    # Adapter
+    adapter = HanamuraMOMEAdapter(
+        composer, topology, operator, cutoff=cutoff, mode=mode, homodyne_resolution=0.01
+    )
 
     D = 40  # genotype dimension
 
@@ -527,9 +586,12 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
             if (it + 1) % 5 == 0:
                 print(f"iter {it + 1}/{n_iters}, best f0 so far: {best_f:.6g}")
         print("RANDOM SEARCH DONE. Best found:")
-        print("  fitness:", best[1])
-        print("  descriptor:", best[2])
-        print("  metrics:", best[3])
+        if best is not None:
+            print("  fitness:", best[1])
+            print("  descriptor:", best[2])
+            print("  metrics:", best[3])
+        else:
+            print("  No valid solution found.")
         return best
 
     # QDax MOME mode
@@ -537,9 +599,9 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
 
     # Define scoring function using jax.pure_callback
     def scoring_fn(genotypes, key):
-        def numpy_scorer(genotypes_jax):
+        def numpy_scorer(genotypes_jax, k):
             gen_np = np.asarray(genotypes_jax)
-            fitnesses, descriptors, extras = adapter.scoring_fn_batch(gen_np)
+            fitnesses, descriptors, extras = adapter.scoring_fn_batch(gen_np, k)
             return np.asarray(fitnesses), np.asarray(descriptors)
 
         result_shape = (
@@ -547,7 +609,7 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
             jax.ShapeDtypeStruct((genotypes.shape[0], 3), jnp.float32),  # 3 descriptors
         )
         fitnesses, descriptors = jax.pure_callback(
-            numpy_scorer, result_shape, genotypes
+            numpy_scorer, result_shape, genotypes, key
         )
         return fitnesses, descriptors, {}
 

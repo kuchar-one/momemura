@@ -95,19 +95,21 @@ class Composer:
         pB: float = 1.0,
         homodyne_x: Optional[float] = None,
         homodyne_window: Optional[float] = None,
+        homodyne_resolution: Optional[float] = None,
         theta: float = math.pi / 4.0,
         phi: float = 0.0,
         n_hom_points: int = 201,
     ) -> Tuple[Union[np.ndarray, np.ndarray], float, float]:
-        r"""
+        """
         Compose two single-mode states (each may be either:
            - a 1D complex vector (pure Fock amplitudes length cutoff), or
            - a 2D complex density matrix (cutoff x cutoff)
         Returns:
            - state_out: if pure path -> 1D state vector (length cutoff), else 2D density matrix
-           - p_hom_or_Pwin: for point homodyne -> density p(x), for window -> integrated probability Pwin,
-                             for no homodyne -> 1.0
-           - joint_prob: product pA * pB * (p_hom or Pwin or 1.0)
+           - p_hom_or_Pwin:
+                * If homodyne_resolution is None and homodyne_window is None: returns probability DENSITY p(x).
+                * If homodyne_resolution is set OR homodyne_window is used: returns PROBABILITY (approximate or integrated).
+           - joint_prob: product pA * pB * (p_hom_or_Pwin)
         Behavior notes:
            - If both inputs are pure vectors and homodyne_x is provided (point), this will take the pure-state
              fast path (use U_bs @ (f1 ⊗ f2), compute conditional vector via phi).
@@ -152,13 +154,22 @@ class Composer:
             psi2d = psi_out.reshape((self.cutoff, self.cutoff))  # psi[n1, n2]
             # unnormalized conditional vector for mode1:
             v = psi2d @ phi_vec  # v[n1] = sum_{n2} psi[n1,n2] phi[n2]
-            p_x = float(np.real(np.vdot(v, v)))
-            if p_x > 0:
-                vec_cond = v / math.sqrt(p_x)
+            p_x_density = float(np.real(np.vdot(v, v)))
+
+            # convert density -> probability if resolution provided
+            if homodyne_resolution is None:
+                p_measure = p_x_density  # keep density (analytic mode)
+            else:
+                p_measure = float(
+                    p_x_density * float(homodyne_resolution)
+                )  # approximate probability
+
+            if p_x_density > 0:
+                vec_cond = v / math.sqrt(p_x_density)
             else:
                 vec_cond = np.zeros_like(v)
-            joint = float(pA * pB * p_x)
-            return vec_cond, p_x, joint
+            joint = float(pA * pB * p_measure)
+            return vec_cond, p_measure, joint
 
         # --- Mixed-state / window path: construct densities and propagate exactly ---
         # Convert inputs to densities if needed
@@ -198,13 +209,20 @@ class Composer:
             # point homodyne: contract
             phi_vec = quadrature_vector(self.cutoff, float(homodyne_x), hbar=HBAR)
             new_rho = contract_rho_with_phi(rho_out, phi_vec)
-            p_x = float(np.real(np.trace(new_rho)))
-            if p_x > 0:
-                rho_cond = new_rho / p_x
+            p_x_density = float(np.real(np.trace(new_rho)))
+
+            # convert density -> probability if resolution provided
+            if homodyne_resolution is None:
+                p_measure = p_x_density
+            else:
+                p_measure = float(p_x_density * float(homodyne_resolution))
+
+            if p_x_density > 0:
+                rho_cond = new_rho / p_x_density
             else:
                 rho_cond = np.zeros_like(new_rho)
-            joint = float(pA * pB * p_x)
-            return rho_cond, p_x, joint
+            joint = float(pA * pB * p_measure)
+            return rho_cond, p_measure, joint
 
         # homodyne window: integrate numerically
         xs = np.linspace(
@@ -212,35 +230,64 @@ class Composer:
             homodyne_x + homodyne_window / 2.0,
             int(n_hom_points),
         )
-        p_xs = np.empty_like(xs)
+
+        # Vectorized integration
+        # 1. Compute all quadrature vectors: shape (cutoff, n_points)
+        # quadrature_vector returns (cutoff,), so we stack them.
+        # Optimization: quadrature_vector depends on x.
+        # We can compute them in a loop or vectorize if quadrature_vector supports it (it likely doesn't).
+        # But we can build the matrix V where V[:, i] = phi_vec(xs[i])
+
         c = self.cutoff
-        Racc = np.zeros((c, c), dtype=complex)
-        # We can try to cache new_rho for each x, but let CacheManager handle it keyed by rho_out bytes + x
-        rho_bytes = rho_out.tobytes()
+        V = np.zeros((c, len(xs)), dtype=complex)
         for i, x in enumerate(xs):
-            # try cache
-            key_bytes = rho_bytes + b"|" + repr(float(x)).encode()
-            key_base = _short_hash_bytes(key_bytes)
-            key_red = "red_rho:" + key_base
-            cached = self.cache.get(key_red)
-            if cached is not None:
-                new_rho = cached
-            else:
-                phi_vec = quadrature_vector(self.cutoff, float(x), hbar=HBAR)
-                new_rho = contract_rho_with_phi(rho_out, phi_vec)
-                # persist small reduced matrix
-                if self.cache_enabled:
-                    self.cache.set(key_red, new_rho)
-            p_xs[i] = float(np.real(np.trace(new_rho)))
-            Racc += new_rho
-        dx = xs[1] - xs[0]
+            V[:, i] = quadrature_vector(c, float(x), hbar=HBAR)
+
+        # 2. Contract rho_out with all phi_vecs
+        # rho_out: (c, c)
+        # V: (c, N)
+        # We want p(x) = <phi_x| rho |phi_x> = sum_{mn} phi_x[m]^* rho[m,n] phi_x[n]
+        # Matrix form: diag(V^H @ rho @ V)
+        # Efficiently: sum(V.conj() * (rho @ V), axis=0)
+
+        rho_V = rho_out @ V  # (c, N)
+        p_xs = np.real(np.sum(V.conj() * rho_V, axis=0))  # (N,)
+
+        # 3. Integrate p(x) to get Pwin
         Pwin = float(np.trapz(p_xs, xs))
-        # Racc was sum of unnormalized reduced rhos; multiply by dx to approximate integral
-        Racc = Racc * dx
+
+        # 4. Compute conditional state: integral of (rho_x * p(x)) / Pwin ?
+        # Actually, the conditional state for a window measurement is:
+        # rho_cond = \int dx M_x rho M_x^dag / Pwin
+        # where M_x is the projection |phi_x><phi_x|.
+        # So rho_cond = \int dx |phi_x><phi_x| * p(x)? No.
+        # The POVM element is E = \int dx |phi_x><phi_x|.
+        # The post-measurement state is \int dx (M_x rho M_x^dag).
+        # M_x rho M_x^dag = |phi_x><phi_x| rho |phi_x><phi_x| = |phi_x> p(x) <phi_x|.
+        # So rho_cond = \int dx p(x) |phi_x><phi_x|.
+
+        # We can compute this integral:
+        # Racc = sum_i (p_xs[i] * outer(V[:,i], V[:,i].conj())) * dx
+
+        dx = xs[1] - xs[0]
+
+        # Vectorized Racc accumulation?
+        # Racc = V @ diag(p_xs) @ V.H * dx
+        # V: (c, N)
+        # V * sqrt(p_xs): (c, N) scaled columns
+        # Let W = V * sqrt(p_xs)
+        # Racc = W @ W.H * dx
+
+        # Ensure p_xs is non-negative (numerical noise might make it slightly negative)
+        p_xs_safe = np.maximum(p_xs, 0.0)
+        W = V * np.sqrt(p_xs_safe)[None, :]
+        Racc = W @ W.conj().T * dx
+
         if Pwin > 0:
             rho_cond = Racc / Pwin
         else:
             rho_cond = np.zeros((c, c), dtype=complex)
+
         joint = float(pA * pB * Pwin)
         return rho_cond, Pwin, joint
 
@@ -253,13 +300,14 @@ class Composer:
         pB: float = 1.0,
         homodyne_x: Optional[float] = None,
         homodyne_window: Optional[float] = None,
+        homodyne_resolution: Optional[float] = None,
         theta: float = math.pi / 4.0,
         phi: float = 0.0,
         n_hom_points: int = 201,
     ) -> Tuple[Union[np.ndarray, np.ndarray], float, float]:
         """
         Wrap compose_pair with persistent caching keyed by:
-           (bytes(stateA), bytes(stateB), cutoff, theta, phi, homodyne_x, homodyne_window, n_hom_points)
+           (bytes(stateA), bytes(stateB), cutoff, theta, phi, homodyne_x, homodyne_window, homodyne_resolution, n_hom_points)
         Where states are serialized as bytes (vectors/density mats).
         """
         # stable serialization
@@ -283,6 +331,12 @@ class Composer:
                 else repr(float(homodyne_window)).encode()
             )
             + b"|"
+            + (
+                b"None"
+                if homodyne_resolution is None
+                else repr(float(homodyne_resolution)).encode()
+            )
+            + b"|"
             + repr(int(n_hom_points)).encode()
         )
         key = "compose_pair_v3:" + _short_hash_bytes(key_bytes)
@@ -299,6 +353,7 @@ class Composer:
             pB,
             homodyne_x,
             homodyne_window,
+            homodyne_resolution,
             theta,
             phi,
             n_hom_points,
@@ -374,10 +429,12 @@ class SuperblockTopology:
         p_heralds: List[float],
         homodyne_x: float = 0.0,
         homodyne_window: Optional[float] = None,
+        homodyne_resolution: Optional[float] = None,
         theta: float = math.pi / 4.0,
         phi: float = 0.0,
         exact_mixed: bool = False,
         n_hom_points: int = 201,
+        pure_only: bool = False,
     ) -> Tuple[Union[np.ndarray, np.ndarray], float]:
         """
         Evaluate plan with provided composer.
@@ -444,6 +501,7 @@ class SuperblockTopology:
                                 p_right,
                                 homodyne_x=homodyne_x,
                                 homodyne_window=None,  # pure_possible only if window None
+                                homodyne_resolution=homodyne_resolution,
                                 theta=theta,
                                 phi=phi,
                                 n_hom_points=n_hom_points,
@@ -456,7 +514,30 @@ class SuperblockTopology:
                             return True, state_out, joint
                         else:
                             # got a density -> can't continue pure path above
+                            # If pure_only is enforced, we must fail here!
+                            if pure_only:
+                                raise ValueError(
+                                    "Pure-only mode: failed to maintain purity (mixed state produced)"
+                                )
                             return False, state_out, joint
+
+                # If pure_only is True: require both children are pure vectors and homodyne_window must be None
+                if pure_only:
+                    if not pure_possible:
+                        # Try to diagnose why pure_possible failed
+                        if not (left_pure and right_pure):
+                            raise ValueError("Pure-only mode: child not pure")
+                        if homodyne_window is not None:
+                            raise ValueError(
+                                "Pure-only mode: homodyne window requested (breaks purity)"
+                            )
+                        # If we are here, it means pure_possible was False but maybe because of vecL/vecR check or state_out check
+                        # But if left_pure and right_pure are True, vecL/vecR should be vectors.
+                        # The only other case is if state_out returned density.
+                        # Re-run logic explicitly for error message if needed, or just raise.
+                        raise ValueError(
+                            "Pure-only mode: failed to maintain purity (mixed state produced)"
+                        )
 
                 # else: do exact mixed-state composition
                 # ensure densities for children
@@ -477,6 +558,7 @@ class SuperblockTopology:
                     p_right,
                     homodyne_x=homodyne_x,
                     homodyne_window=homodyne_window,
+                    homodyne_resolution=homodyne_resolution,
                     theta=theta,
                     phi=phi,
                     n_hom_points=n_hom_points,
