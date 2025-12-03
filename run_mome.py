@@ -24,6 +24,13 @@ from functools import partial
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+try:
+    import jax
+    import jax.numpy as jnp
+except ImportError:
+    jax = None
+    jnp = None
+
 # === Project imports ===
 from src.circuits.gaussian_herald_circuit import GaussianHeraldCircuit
 from src.circuits.composer import Composer, SuperblockTopology
@@ -436,8 +443,45 @@ class HanamuraMOMEAdapter:
             extras.append(metrics)
 
         # Convert extras to dict of arrays (for QDax compatibility if needed, though QDax ignores extras usually)
-        # We just return empty dict or minimal info as QDax MOME doesn't store extras in repertoire
-        return fitnesses, descriptors, {}
+        # We return the list of extras for random mode usage.
+        return fitnesses, descriptors, extras
+
+
+# -------------------------
+# Custom Metrics (JAX)
+# -------------------------
+def custom_metrics(repertoire):
+    """Custom metrics for progress tracking."""
+    if jnp is None:
+        return {}
+
+    # Coverage
+    # repertoire.fitnesses shape: (N, Pareto, Objs)
+    # A cell is filled if ANY pareto solution is valid (not -inf)
+    # We check the first objective of the first pareto front item, or better, check if any in pareto dim is valid.
+    # Usually checking [:, 0, 0] is enough if we fill sequentially, but let's be robust.
+    # valid_mask = jnp.any(repertoire.fitnesses[..., 0] != -jnp.inf, axis=1)
+    # Actually, let's just check the first slot of the Pareto front for simplicity and speed, assuming contiguous filling.
+    valid_mask = repertoire.fitnesses[:, 0, 0] != -jnp.inf
+    coverage = jnp.sum(valid_mask) / repertoire.fitnesses.shape[0]
+
+    # Best expectation (min expectation = max fitness[0])
+    # fitness[0] is -expectation
+    # We want max over all cells and all pareto fronts.
+    # Flatten pareto dim
+    flat_fitnesses = repertoire.fitnesses.reshape(-1, repertoire.fitnesses.shape[-1])
+    flat_valid = flat_fitnesses[:, 0] != -jnp.inf
+    min_expectation = -jnp.max(jnp.where(flat_valid, flat_fitnesses[:, 0], -jnp.inf))
+
+    # Best log prob (min log prob = max fitness[1])
+    # fitness[1] is -log_prob
+    min_log_prob = -jnp.max(jnp.where(flat_valid, flat_fitnesses[:, 1], -jnp.inf))
+
+    return {
+        "coverage": coverage,
+        "min_expectation": min_expectation,
+        "min_log_prob": min_log_prob,
+    }
 
 
 # -------------------------
@@ -573,7 +617,7 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
         best_f = -1e99
         for it in range(n_iters):
             pop = np.random.randn(pop_size, D)
-            fitnesses, descs, extras = adapter.scoring_fn_batch(pop)
+            fitnesses, descs, extras = adapter.scoring_fn_batch(pop, None)
             for i in range(pop_size):
                 if fitnesses[i, 0] > best_f:
                     best_f = float(fitnesses[i, 0])
@@ -598,50 +642,47 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
     print("Running QDax MOME...")
 
     # Define scoring function using jax.pure_callback
+    # Define scoring function using jax.pure_callback
     def scoring_fn(genotypes, key):
-        def numpy_scorer(genotypes_jax, k):
+        def numpy_batch_scorer(genotypes_jax, k):
+            """
+            Batched scorer called from JAX host callback.
+            Receives the entire batch of genotypes (B, D).
+            Returns fitnesses (B, N_objs) and descriptors (B, N_descs).
+            """
             gen_np = np.asarray(genotypes_jax)
-            fitnesses, descriptors, extras = adapter.scoring_fn_batch(gen_np, k)
-            return np.asarray(fitnesses), np.asarray(descriptors)
+            print(
+                f"DEBUG: Batch scoring {gen_np.shape[0]} genotypes"
+            )  # Uncomment to verify batching
+
+            # We don't need 'k' here if we aren't using it, or if pure_callback doesn't pass it.
+            # The original code passed 'key' to pure_callback, so we should accept it if we want to be consistent,
+            # BUT pure_callback(callback, result_shape, *args) passes *args to callback.
+            # In the call below: jax.pure_callback(numpy_batch_scorer, result_shape, genotypes, key)
+            # So numpy_batch_scorer receives (genotypes, key).
+            fitnesses, descriptors, extras = adapter.scoring_fn_batch(
+                gen_np, None
+            )  # We don't use key in batch scorer yet
+            return np.asarray(fitnesses, dtype=np.float32), np.asarray(
+                descriptors, dtype=np.float32
+            )
 
         result_shape = (
             jax.ShapeDtypeStruct((genotypes.shape[0], 4), jnp.float32),  # 4 objectives
             jax.ShapeDtypeStruct((genotypes.shape[0], 3), jnp.float32),  # 3 descriptors
         )
         fitnesses, descriptors = jax.pure_callback(
-            numpy_scorer, result_shape, genotypes, key
+            numpy_batch_scorer, result_shape, genotypes, key
         )
         return fitnesses, descriptors, {}
-
-    # Custom metrics function
-    def custom_metrics(repertoire):
-        """Custom metrics for progress tracking."""
-        # Coverage
-        valid_mask = repertoire.fitnesses[:, 0] != -jnp.inf
-        coverage = jnp.sum(valid_mask) / repertoire.fitnesses.shape[0]
-
-        # Best expectation (min expectation = max fitness[0])
-        # fitness[0] is -expectation
-        min_expectation = -jnp.max(
-            jnp.where(valid_mask, repertoire.fitnesses[:, 0], -jnp.inf)
-        )
-
-        # Best log prob (min log prob = max fitness[1])
-        # fitness[1] is -log_prob
-        min_log_prob = -jnp.max(
-            jnp.where(valid_mask, repertoire.fitnesses[:, 1], -jnp.inf)
-        )
-
-        return {
-            "coverage": coverage,
-            "min_expectation": min_expectation,
-            "min_log_prob": min_log_prob,
-        }
 
     metrics_function = custom_metrics
 
     # Initialize RNG
-    key = jax.random.key(seed)
+    if jax is None:
+        print("JAX not found, cannot run QDax mode.")
+        return
+    key = jax.random.PRNGKey(seed)
 
     # Create initial population
     key, subkey = jax.random.split(key)
@@ -748,7 +789,7 @@ if __name__ == "__main__":
         "--mode", choices=["random", "qdax"], default="random", help="Run mode"
     )
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--pop", type=int, default=16)
+    parser.add_argument("--pop", type=int, default=128)
     parser.add_argument("--seed", type=int, default=12345)
     args = parser.parse_args()
     run(mode=args.mode, n_iters=args.iters, pop_size=args.pop, seed=args.seed)

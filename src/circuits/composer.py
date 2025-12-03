@@ -244,47 +244,32 @@ class Composer:
             V[:, i] = quadrature_vector(c, float(x), hbar=HBAR)
 
         # 2. Contract rho_out with all phi_vecs
-        # rho_out: (c, c)
-        # V: (c, N)
-        # We want p(x) = <phi_x| rho |phi_x> = sum_{mn} phi_x[m]^* rho[m,n] phi_x[n]
-        # Matrix form: diag(V^H @ rho @ V)
-        # Efficiently: sum(V.conj() * (rho @ V), axis=0)
+        # rho_out is (c^2, c^2) corresponding to (a, u, b, v) where u,v are mode B indices
+        # V is (c, N)
+        # We want rho_cond_i[a, b] = sum_{u, v} V[u, i]^* rho[a, u, b, v] V[v, i]
 
-        rho_V = rho_out @ V  # (c, N)
-        p_xs = np.real(np.sum(V.conj() * rho_V, axis=0))  # (N,)
+        c = self.cutoff
+        rho_reshaped = rho_out.reshape((c, c, c, c))
+
+        # Calculate conditional states for all x points
+        # shape (c, c, N)
+        rho_cond_stack = np.einsum("aubv,vi,ui->abi", rho_reshaped, V, V.conj())
+
+        # Calculate p(x) for all x points
+        # p(x) = Tr(rho_cond(x))
+        # shape (N,)
+        p_xs = np.real(np.einsum("aai->i", rho_cond_stack))
 
         # 3. Integrate p(x) to get Pwin
         Pwin = float(np.trapz(p_xs, xs))
 
-        # 4. Compute conditional state: integral of (rho_x * p(x)) / Pwin ?
-        # Actually, the conditional state for a window measurement is:
-        # rho_cond = \int dx M_x rho M_x^dag / Pwin
-        # where M_x is the projection |phi_x><phi_x|.
-        # So rho_cond = \int dx |phi_x><phi_x| * p(x)? No.
-        # The POVM element is E = \int dx |phi_x><phi_x|.
-        # The post-measurement state is \int dx (M_x rho M_x^dag).
-        # M_x rho M_x^dag = |phi_x><phi_x| rho |phi_x><phi_x| = |phi_x> p(x) <phi_x|.
-        # So rho_cond = \int dx p(x) |phi_x><phi_x|.
-
-        # We can compute this integral:
-        # Racc = sum_i (p_xs[i] * outer(V[:,i], V[:,i].conj())) * dx
-
-        dx = xs[1] - xs[0]
-
-        # Vectorized Racc accumulation?
-        # Racc = V @ diag(p_xs) @ V.H * dx
-        # V: (c, N)
-        # V * sqrt(p_xs): (c, N) scaled columns
-        # Let W = V * sqrt(p_xs)
-        # Racc = W @ W.H * dx
-
-        # Ensure p_xs is non-negative (numerical noise might make it slightly negative)
-        p_xs_safe = np.maximum(p_xs, 0.0)
-        W = V * np.sqrt(p_xs_safe)[None, :]
-        Racc = W @ W.conj().T * dx
+        # 4. Compute integrated conditional state
+        # rho_cond = \int dx rho_cond(x)
+        # We integrate rho_cond_stack along axis 2
+        rho_cond_integrated = np.trapz(rho_cond_stack, xs, axis=2)
 
         if Pwin > 0:
-            rho_cond = Racc / Pwin
+            rho_cond = rho_cond_integrated / Pwin
         else:
             rho_cond = np.zeros((c, c), dtype=complex)
 
