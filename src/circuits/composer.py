@@ -19,15 +19,15 @@ import threading
 import os
 import warnings
 
-from src.utils.cache_manager import CacheManager, _short_hash_bytes, _bytes_key_of_array
+from src.utils.cache_manager import CacheManager
 from src.circuits.ops import (
-    HBAR,
-    quadrature_vector,
     build_beamsplitter_unitary,
-    _bs_cache_key,
     kron_state_vector,
     contract_rho_with_phi,
+    get_phi_matrix_cached,
+    HBAR,
 )
+from numpy.polynomial.legendre import leggauss
 
 # Silence potential strawberryfields deprecation noise in importers if present
 with warnings.catch_warnings():
@@ -35,11 +35,20 @@ with warnings.catch_warnings():
 
 
 # Project-level cache directory
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Project-level cache directory
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 CACHE_DIR = os.path.join(_PROJECT_ROOT, "cache")
 global_composer_cache = CacheManager(
     cache_dir=CACHE_DIR, size_limit_bytes=1024 * 1024 * 1024
 )
+
+# Global in-memory cache for beam splitter unitaries to persist across Composer instances
+# Key: (cutoff, theta, phi)
+# Value: np.ndarray
+_GLOBAL_BS_CACHE = {}
+_GLOBAL_BS_CACHE_LIMIT = 1000
 
 
 # -----------------------------------------------------------
@@ -69,19 +78,39 @@ class Composer:
         self._U_cache_local = {}
         self._engine_lock = threading.Lock()
 
+        # Cache for leggauss nodes/weights
+        self._leggauss_cache = {}
+
     # ------------
     # Helpers
     # ------------
     def _u_bs(self, theta: float, phi: float = 0.0) -> np.ndarray:
         """
         Return (and cache) the beamsplitter unitary for current cutoff/theta/phi.
-        Local memory + persistent cache is used.
+        Uses a global in-memory cache to persist across Composer instances.
         """
-        key = _bs_cache_key(self.cutoff, theta, phi)
+        key = (self.cutoff, theta, phi)
+
+        # 1. Check global in-memory cache
+        if key in _GLOBAL_BS_CACHE:
+            return _GLOBAL_BS_CACHE[key]
+
+        # 2. Check local cache (legacy, but fast)
         if key in self._U_cache_local:
             return self._U_cache_local[key]
+
+        # 3. Build (this hits disk cache internally if configured, but we want to avoid that overhead too)
+        # build_beamsplitter_unitary uses the passed cache manager (self.cache)
         U = build_beamsplitter_unitary(self.cutoff, theta, phi, cache=self.cache)
-        self._U_cache_local[key] = U
+
+        # 4. Update global cache
+        if len(_GLOBAL_BS_CACHE) < _GLOBAL_BS_CACHE_LIMIT:
+            _GLOBAL_BS_CACHE[key] = U
+        else:
+            # Simple eviction
+            _GLOBAL_BS_CACHE.pop(next(iter(_GLOBAL_BS_CACHE)))
+            _GLOBAL_BS_CACHE[key] = U
+
         return U
 
     # ------------
@@ -150,7 +179,11 @@ class Composer:
                 return rho_red, 1.0, joint
 
             # homodyne point requested -> pure-state conditional vector (fast)
-            phi_vec = quadrature_vector(self.cutoff, float(homodyne_x), hbar=HBAR)
+            # phi_vec = quadrature_vector(self.cutoff, float(homodyne_x), hbar=HBAR)
+            # Use cached vectorized version even for single point
+            phi_vec = get_phi_matrix_cached(
+                self.cutoff, np.array([float(homodyne_x)]), hbar=HBAR
+            )[:, 0]
             psi2d = psi_out.reshape((self.cutoff, self.cutoff))  # psi[n1, n2]
             # unnormalized conditional vector for mode1:
             v = psi2d @ phi_vec  # v[n1] = sum_{n2} psi[n1,n2] phi[n2]
@@ -207,7 +240,10 @@ class Composer:
         # If we reach here, we must perform homodyne point or window on mode2 (mixed-state approach)
         if homodyne_window is None:
             # point homodyne: contract
-            phi_vec = quadrature_vector(self.cutoff, float(homodyne_x), hbar=HBAR)
+            # phi_vec = quadrature_vector(self.cutoff, float(homodyne_x), hbar=HBAR)
+            phi_vec = get_phi_matrix_cached(
+                self.cutoff, np.array([float(homodyne_x)]), hbar=HBAR
+            )[:, 0]
             new_rho = contract_rho_with_phi(rho_out, phi_vec)
             p_x_density = float(np.real(np.trace(new_rho)))
 
@@ -225,23 +261,40 @@ class Composer:
             return rho_cond, p_measure, joint
 
         # homodyne window: integrate numerically
-        xs = np.linspace(
-            homodyne_x - homodyne_window / 2.0,
-            homodyne_x + homodyne_window / 2.0,
-            int(n_hom_points),
-        )
+        c = self.cutoff
 
         # Vectorized integration
-        # 1. Compute all quadrature vectors: shape (cutoff, n_points)
-        # quadrature_vector returns (cutoff,), so we stack them.
-        # Optimization: quadrature_vector depends on x.
-        # We can compute them in a loop or vectorize if quadrature_vector supports it (it likely doesn't).
-        # But we can build the matrix V where V[:, i] = phi_vec(xs[i])
+        # 1. Integration nodes
+        if homodyne_window is not None:
+            # Use Gauss-Legendre quadrature for window integration
+            # n_hom_points default 201 is for trapz; for Gauss 51 is usually sufficient/better
+            # We use min(n_hom_points, 61) to avoid excessive nodes if user passed 201
+            n_nodes = min(n_hom_points, 61)
 
-        c = self.cutoff
-        V = np.zeros((c, len(xs)), dtype=complex)
-        for i, x in enumerate(xs):
-            V[:, i] = quadrature_vector(c, float(x), hbar=HBAR)
+            # Cache leggauss results
+            if n_nodes in self._leggauss_cache:
+                nodes, weights = self._leggauss_cache[n_nodes]
+            else:
+                nodes, weights = leggauss(n_nodes)
+                self._leggauss_cache[n_nodes] = (nodes, weights)
+
+            # Map [-1, 1] to [x - w/2, x + w/2]
+            half_w = homodyne_window / 2.0
+            center = homodyne_x if homodyne_x is not None else 0.0
+            xs = center + half_w * nodes
+            dx_weights = half_w * weights  # Jacobian is half_w
+
+        else:
+            # Point homodyne: just one point
+            xs = np.array([homodyne_x], dtype=float)
+            dx_weights = np.array(
+                [1.0], dtype=float
+            )  # Not used for point measurement except maybe scaling?
+            # Actually for point measurement we don't integrate, we just take the value.
+
+        # Get quadrature matrix for all xs at once (cached)
+        # V shape: (c, N_points)
+        V = get_phi_matrix_cached(c, xs, hbar=HBAR)
 
         # 2. Contract rho_out with all phi_vecs
         # rho_out is (c^2, c^2) corresponding to (a, u, b, v) where u,v are mode B indices
@@ -260,21 +313,46 @@ class Composer:
         # shape (N,)
         p_xs = np.real(np.einsum("aai->i", rho_cond_stack))
 
-        # 3. Integrate p(x) to get Pwin
-        Pwin = float(np.trapz(p_xs, xs))
+        if homodyne_window is not None:
+            # 3. Integrate p(x) to get Pwin
+            # Pwin = sum(p(x_i) * w_i)
+            Pwin = float(np.sum(p_xs * dx_weights))
 
-        # 4. Compute integrated conditional state
-        # rho_cond = \int dx rho_cond(x)
-        # We integrate rho_cond_stack along axis 2
-        rho_cond_integrated = np.trapz(rho_cond_stack, xs, axis=2)
+            # 4. Compute integrated conditional state
+            # rho_cond = \int dx rho_cond(x)
+            # rho_cond = sum(rho_cond(x_i) * w_i)
+            # rho_cond_stack is (c, c, N), dx_weights is (N,)
+            rho_cond_integrated = np.sum(
+                rho_cond_stack * dx_weights[None, None, :], axis=2
+            )
 
-        if Pwin > 0:
-            rho_cond = rho_cond_integrated / Pwin
+            if Pwin > 0:
+                rho_cond = rho_cond_integrated / Pwin
+            else:
+                rho_cond = np.zeros((c, c), dtype=complex)
+
+            joint = float(pA * pB * Pwin)
+            return rho_cond, Pwin, joint
+
         else:
-            rho_cond = np.zeros((c, c), dtype=complex)
+            # Point homodyne
+            # p(x) is density. To get prob, multiply by resolution if provided.
+            p_val = p_xs[0]
+            rho_cond_unnorm = rho_cond_stack[:, :, 0]
 
-        joint = float(pA * pB * Pwin)
-        return rho_cond, Pwin, joint
+            if homodyne_resolution is not None:
+                prob = p_val * homodyne_resolution
+            else:
+                prob = p_val  # Density treated as prob (legacy behavior or specific use case)
+
+            if p_val > 1e-15:
+                rho_cond = rho_cond_unnorm / p_val
+            else:
+                rho_cond = np.zeros((c, c), dtype=complex)
+                prob = 0.0
+
+            joint = float(pA * pB * prob)
+            return rho_cond, prob, joint
 
     # convenience wrapper that caches on input bytes + params
     def compose_pair_cached(
@@ -295,43 +373,8 @@ class Composer:
            (bytes(stateA), bytes(stateB), cutoff, theta, phi, homodyne_x, homodyne_window, homodyne_resolution, n_hom_points)
         Where states are serialized as bytes (vectors/density mats).
         """
-        # stable serialization
-        a_bytes = _bytes_key_of_array(np.ascontiguousarray(stateA))
-        b_bytes = _bytes_key_of_array(np.ascontiguousarray(stateB))
-        key_bytes = (
-            a_bytes
-            + b_bytes
-            + b"|"
-            + str(self.cutoff).encode()
-            + b"|"
-            + repr(float(theta)).encode()
-            + b"|"
-            + repr(float(phi)).encode()
-            + b"|"
-            + (b"None" if homodyne_x is None else repr(float(homodyne_x)).encode())
-            + b"|"
-            + (
-                b"None"
-                if homodyne_window is None
-                else repr(float(homodyne_window)).encode()
-            )
-            + b"|"
-            + (
-                b"None"
-                if homodyne_resolution is None
-                else repr(float(homodyne_resolution)).encode()
-            )
-            + b"|"
-            + repr(int(n_hom_points)).encode()
-        )
-        key = "compose_pair_v3:" + _short_hash_bytes(key_bytes)
-
-        if self.cache_enabled:
-            cached = self.cache.get(key)
-            if cached is not None:
-                return cached
-
-        res = self.compose_pair(
+        # Bypass caching due to high overhead and low hit rate in continuous optimization
+        return self.compose_pair(
             stateA,
             stateB,
             pA,
@@ -343,9 +386,6 @@ class Composer:
             phi,
             n_hom_points,
         )
-        if self.cache_enabled:
-            self.cache.set(key, res)
-        return res
 
     def clear_caches(self):
         """Clear the persistent cache (useful between experiments)."""

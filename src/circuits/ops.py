@@ -17,6 +17,7 @@ from scipy.special import eval_hermite, gammaln
 from scipy.linalg import expm
 from src.utils.accel import njit_wrapper as njit
 from src.utils.cache_manager import CacheManager
+from threading import Lock
 
 # -----------------------------------------------------------
 # Global numeric conventions
@@ -43,10 +44,106 @@ def quadrature_wavefunction(n: int, x: float, hbar: float = HBAR) -> float:
 def quadrature_vector(cutoff: int, x: float, hbar: float = HBAR) -> np.ndarray:
     """
     Build the quadrature vector phi_n(x) (length=cutoff) for given x and hbar.
+    DEPRECATED: Use get_phi_matrix_cached for performance.
     """
     return np.array(
         [quadrature_wavefunction(n, x, hbar=hbar) for n in range(cutoff)], dtype=float
     )
+
+
+# -----------------------------------------------------------
+# Vectorized & Cached Quadrature (Stage 3 Optimization)
+# -----------------------------------------------------------
+_QUAD_CACHE = {}
+_QUAD_CACHE_LOCK = Lock()
+
+
+def quadrature_prefactors(cutoff: int, hbar: float = HBAR) -> np.ndarray:
+    """
+    Precompute normalization prefactors for Hermite functions.
+    pref_n = (pi*hbar)^(-1/4) / sqrt(2^n n!)
+    """
+    # compute in log domain for stability
+    log_pref0 = -0.25 * math.log(math.pi * hbar)
+    n = np.arange(cutoff)
+    log_denom = 0.5 * (n * math.log(2.0) + gammaln(n + 1.0))
+    log_pref = log_pref0 - log_denom
+    pref = np.exp(log_pref)  # shape (cutoff,)
+    return pref
+
+
+@njit
+def _hermite_phi_matrix(
+    cutoff: int, xs: np.ndarray, prefactors: np.ndarray, hbar: float
+) -> np.ndarray:
+    """
+    Compute quadrature matrix Phi[n, i] = phi_n(xs[i]) using stable recurrence.
+    JIT-compiled for speed.
+    """
+    N = xs.shape[0]
+    phi = np.zeros((cutoff, N), dtype=np.float64)
+    # transform argument
+    arg = np.empty(N, dtype=np.float64)
+    sqrt_h = math.sqrt(hbar)
+    for i in range(N):
+        arg[i] = xs[i] / sqrt_h
+
+    # compute H_0 and H_1 arrays
+    if cutoff > 0:
+        # H0(x) = 1
+        for i in range(N):
+            phi[0, i] = prefactors[0] * 1.0 * math.exp(-0.5 * arg[i] * arg[i])
+    if cutoff > 1:
+        for i in range(N):
+            H1 = 2.0 * arg[i]
+            phi[1, i] = prefactors[1] * H1 * math.exp(-0.5 * arg[i] * arg[i])
+    # recurrence for n >= 2
+    if cutoff > 2:
+        # maintain arrays for H_{n-2} and H_{n-1} at each x
+        H_nm2 = np.empty(N, dtype=np.float64)
+        H_nm1 = np.empty(N, dtype=np.float64)
+        # initialize
+        for i in range(N):
+            H_nm2[i] = 1.0
+            H_nm1[i] = 2.0 * arg[i]
+        for n in range(2, cutoff):
+            for i in range(N):
+                Hn = 2.0 * arg[i] * H_nm1[i] - 2.0 * (n - 1) * H_nm2[i]
+                phi[n, i] = prefactors[n] * Hn * math.exp(-0.5 * arg[i] * arg[i])
+                # shift
+                H_nm2[i] = H_nm1[i]
+                H_nm1[i] = Hn
+    return phi
+
+
+def get_phi_matrix_cached(
+    cutoff: int, xs: np.ndarray, hbar: float = HBAR
+) -> np.ndarray:
+    """
+    Get the quadrature matrix Phi[n, i] from cache or compute it.
+    Thread-safe.
+    """
+    # Build a stable cache key: quantize xs to 1e-10 or use bytes hash
+    # For window quadrature we often reuse the same xs exactly, so using bytes is fine.
+    # Ensure xs is float64 and contiguous for consistent bytes
+    # Round to 8 decimals to ensure cache hits for slightly varying inputs
+    xs_rounded = np.round(xs, decimals=8)
+    xs_f64 = np.ascontiguousarray(xs_rounded, dtype=np.float64)
+    key = (int(cutoff), float(hbar), xs_f64.tobytes())
+
+    with _QUAD_CACHE_LOCK:
+        res = _QUAD_CACHE.get(key)
+
+    if res is not None:
+        return res
+
+    pref = quadrature_prefactors(cutoff, hbar)
+    Phi = _hermite_phi_matrix(cutoff, xs_f64, pref, hbar)
+
+    with _QUAD_CACHE_LOCK:
+        _QUAD_CACHE[key] = Phi
+
+    return Phi
 
 
 # -----------------------------------------------------------

@@ -44,6 +44,10 @@ global_circuit_cache = CacheManager(
     cache_dir=CACHE_DIR, size_limit_bytes=500 * 1024 * 1024
 )
 
+# In-memory LRU cache for unitaries
+_UNITARY_CACHE = {}
+_UNITARY_CACHE_LIMIT = 20000
+
 # -----------------------------
 # Beam-splitter and mesh builder
 # -----------------------------
@@ -218,13 +222,45 @@ class GaussianHeraldCircuit:
         varphi = params.get("varphi")
         if theta is None or phi is None or varphi is None:
             raise ValueError("params must contain 'theta','phi','varphi' keys.")
-        return interferometer_params_to_unitary(
-            np.asarray(theta, dtype=np.float64),
-            np.asarray(phi, dtype=np.float64),
-            np.asarray(varphi, dtype=np.float64),
-            M,
-            mesh=mesh,
-        )
+
+        # Cache lookup
+        try:
+            t_arr = np.ascontiguousarray(theta, dtype=np.float64)
+            p_arr = np.ascontiguousarray(phi, dtype=np.float64)
+            v_arr = np.ascontiguousarray(varphi, dtype=np.float64)
+
+            # Key: (M, mesh, bytes of params)
+            key = (M, mesh, t_arr.tobytes(), p_arr.tobytes(), v_arr.tobytes())
+
+            if key in _UNITARY_CACHE:
+                return _UNITARY_CACHE[key]
+
+            U = interferometer_params_to_unitary(
+                t_arr,
+                p_arr,
+                v_arr,
+                M,
+                mesh=mesh,
+            )
+
+            if len(_UNITARY_CACHE) < _UNITARY_CACHE_LIMIT:
+                _UNITARY_CACHE[key] = U
+            else:
+                # Evict oldest (dict is ordered by insertion in Python 3.7+)
+                _UNITARY_CACHE.pop(next(iter(_UNITARY_CACHE)))
+                _UNITARY_CACHE[key] = U
+
+            return U
+
+        except Exception:
+            # Fallback
+            return interferometer_params_to_unitary(
+                np.asarray(theta, dtype=np.float64),
+                np.asarray(phi, dtype=np.float64),
+                np.asarray(varphi, dtype=np.float64),
+                M,
+                mesh=mesh,
+            )
 
     def _cache_key_for_unitary(self, U: np.ndarray):
         # cheap stable key: use shape + bytes hash; bytes can be large but OK for small unitaries

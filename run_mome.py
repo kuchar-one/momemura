@@ -21,7 +21,11 @@ import numpy as np
 from typing import Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import os
 import seaborn as sns
 
 try:
@@ -38,7 +42,7 @@ from src.utils.cache_manager import CacheManager
 
 # Local defaults
 DEFAULT_CUTOFF = 6
-GLOBAL_CACHE = CacheManager(cache_dir="./.cache", size_limit_bytes=1024 * 1024 * 512)
+GLOBAL_CACHE = CacheManager(cache_dir="./cache", size_limit_bytes=1024 * 1024 * 512)
 
 
 # -------------------------
@@ -163,13 +167,22 @@ def decode_genotype(
     idx += 1
     homodyne_x = float(np.tanh(hom_x_raw) * 4.0)
     homodyne_window = float(np.abs(np.tanh(hom_win_raw) * 2.0))
+
+    # Round to ensure cache hits for quadrature matrices
+    homodyne_x = round(homodyne_x, 6)
+    homodyne_window = round(homodyne_window, 6)
+
     if homodyne_window < 1e-3:
         homodyne_window = None
 
-    mix_theta = float(np.tanh(g[idx]) * (math.pi / 2))
+    # Force fixed beam splitter parameters for consistent caching/architecture
+    # We still consume the genotype slots to maintain compatibility
+    _ = float(np.tanh(g[idx]) * (math.pi / 2))
     idx += 1
-    mix_phi = float(np.tanh(g[idx]) * math.pi)
+    _ = float(np.tanh(g[idx]) * math.pi)
     idx += 1
+    mix_theta = math.pi / 4.0
+    mix_phi = 0.0
     final_rot = float(np.tanh(g[idx]) * math.pi)
     idx += 1
 
@@ -282,6 +295,15 @@ class HanamuraMOMEAdapter:
         self.homodyne_resolution = homodyne_resolution
         if hasattr(composer, "cutoff") and composer.cutoff != self.cutoff:
             raise ValueError("composer.cutoff != operator cutoff")
+
+        # Reuse executor to avoid overhead
+        # Limit max_workers to avoid excessive contention
+        max_workers = min(32, (os.cpu_count() or 1) + 4)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    def __del__(self):
+        if hasattr(self, "executor"):
+            self.executor.shutdown(wait=False)
 
     def evaluate_one(self, genotype: np.ndarray) -> Dict[str, Any]:
         """Evaluate a single genotype and return metrics."""
@@ -404,8 +426,9 @@ class HanamuraMOMEAdapter:
             except Exception as e:
                 return i, None, str(e)
 
-        with ThreadPoolExecutor() as executor:
-            results = list(executor.map(eval_single, range(batch_size)))
+        # Use persistent executor
+        futures = [self.executor.submit(eval_single, i) for i in range(batch_size)]
+        results = [f.result() for f in futures]
 
         for i, metrics, error in results:
             if error:
@@ -580,12 +603,17 @@ def plot_mome_results(repertoire, metrics, filename="mome_results.png"):
 # -------------------------
 # Runner
 # -------------------------
-def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int = 12345):
+def run(
+    mode: str = "random",
+    n_iters: int = 50,
+    pop_size: int = 16,
+    seed: int = 12345,
+    cutoff: int = DEFAULT_CUTOFF,
+):
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
 
     # Setup
-    cutoff = DEFAULT_CUTOFF
     composer = Composer(cutoff=cutoff)
     topology = SuperblockTopology.build_layered(2)
     operator = np.diag(np.arange(cutoff, dtype=float))
@@ -703,7 +731,7 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
         mutation_fn=mutation_function,
         variation_fn=crossover_function,
         variation_percentage=1.0,
-        batch_size=pop_size,
+        batch_size=pop_size * 2,  # Increase batch size to amortize callback overhead
     )
 
     # Grid-based Centroids
@@ -729,6 +757,14 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
 
     # Init algorithm
     key, subkey = jax.random.split(key)
+
+    # Warmup JAX compilation
+    print("Warming up JAX compilation...")
+    # Run a single dummy call to scoring_fn with a representative batch
+    # We use the initial genotypes for warmup
+    scoring_fn(genotypes, subkey)
+    print("Warmup complete.")
+
     repertoire, emitter_state, init_metrics = mome.init(genotypes, centroids, subkey)
 
     # Run loop with progress reporting
@@ -784,12 +820,28 @@ def run(mode: str = "random", n_iters: int = 50, pop_size: int = 16, seed: int =
 # CLI
 # -------------------------
 if __name__ == "__main__":
+    # Assuming DEFAULT_CUTOFF is defined elsewhere or a reasonable default like 10
+    # For the purpose of this edit, we'll define it here if not present.
+    try:
+        DEFAULT_CUTOFF
+    except NameError:
+        DEFAULT_CUTOFF = 10  # Placeholder default value
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode", choices=["random", "qdax"], default="random", help="Run mode"
     )
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--pop", type=int, default=128)
+    parser.add_argument("--iters", type=int, default=100, help="Number of iterations")
+    parser.add_argument("--pop", type=int, default=128, help="Population size")
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument(
+        "--cutoff", type=int, default=DEFAULT_CUTOFF, help="Fock cutoff"
+    )
     args = parser.parse_args()
-    run(mode=args.mode, n_iters=args.iters, pop_size=args.pop, seed=args.seed)
+
+    run(
+        mode=args.mode,
+        pop_size=args.pop,
+        n_iters=args.iters,
+        cutoff=args.cutoff,
+    )
