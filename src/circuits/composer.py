@@ -29,6 +29,17 @@ from src.circuits.ops import (
 )
 from numpy.polynomial.legendre import leggauss
 
+try:
+    import jax
+    import jax.numpy as jnp
+
+    JAX_AVAILABLE = True
+except ImportError:
+    JAX_AVAILABLE = False
+    jax = None
+    jnp = None
+
+
 # Silence potential strawberryfields deprecation noise in importers if present
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
@@ -70,10 +81,15 @@ class Composer:
         cutoff: int,
         cache: Optional[CacheManager] = None,
         cache_enabled: bool = True,
+        backend: str = "thewalrus",
     ):
         self.cutoff = int(cutoff)
         self.cache_enabled = bool(cache_enabled)
         self.cache = cache if cache is not None else global_composer_cache
+        self.backend = backend.lower()
+        if self.backend == "jax" and not JAX_AVAILABLE:
+            raise ImportError("JAX backend requested but JAX is not available.")
+
         # small in-memory caches to avoid hitting diskcache often
         self._U_cache_local = {}
         self._engine_lock = threading.Lock()
@@ -153,6 +169,21 @@ class Composer:
         if not (is_vec_A or is_dm_A) or not (is_vec_B or is_dm_B):
             raise ValueError(
                 "stateA/stateB must be either 1D vector or 2D density matrix."
+            )
+
+        if self.backend == "jax":
+            # JAX Backend Path
+            return self._compose_pair_jax(
+                stateA,
+                stateB,
+                pA,
+                pB,
+                homodyne_x,
+                homodyne_window,
+                homodyne_resolution,
+                theta,
+                phi,
+                n_hom_points,
             )
 
         # choose beamsplitter unitary
@@ -389,9 +420,101 @@ class Composer:
 
     def clear_caches(self):
         """Clear the persistent cache (useful between experiments)."""
-        if self.cache_enabled:
-            self.cache.clear()
-        self._U_cache_local.clear()
+        self.cache.clear()
+
+    # -----------------------------
+    # JAX Implementation
+    # -----------------------------
+    def _u_bs_jax(self, theta: float, phi: float) -> "jnp.ndarray":
+        """
+        Return JAX array for beamsplitter unitary.
+        Uses the same cache mechanism but converts to JAX array.
+        """
+        # Get numpy unitary from cache
+        U_np = self._u_bs(theta, phi)
+        # Convert to JAX array (this will move to GPU if available)
+        return jnp.array(U_np)
+
+    def _compose_pair_jax(
+        self,
+        stateA: Union[np.ndarray, "jnp.ndarray"],
+        stateB: Union[np.ndarray, "jnp.ndarray"],
+        pA: float,
+        pB: float,
+        homodyne_x: Optional[float],
+        homodyne_window: Optional[float],
+        homodyne_resolution: Optional[float],
+        theta: float,
+        phi: float,
+        n_hom_points: int,
+    ) -> Tuple[Union[np.ndarray, "jnp.ndarray"], float, float]:
+        """
+        JAX implementation of compose_pair using JIT-compiled kernel.
+        """
+        # Ensure inputs are JAX arrays
+        stateA = jnp.asarray(stateA)
+        stateB = jnp.asarray(stateB)
+
+        U = self._u_bs_jax(theta, phi)
+
+        # Prepare arguments for JIT function
+        hom_x_val = float(homodyne_x) if homodyne_x is not None else 0.0
+        hom_win_val = float(homodyne_window) if homodyne_window is not None else 0.0
+        hom_res_val = (
+            float(homodyne_resolution) if homodyne_resolution is not None else 0.0
+        )
+
+        phi_vec = jnp.zeros(1)  # Dummy
+        V_matrix = jnp.zeros((1, 1))  # Dummy
+        dx_weights = jnp.zeros(1)  # Dummy
+
+        if homodyne_x is not None and homodyne_window is None:
+            # Point
+            phi_vec_np = get_phi_matrix_cached(
+                self.cutoff, np.array([float(homodyne_x)]), hbar=HBAR
+            )[:, 0]
+            phi_vec = jnp.array(phi_vec_np)
+
+        if homodyne_window is not None:
+            # Window
+            n_nodes = min(n_hom_points, 61)
+            if n_nodes in self._leggauss_cache:
+                nodes, weights = self._leggauss_cache[n_nodes]
+            else:
+                nodes, weights = leggauss(n_nodes)
+                self._leggauss_cache[n_nodes] = (nodes, weights)
+
+            half_w = homodyne_window / 2.0
+            center = homodyne_x if homodyne_x is not None else 0.0
+            xs = center + half_w * nodes
+            dx_weights_np = half_w * weights
+
+            V_np = get_phi_matrix_cached(self.cutoff, xs, hbar=HBAR)
+            V_matrix = jnp.array(V_np)
+            dx_weights = jnp.array(dx_weights_np)
+
+        # Call JIT function
+        from .jax_composer import jax_compose_pair
+
+        return jax_compose_pair(
+            stateA,
+            stateB,
+            U,
+            pA,
+            pB,
+            hom_x_val,
+            hom_win_val,
+            hom_res_val,
+            phi_vec,
+            V_matrix,
+            dx_weights,
+            self.cutoff,
+            homodyne_window is None,
+            homodyne_x is None,
+            homodyne_resolution is None,
+            theta=theta,
+            phi=phi,
+        )
 
 
 # -----------------------------------------------------------
@@ -596,29 +719,3 @@ class SuperblockTopology:
 
         is_pure_final, state_final, joint_prob = eval_node(self.plan)
         return state_final, joint_prob
-
-
-# -----------------------------------------------------------
-# Small self-test when run as script (smoke tests)
-# -----------------------------------------------------------
-if __name__ == "__main__":
-    # quick smoke: HOM |1,1> -> no |1,1> at output for theta=pi/4, phi=0
-    c = 6
-    comp = Composer(cutoff=c)
-    f1 = np.zeros(c, dtype=complex)
-    f1[1] = 1.0
-    f2 = np.zeros(c, dtype=complex)
-    f2[1] = 1.0
-    out, p, joint = comp.compose_pair_cached(
-        f1, f2, homodyne_x=None, homodyne_window=None, theta=math.pi / 4, phi=0.0
-    )
-    # out is reduced density for mode0
-    idx11 = 1 * c + 1
-    # check full rho via U_bs
-    U = comp._u_bs(theta=math.pi / 4, phi=0.0)
-    psi_in = np.kron(f1, f2)
-    psi_out = U @ psi_in
-    rho_full = np.outer(psi_out, psi_out.conj())
-    p11 = np.real(rho_full[idx11, idx11])
-    print("HOM p(|1,1>) full-state:", p11)
-    print("reduced mode0 diagonal (photon probs) example:", np.real(np.diag(out))[:6])

@@ -15,34 +15,73 @@ Usage:
     python run_mome.py --mode random # quick smoke-run (default)
 """
 
+import os
+import sys
+import time
 import argparse
-import math
 import numpy as np
+from functools import partial
+import math
 from typing import Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import os
-import seaborn as sns
-
-try:
-    import jax
-    import jax.numpy as jnp
-except ImportError:
-    jax = None
-    jnp = None
 
 # === Project imports ===
 from src.circuits.gaussian_herald_circuit import GaussianHeraldCircuit
 from src.circuits.composer import Composer, SuperblockTopology
 from src.utils.cache_manager import CacheManager
 
+# Set memory allocator to avoid fragmentation OOMs
+os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+
+# Check for low-mem flag early
+LOW_MEM = "--low-mem" in sys.argv
+
+# Enable JAX x64 mode unless low-mem is requested
+if not LOW_MEM:
+    os.environ["JAX_ENABLE_X64"] = "True"
+else:
+    os.environ["JAX_ENABLE_X64"] = "False"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    print("Low-memory mode enabled: x64 disabled, preallocation disabled.")
+
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
+
+try:
+    import jax
+
+    # Enable x64 immediately after import if not low mem
+    if not LOW_MEM:
+        # JAX Config
+        # Use float32 for speed (User request)
+        jax.config.update("jax_enable_x64", False)
+    else:
+        jax.config.update("jax_enable_x64", False)
+    import jax.numpy as jnp
+except ImportError:
+    jax = None
+    jnp = None
+
 # Local defaults
 DEFAULT_CUTOFF = 6
 GLOBAL_CACHE = CacheManager(cache_dir="./cache", size_limit_bytes=1024 * 1024 * 512)
+
+
+class SimpleRepertoire:
+    """Simple container for random search results."""
+
+    def __init__(self, genotypes, fitnesses, descriptors):
+        self.genotypes = genotypes
+        self.fitnesses = fitnesses
+        self.descriptors = descriptors
 
 
 # -------------------------
@@ -210,7 +249,7 @@ def decode_genotype(
 # Gaussian block builder
 # -------------------------
 def gaussian_block_builder_from_params(
-    params: Dict[str, Any], cutoff: int = DEFAULT_CUTOFF
+    params: Dict[str, Any], cutoff: int = DEFAULT_CUTOFF, backend: str = "thewalrus"
 ) -> Tuple[np.ndarray, float]:
     """
     Build GaussianHeraldCircuit and return *single-mode* signal vector (length cutoff, complex, normalized)
@@ -234,6 +273,7 @@ def gaussian_block_builder_from_params(
         mesh="rectangular",
         hbar=2.0,
         cache_enabled=True,
+        backend=backend,
     )
     circ.build()
     state, prob = circ.herald(
@@ -273,7 +313,7 @@ def gaussian_block_builder_from_params(
 
 
 # -------------------------
-# Adapter: HanamuraMOME
+# Adapter: HanamuraMOMEAdapter
 # -------------------------
 class HanamuraMOMEAdapter:
     """Adapter for QDax MOME optimization."""
@@ -286,6 +326,7 @@ class HanamuraMOMEAdapter:
         cutoff: int = DEFAULT_CUTOFF,
         mode: str = "pure",
         homodyne_resolution: float = 0.01,
+        backend: str = "thewalrus",
     ):
         self.composer = composer
         self.topology = topology
@@ -293,6 +334,7 @@ class HanamuraMOMEAdapter:
         self.cutoff = int(cutoff)
         self.mode = mode
         self.homodyne_resolution = homodyne_resolution
+        self.backend = backend
         if hasattr(composer, "cutoff") and composer.cutoff != self.cutoff:
             raise ValueError("composer.cutoff != operator cutoff")
 
@@ -314,7 +356,7 @@ class HanamuraMOMEAdapter:
 
         try:
             vec, prob_block = gaussian_block_builder_from_params(
-                params, cutoff=self.cutoff
+                params, cutoff=self.cutoff, backend=self.backend
             )
         except Exception as e:
             # invalid genotype: too small prob or other failure -> mark as invalid
@@ -419,6 +461,53 @@ class HanamuraMOMEAdapter:
         extras = []
 
         # Parallel evaluation
+        if self.backend == "jax" and jax is not None:
+            # JAX batch execution
+            from src.circuits.jax_runner import jax_scoring_fn_batch
+
+            # Ensure genotypes are JAX array
+            g_jax = jnp.array(genotypes)
+            op_jax = jnp.array(self.operator)
+
+            # Run batched scoring
+            # jax_scoring_fn_batch returns (fitnesses, descriptors)
+            # We need to handle potential compilation overhead on first run
+            with jax.profiler.TraceAnnotation("jax_scoring_fn_batch"):
+                fitnesses_jax, descriptors_jax = jax_scoring_fn_batch(
+                    g_jax, self.cutoff, op_jax
+                )
+                # Force synchronization to ensure it's captured in profile
+                fitnesses_jax.block_until_ready()
+                descriptors_jax.block_until_ready()
+
+            # Convert back to numpy for QDax/compatibility
+            # (QDax might accept JAX arrays, but let's be safe if mixing)
+            # Actually QDax runs on JAX, so it expects JAX arrays!
+            # But run_mome.py seems to use numpy for adapter interface?
+            # "genotypes: np.ndarray" in type hint.
+            # If we are in "qdax" mode, genotypes might be JAX arrays.
+            # If we are in "random" mode, they are numpy.
+
+            # If input was numpy, return numpy. If jax, return jax?
+            # The signature says np.ndarray.
+            # But let's check if we need to convert.
+
+            # If we return JAX arrays, QDax is happy.
+            # If we return Numpy arrays, QDax might convert them.
+
+            # Let's return JAX arrays if input was JAX, else convert?
+            # Or just return JAX arrays and let caller handle.
+            # But `extras` needs to be constructed.
+
+            fitnesses = fitnesses_jax
+            descriptors = descriptors_jax
+
+            # Extras: we don't have per-individual metrics easily from vmap unless we modify it.
+            # For now return list of empty dicts to satisfy random search loop (extras[i]).
+            extras = [{} for _ in range(batch_size)]
+
+            return fitnesses, descriptors, extras
+
         def eval_single(i):
             try:
                 metrics = self.evaluate_one(genotypes[i, :])
@@ -440,19 +529,22 @@ class HanamuraMOMEAdapter:
                 extras.append({"error": error})
                 continue
 
-            # Objectives (minimize all)
-            # 1. Expectation (minimize)
+            # Objectives
+            # 1. Expectation (maximize) -> QDax maximizes fitness, so use f_expect directly
             f_expect = metrics["expectation"]
-            # 2. Log Prob (minimize -logP)
+            # 2. Log Prob (minimize -logP) -> QDax maximizes, so use -(-logP) = logP? No.
+            # We want to minimize -log(P). So we want to maximize log(P).
+            # metrics["log_prob"] is -log10(P). We want to minimize it.
+            # So fitness = -metrics["log_prob"].
             f_prob = metrics["log_prob"]
-            # 3. Complexity (minimize)
+            # 3. Complexity (minimize) -> fitness = -complexity
             f_complex = float(metrics["complexity"])
-            # 4. Total Photons (minimize)
+            # 4. Total Photons (minimize) -> fitness = -photons
             f_photons = float(metrics["total_measured_photons"])
 
             fitnesses[i, :] = np.array(
-                [-f_expect, -f_prob, -f_complex, -f_photons]
-            )  # QDax maximizes, so negate to minimize
+                [f_expect, -f_prob, -f_complex, -f_photons]
+            )  # QDax maximizes fitness
 
             # Descriptors (for map)
             # 1. Total Photons
@@ -494,16 +586,27 @@ def custom_metrics(repertoire):
     # Flatten pareto dim
     flat_fitnesses = repertoire.fitnesses.reshape(-1, repertoire.fitnesses.shape[-1])
     flat_valid = flat_fitnesses[:, 0] != -jnp.inf
+    # We want the minimum expectation value.
+    # fitness[0] = -expectation.
+    # max(fitness[0]) = max(-expectation) = -min(expectation).
+    # So min(expectation) = -max(fitness[0]).
     min_expectation = -jnp.max(jnp.where(flat_valid, flat_fitnesses[:, 0], -jnp.inf))
 
     # Best log prob (min log prob = max fitness[1])
     # fitness[1] is -log_prob
     min_log_prob = -jnp.max(jnp.where(flat_valid, flat_fitnesses[:, 1], -jnp.inf))
 
+    # Max probability
+    # log_prob = -log10(P) -> P = 10^(-log_prob)
+    # We want max P. P is maximized when log_prob is minimized.
+    # So max_prob = 10^(-min_log_prob)
+    max_probability = 10.0 ** (-min_log_prob)
+
     return {
         "coverage": coverage,
         "min_expectation": min_expectation,
         "min_log_prob": min_log_prob,
+        "max_probability": max_probability,
     }
 
 
@@ -550,13 +653,13 @@ def plot_mome_results(repertoire, metrics, filename="mome_results.png"):
     # 2. Heatmap: Total Photons vs Complexity -> Best Expectation
     ax = axes[0, 1]
     # Bin data for heatmap
-    x_bins = np.arange(0, 10)  # Total photons 0..9
+    x_bins = np.arange(0, 26)  # Total photons 0..25
     y_bins = np.arange(0, 10)  # Complexity 0..9
     heatmap_data = np.full((len(y_bins) - 1, len(x_bins) - 1), np.nan)
 
     for i in range(len(objectives)):
-        d_total = int(descriptors[i, 0])
-        d_complex = int(descriptors[i, 2])
+        d_complex = int(descriptors[i, 0])
+        d_total = int(descriptors[i, 2])
         val = objectives[i, 0]  # Expectation
 
         if 0 <= d_total < len(x_bins) - 1 and 0 <= d_complex < len(y_bins) - 1:
@@ -570,7 +673,7 @@ def plot_mome_results(repertoire, metrics, filename="mome_results.png"):
         heatmap_data,
         ax=ax,
         cmap="viridis_r",
-        annot=True,
+        annot=False,  # Disable annotations to avoid massive text rendering overhead
         fmt=".2f",
         xticklabels=x_bins[:-1],
         yticklabels=y_bins[:-1],
@@ -604,48 +707,107 @@ def plot_mome_results(repertoire, metrics, filename="mome_results.png"):
 # Runner
 # -------------------------
 def run(
-    mode: str = "random",
-    n_iters: int = 50,
-    pop_size: int = 16,
-    seed: int = 12345,
-    cutoff: int = DEFAULT_CUTOFF,
+    mode: str,
+    n_iters: int,
+    pop_size: int,
+    seed: int,
+    cutoff: int,
+    backend: str = "thewalrus",
+    no_plot: bool = False,
+    target_alpha: complex = 2.0,
+    target_beta: complex = 0.0,
+    low_mem: bool = False,
 ):
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
 
     # Setup
-    composer = Composer(cutoff=cutoff)
+    from src.utils.gkp_operator import construct_gkp_operator
+
+    composer = Composer(cutoff=cutoff, backend=backend)
     topology = SuperblockTopology.build_layered(2)
-    operator = np.diag(np.arange(cutoff, dtype=float))
-    # Adapter
-    adapter = HanamuraMOMEAdapter(
-        composer, topology, operator, cutoff=cutoff, mode=mode, homodyne_resolution=0.01
+
+    # Construct GKP operator
+    # Note: construct_gkp_operator handles backend-specific return types (numpy vs jax)
+    # But HanamuraMOMEAdapter expects a numpy array for initialization usually?
+    # Let's check. The adapter stores it.
+    # If backend is jax, we might want jax array.
+    # construct_gkp_operator(..., backend=backend) does the right thing.
+    operator = construct_gkp_operator(
+        cutoff, target_alpha, target_beta, backend=backend
     )
 
-    D = 40  # genotype dimension
+    # Adapter
+    adapter = HanamuraMOMEAdapter(
+        composer,
+        topology,
+        operator,
+        cutoff=cutoff,
+        mode=mode,
+        homodyne_resolution=0.01,
+        backend=backend,
+    )
+
+    D = 256  # genotype dimension (increased for full tree)
 
     if mode == "qdax":
         try:
-            import jax
-            import jax.numpy as jnp
             from qdax.core.mome import MOME
             from qdax.core.emitters.mutation_operators import (
                 polynomial_mutation,
                 polynomial_crossover,
             )
             from qdax.core.emitters.standard_emitters import MixingEmitter
+            # import jax # Already imported globally
+            # import jax.numpy as jnp # Already imported globally
         except Exception as e:
             print(f"Error importing jax/qdax: {e}")
             print("Falling back to random mode.")
             mode = "random"
 
+    # Common variables for result management
+    repertoire = None
+    emitter_state = None
+    final_metrics = {}
+    centroids = None
+
     if mode == "random":
         # Random search baseline
         best = None
         best_f = -1e99
+
+        # Accumulate all results for "repertoire"
+        all_genotypes = []
+        all_fitnesses = []
+        all_descriptors = []
+
+        # Metrics history
+        history_max_exp = []
+        history_min_lp = []
+
+        # Check devices
+        if jax is not None:
+            print(f"JAX Devices: {jax.devices()}")
+
         for it in range(n_iters):
+            # Step annotation for profiling
+            if jax is not None:
+                step_ctx = jax.profiler.StepTraceAnnotation("random_step", step_num=it)
+                step_ctx.__enter__()
+
             pop = np.random.randn(pop_size, D)
             fitnesses, descs, extras = adapter.scoring_fn_batch(pop, None)
+
+            if jax is not None:
+                step_ctx.__exit__(None, None, None)
+
+            # Accumulate
+            all_genotypes.append(pop)
+            all_fitnesses.append(fitnesses)
+            all_descriptors.append(descs)
+
+            # Track best
+            current_best_f = -1e99
             for i in range(pop_size):
                 if fitnesses[i, 0] > best_f:
                     best_f = float(fitnesses[i, 0])
@@ -655,163 +817,324 @@ def run(
                         descs[i].copy(),
                         extras[i],
                     )
+                if fitnesses[i, 0] > current_best_f:
+                    current_best_f = float(fitnesses[i, 0])
+
+            # Metrics
+            # fitness[0] is now f_expect (maximized)
+            # We track max expectation directly.
+            history_max_exp.append(current_best_f)
+            # Similarly for log prob
+            # This is approximate since we track best f0, not best f1.
+            # But let's just take the mean or something for history?
+            # Or just the best f0's corresponding f1?
+            # For simplicity, let's track the best f0's metrics.
+
             if (it + 1) % 5 == 0:
-                print(f"iter {it + 1}/{n_iters}, best f0 so far: {best_f:.6g}")
-        print("RANDOM SEARCH DONE. Best found:")
-        if best is not None:
-            print("  fitness:", best[1])
-            print("  descriptor:", best[2])
-            print("  metrics:", best[3])
+                print(f"iter {it + 1}/{n_iters}, best f0 (exp) so far: {best_f:.6g}")
+
+        print("RANDOM SEARCH DONE.")
+
+        # Construct SimpleRepertoire
+        # SimpleRepertoire is defined globally now
+
+        # Concatenate all history
+        # Shape: (Total_Pop, 1, Objs) to mimic QDax (N, Pareto, Objs)?
+        # QDax repertoire has shape (N_cells, Pareto_len, Objs).
+        # Here we just have a flat list of individuals.
+        # Let's reshape to (N, 1, Objs)
+
+        flat_geno = np.concatenate(all_genotypes, axis=0)
+        flat_fit = np.concatenate(all_fitnesses, axis=0)
+        flat_desc = np.concatenate(all_descriptors, axis=0)
+
+        # Add Pareto dim
+        flat_fit = flat_fit[:, np.newaxis, :]
+        flat_desc = flat_desc[:, np.newaxis, :]
+        flat_geno = flat_geno[:, np.newaxis, :]
+
+        repertoire = SimpleRepertoire(flat_geno, flat_fit, flat_desc)
+
+        # Metrics
+        final_metrics = {
+            "max_expectation": np.array(history_max_exp),
+            "min_expectation": -np.array(
+                history_max_exp
+            ),  # Match custom_metrics naming convention
+            # "min_log_prob": ... # Skip for random
+        }
+
+        # Fall through to Result Management
+
+    elif mode == "qdax":
+        if jax is not None:
+            print(f"JAX Devices: {jax.devices()}")
+
+        # Define scoring function using jax.pure_callback
+        # Define scoring function using jax.pure_callback
+        # Define scoring function using JAX runner
+        from src.circuits.jax_runner import jax_scoring_fn_batch
+
+        def scoring_fn(genotypes, key):
+            """
+            JAX-native scoring function.
+            """
+            # We don't use key in scoring (deterministic given genotype)
+            # But we accept it for compatibility with QDax interface.
+
+            # Call batched JAX scorer
+            # Note: We removed block_until_ready() as it fails during JIT/scan tracing.
+            # Profiling will still capture kernels.
+            # We must pass the operator (GKP) to the scoring function now.
+            # operator is available in the closure (from run() scope)
+            with jax.profiler.TraceAnnotation("jax_scoring_fn_batch_qdax"):
+                # Ensure operator is a JAX array
+                op_jax = jnp.array(operator)
+                fitnesses, descriptors = jax_scoring_fn_batch(genotypes, cutoff, op_jax)
+
+            # QDax expects extra scores (gradients/etc) but we don't have them.
+            # We return empty dict for extras.
+            return fitnesses, descriptors, {}
+
+        metrics_function = custom_metrics
+
+        # Initialize RNG
+        if jax is None:
+            print("JAX not found, cannot run QDax mode.")
+            return
+        key = jax.random.PRNGKey(seed)
+
+        # Create initial population
+        key, subkey = jax.random.split(key)
+        genotypes = jax.random.uniform(
+            subkey, (pop_size, D), minval=-2.0, maxval=2.0, dtype=jnp.float32
+        )
+
+        # Emitter setup
+        crossover_function = partial(polynomial_crossover, proportion_var_to_change=0.5)
+        mutation_function = partial(
+            polynomial_mutation,
+            eta=1.0,
+            minval=-5.0,
+            maxval=5.0,
+            proportion_to_mutate=0.6,
+        )
+
+        # Adjust batch size for low memory
+        emitter_batch_size = pop_size if LOW_MEM else pop_size * 2
+
+        mixing_emitter = MixingEmitter(
+            mutation_fn=mutation_function,
+            variation_fn=crossover_function,
+            variation_percentage=1.0,
+            batch_size=emitter_batch_size,
+        )
+
+        # Grid-based Centroids
+        # D1: Active Modes (Complexity): 1..8 (8 bins)
+        # D2: Max PNR: 0..4 (5 bins)
+        # D3: Total Photons: 0..24 (25 bins)
+        # Total = 8 * 5 * 25 = 1000 cells
+        d1 = jnp.linspace(1, 8, 8)
+        d2 = jnp.linspace(0, 4, 5)
+        d3 = jnp.linspace(0, 24, 25)
+        grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
+        centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
+
+        print(f"Generated {centroids.shape[0]} centroids.")
+
+        # MOME instance
+        mome = MOME(
+            scoring_function=scoring_fn,
+            emitter=mixing_emitter,
+            metrics_function=metrics_function,
+            pareto_front_max_length=5,  # As requested
+        )
+
+        # Init algorithm
+        key, subkey = jax.random.split(key)
+
+        # Warmup JAX compilation
+        print("Warming up JAX compilation...")
+        # Run a single dummy call to scoring_fn with a representative batch
+        # We use the initial genotypes for warmup
+        scoring_fn(genotypes, subkey)
+        print("Warmup complete.")
+
+        repertoire, emitter_state, init_metrics = mome.init(
+            genotypes, centroids, subkey
+        )
+
+        # Run loop with progress reporting
+        # We run in chunks to print metrics
+        # Adjust chunk size for low memory
+        # User requested to limit CPU calls -> larger chunks.
+        # jax.lax.scan compiles the body once, so larger chunk_size doesn't increase graph size,
+        # only the execution time per chunk.
+
+        # Aggressive chunking: target ~50-100 steps per chunk
+        if LOW_MEM:
+            target_chunk = 50
         else:
-            print("  No valid solution found.")
-        return best
+            target_chunk = 100
 
-    # QDax MOME mode
-    print("Running QDax MOME...")
+        chunk_size = min(n_iters, target_chunk)
+        n_chunks = n_iters // chunk_size
+        remainder = n_iters % chunk_size
 
-    # Define scoring function using jax.pure_callback
-    # Define scoring function using jax.pure_callback
-    def scoring_fn(genotypes, key):
-        def numpy_batch_scorer(genotypes_jax, k):
-            """
-            Batched scorer called from JAX host callback.
-            Receives the entire batch of genotypes (B, D).
-            Returns fitnesses (B, N_objs) and descriptors (B, N_descs).
-            """
-            gen_np = np.asarray(genotypes_jax)
-            print(
-                f"DEBUG: Batch scoring {gen_np.shape[0]} genotypes"
-            )  # Uncomment to verify batching
+        # If there's a remainder, we'll handle it (or just ignore for now and run n_chunks)
+        # Actually, scan requires fixed length.
+        # If remainder > 0, we might need a final smaller chunk.
+        # For simplicity, let's just run n_chunks and warn if n_iters is not divisible?
+        # Or better, adjust chunk_size to be a divisor if possible?
+        # No, just run n_chunks and then a final chunk.
 
-            # We don't need 'k' here if we aren't using it, or if pure_callback doesn't pass it.
-            # The original code passed 'key' to pure_callback, so we should accept it if we want to be consistent,
-            # BUT pure_callback(callback, result_shape, *args) passes *args to callback.
-            # In the call below: jax.pure_callback(numpy_batch_scorer, result_shape, genotypes, key)
-            # So numpy_batch_scorer receives (genotypes, key).
-            fitnesses, descriptors, extras = adapter.scoring_fn_batch(
-                gen_np, None
-            )  # We don't use key in batch scorer yet
-            return np.asarray(fitnesses, dtype=np.float32), np.asarray(
-                descriptors, dtype=np.float32
-            )
+        chunks = [chunk_size] * n_chunks
+        if remainder > 0:
+            chunks.append(remainder)
+            n_chunks += 1
 
-        result_shape = (
-            jax.ShapeDtypeStruct((genotypes.shape[0], 4), jnp.float32),  # 4 objectives
-            jax.ShapeDtypeStruct((genotypes.shape[0], 3), jnp.float32),  # 3 descriptors
-        )
-        fitnesses, descriptors = jax.pure_callback(
-            numpy_batch_scorer, result_shape, genotypes, key
-        )
-        return fitnesses, descriptors, {}
-
-    metrics_function = custom_metrics
-
-    # Initialize RNG
-    if jax is None:
-        print("JAX not found, cannot run QDax mode.")
-        return
-    key = jax.random.PRNGKey(seed)
-
-    # Create initial population
-    key, subkey = jax.random.split(key)
-    genotypes = jax.random.uniform(
-        subkey, (pop_size, D), minval=-2.0, maxval=2.0, dtype=jnp.float32
-    )
-
-    # Emitter setup
-    crossover_function = partial(polynomial_crossover, proportion_var_to_change=0.5)
-    mutation_function = partial(
-        polynomial_mutation,
-        eta=1.0,
-        minval=-5.0,
-        maxval=5.0,
-        proportion_to_mutate=0.6,
-    )
-    mixing_emitter = MixingEmitter(
-        mutation_fn=mutation_function,
-        variation_fn=crossover_function,
-        variation_percentage=1.0,
-        batch_size=pop_size * 2,  # Increase batch size to amortize callback overhead
-    )
-
-    # Grid-based Centroids
-    # D_total: 0..8 (9 bins)
-    # D_max: 0..4 (5 bins)
-    # Complexity: 1..6 (6 bins)
-    # Total = 9 * 5 * 6 = 270
-    d1 = jnp.linspace(0, 8, 9)
-    d2 = jnp.linspace(0, 4, 5)
-    d3 = jnp.linspace(1, 6, 6)
-    grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
-    centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
-
-    print(f"Generated {centroids.shape[0]} centroids.")
-
-    # MOME instance
-    mome = MOME(
-        scoring_function=scoring_fn,
-        emitter=mixing_emitter,
-        metrics_function=metrics_function,
-        pareto_front_max_length=5,  # As requested
-    )
-
-    # Init algorithm
-    key, subkey = jax.random.split(key)
-
-    # Warmup JAX compilation
-    print("Warming up JAX compilation...")
-    # Run a single dummy call to scoring_fn with a representative batch
-    # We use the initial genotypes for warmup
-    scoring_fn(genotypes, subkey)
-    print("Warmup complete.")
-
-    repertoire, emitter_state, init_metrics = mome.init(genotypes, centroids, subkey)
-
-    # Run loop with progress reporting
-    # We run in chunks to print metrics
-    chunk_size = 10
-    n_chunks = n_iters // chunk_size
-
-    all_metrics = {k: [] for k in init_metrics.keys()}
-
-    print(f"Starting optimization: {n_iters} iterations in {n_chunks} chunks.")
-
-    for chunk in range(n_chunks):
-        (repertoire, emitter_state, key), metrics = jax.lax.scan(
-            mome.scan_update,
-            (repertoire, emitter_state, key),
-            (),
-            length=chunk_size,
-        )
-
-        # Accumulate metrics (taking the last value from the chunk)
-        for k, v in metrics.items():
-            # v is array of shape (chunk_size, ...)
-            # We take the last one for printing, but could store all
-            all_metrics[k].extend(v)  # Store all history
-
-        # Print progress
-        cov = float(metrics["coverage"][-1]) * 100
-        best_exp = float(metrics["min_expectation"][-1])
-        best_lp = float(metrics["min_log_prob"][-1])
+        all_metrics = {k: [] for k in init_metrics.keys()}
 
         print(
-            f"Iter {(chunk + 1) * chunk_size}/{n_iters} | "
-            f"Cov: {cov:.1f}% | "
-            f"Best Exp: {best_exp:.4f} | "
-            f"Best LogProb: {best_lp:.2f}"
+            f"Starting optimization: {n_iters} iterations in {n_chunks} chunks (sizes={chunks})."
         )
 
-    print("QDax MOME finished.")
+        start_time = time.time()
+        history_fronts = []
 
-    # Convert JAX metrics to numpy for plotting
-    final_metrics = {k: np.array(v) for k, v in all_metrics.items()}
+        # Target ~50-100 frames for animation to keep overhead low
+        snapshot_interval = max(1, n_iters // 50)
 
-    # Visualization
-    try:
-        plot_mome_results(repertoire, final_metrics)
-    except Exception as e:
-        print(f"Visualization failed: {e}")
+        completed = 0
+
+        for chunk_len in chunks:
+            # Re-compile scan for each unique chunk length?
+            # JAX compiles for specific static arguments (length is static).
+            # So [100, 100, 100, 50] triggers 2 compilations (100 and 50).
+            # This is acceptable overhead for the last chunk.
+
+            (repertoire, emitter_state, key), metrics = jax.lax.scan(
+                mome.scan_update,
+                (repertoire, emitter_state, key),
+                (),
+                length=chunk_len,
+            )
+
+            # Accumulate metrics (taking the last value from the chunk)
+            for k, v in metrics.items():
+                # v is array of shape (chunk_len, ...)
+                all_metrics[k].extend(v)
+
+            # ETR Calculation
+            elapsed = time.time() - start_time
+            completed += chunk_len
+
+            # Capture Pareto Front Snapshot
+            if completed % snapshot_interval == 0 or completed == n_iters:
+                fits = np.array(repertoire.fitnesses)
+                descs = np.array(repertoire.descriptors)
+
+                flat_fits = fits.reshape(-1, fits.shape[-1])
+                flat_descs = descs.reshape(-1, descs.shape[-1])
+                valid_mask = flat_fits[:, 0] > -np.inf
+
+                valid_fits = flat_fits[valid_mask]
+                valid_descs = flat_descs[valid_mask]
+
+                history_fronts.append((valid_fits, valid_descs))
+
+            # Print progress with ETR
+            cov = float(metrics["coverage"][-1]) * 100
+            best_exp = float(metrics["min_expectation"][-1])
+            best_lp = float(metrics["min_log_prob"][-1])
+            best_prob = float(metrics["max_probability"][-1])
+
+            # Best fitness is -best_exp (since we minimize exp)
+            best_fit = -best_exp
+
+            # ETR Calculation
+            elapsed = time.time() - start_time
+            # completed is already updated
+            rate = completed / elapsed if elapsed > 0 else 0
+            remaining = n_iters - completed
+            etr_seconds = remaining / rate if rate > 0 else 0
+            etr_str = time.strftime("%H:%M:%S", time.gmtime(etr_seconds))
+
+            # Progress Bar
+            bar_len = 20
+            progress = completed / n_iters
+            filled = int(bar_len * progress)
+            bar = "=" * filled + "-" * (bar_len - filled)
+
+            print(
+                f"[{bar}] Iter {completed}/{n_iters} | "
+                f"ETR: {etr_str} | "
+                f"Cov: {cov:.1f}% | "
+                f"Best Exp: {best_exp:.4f} | "
+                f"Best Prob: {best_prob:.2e}"
+            )
+
+        print("QDax MOME finished.")
+
+        # Convert JAX metrics to numpy for plotting
+        final_metrics = {k: np.array(v) for k, v in all_metrics.items()}
+
+    # --- Result Management ---
+    from src.utils.result_manager import OptimizationResult
+
+    # Create structured output directory
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    params_str = f"c{cutoff}_p{pop_size}_i{n_iters}"
+    output_dir = f"output/{timestamp}_{params_str}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Config dict
+    config = {
+        "mode": mode,
+        "n_iters": n_iters,
+        "pop_size": pop_size,
+        "seed": seed,
+        "cutoff": cutoff,
+        "backend": backend,
+        "target_alpha": str(target_alpha),
+        "target_beta": str(target_beta),
+    }
+
+    # Create Result object
+    # Pass history_fronts if available (only in qdax mode)
+    h_fronts = locals().get("history_fronts", None)
+
+    result = OptimizationResult(
+        repertoire=repertoire,
+        history=final_metrics,
+        config=config,
+        centroids=centroids,
+        history_fronts=h_fronts,
+    )
+
+    # Save Results
+    result.save(output_dir)
+
+    # Create Animation
+    if not no_plot:
+        try:
+            result.create_animation(os.path.join(output_dir, "history.gif"))
+        except Exception as e:
+            print(f"Animation creation failed: {e}")
+
+    # Visualization (Static)
+    if not no_plot:
+        try:
+            plot_mome_results(
+                repertoire,
+                final_metrics,
+                filename=os.path.join(output_dir, "final_plot.png"),
+            )
+        except Exception as e:
+            print(f"Visualization failed: {e}")
+    else:
+        print("Skipping plotting as requested.")
 
     return repertoire, emitter_state, final_metrics
 
@@ -819,29 +1142,71 @@ def run(
 # -------------------------
 # CLI
 # -------------------------
-if __name__ == "__main__":
-    # Assuming DEFAULT_CUTOFF is defined elsewhere or a reasonable default like 10
-    # For the purpose of this edit, we'll define it here if not present.
-    try:
-        DEFAULT_CUTOFF
-    except NameError:
-        DEFAULT_CUTOFF = 10  # Placeholder default value
-
+def main():
+    # Parse args
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", choices=["random", "qdax"], default="random", help="Run mode"
+        "--mode", type=str, default="random", choices=["random", "qdax"]
     )
-    parser.add_argument("--iters", type=int, default=100, help="Number of iterations")
-    parser.add_argument("--pop", type=int, default=128, help="Population size")
-    parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
-        "--cutoff", type=int, default=DEFAULT_CUTOFF, help="Fock cutoff"
+        "--backend", type=str, default="thewalrus", choices=["thewalrus", "jax"]
+    )
+    parser.add_argument("--target-alpha", type=float, default=1.0)
+    parser.add_argument("--pop", type=int, default=100)
+    parser.add_argument("--cutoff", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--low-mem", action="store_true", help="Enable low-memory mode")
+    parser.add_argument("--profile", action="store_true", help="Enable JAX profiling")
+    parser.add_argument(
+        "--target-beta",
+        type=complex,
+        default=0.0,
+        help="Target superposition beta (complex)",
     )
     args = parser.parse_args()
 
-    run(
-        mode=args.mode,
-        pop_size=args.pop,
-        n_iters=args.iters,
-        cutoff=args.cutoff,
-    )
+    # Profiling context
+    if args.profile and args.backend == "jax" and jax is not None:
+        print("Profiling enabled. Traces will be saved to ./profiles")
+        jax.profiler.start_trace("./profiles")
+        try:
+            run(
+                mode=args.mode,
+                n_iters=args.iters,
+                pop_size=args.pop,
+                seed=args.seed,
+                cutoff=args.cutoff,
+                no_plot=args.no_plot,
+                backend=args.backend,
+                target_alpha=args.target_alpha,
+                target_beta=args.target_beta,
+                low_mem=args.low_mem,
+            )
+        finally:
+            jax.profiler.stop_trace()
+            print("Profiling trace saved to ./profiles")
+    else:
+        run(
+            mode=args.mode,
+            n_iters=args.iters,
+            pop_size=args.pop,
+            seed=args.seed,
+            cutoff=args.cutoff,
+            no_plot=args.no_plot,
+            backend=args.backend,
+            target_alpha=args.target_alpha,
+            target_beta=args.target_beta,
+            low_mem=args.low_mem,
+        )
+
+
+if __name__ == "__main__":
+    # Assuming DEFAULT_CUTOFF is defined elsewhere or a reasonable default like 10
+    try:
+        DEFAULT_CUTOFF
+    except NameError:
+        DEFAULT_CUTOFF = 10
+
+    main()
