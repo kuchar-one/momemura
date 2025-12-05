@@ -1,34 +1,12 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual Environment
+*.pyc
 .venv/
-venv/
-ENV/
-env/
-
-# Caches
-cache/
-.cache/
 .pytest_cache/
-.mypy_cache/
-
-# Distribution / Packaging
-build/
-dist/
-*.egg-info/
-
-# IDEs
-.vscode/
-.idea/
-
-# Project specific
-mome_results.png
+.cache/
+cache/
+output/
+profiles/
+*.prof
 *.log
-.DS_Store
-
 *.png
-*.ini
-*.db
+.DS_Store

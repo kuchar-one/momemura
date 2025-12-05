@@ -15,7 +15,7 @@ Interferometer(mesh='rectangular')).
 # Apply SciPy patch for StrawberryFields compatibility
 import src.utils.scipy_patch  # noqa: F401
 
-from typing import Sequence, Tuple, Optional
+from typing import Sequence, Tuple, Optional, Union
 import numpy as np
 import itertools
 from thewalrus.quantum import pure_state_amplitude
@@ -34,6 +34,19 @@ from src.utils.accel import njit_wrapper as njit
 from src.utils.cache_manager import CacheManager, _short_hash_bytes
 from src.circuits.ops import beamsplitter_2x2
 
+try:
+    import jax
+    import jax.numpy as jnp
+    from src.circuits.jax_herald import jax_pure_state_amplitude
+
+    JAX_AVAILABLE = True
+except ImportError:
+    JAX_AVAILABLE = False
+    jax = None
+    jnp = None
+    jax_pure_state_amplitude = None
+
+
 # create global circuit cache (persist on disk)
 _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +56,10 @@ CACHE_DIR = os.path.join(_PROJECT_ROOT, "cache")
 global_circuit_cache = CacheManager(
     cache_dir=CACHE_DIR, size_limit_bytes=500 * 1024 * 1024
 )
+
+# In-memory LRU cache for unitaries
+_UNITARY_CACHE = {}
+_UNITARY_CACHE_LIMIT = 20000
 
 # -----------------------------
 # Beam-splitter and mesh builder
@@ -150,6 +167,7 @@ class GaussianHeraldCircuit:
         mesh: str = "rectangular",
         hbar: float = 2.0,
         cache_enabled: bool = True,
+        backend: str = "thewalrus",
     ):
         """
         Initialize circuit builder.
@@ -159,6 +177,7 @@ class GaussianHeraldCircuit:
           (like PennyLane Interferometer). If both provided, U_* takes precedence.
         - tmss_squeezing is a sequence of r parameters (schmidt_rank).
         - mode ordering is signal-first internally.
+        - backend: "thewalrus" (CPU) or "jax" (GPU).
         """
         self.n_signal = int(n_signal)
         self.n_control = int(n_control)
@@ -185,6 +204,9 @@ class GaussianHeraldCircuit:
         self.hbar = float(hbar)
         self.cache_enabled = bool(cache_enabled)
         self.cache = global_circuit_cache
+        self.backend = backend.lower()
+        if self.backend == "jax" and not JAX_AVAILABLE:
+            raise ImportError("JAX backend requested but JAX is not available.")
 
         self.mu = None
         self.cov = None
@@ -218,13 +240,45 @@ class GaussianHeraldCircuit:
         varphi = params.get("varphi")
         if theta is None or phi is None or varphi is None:
             raise ValueError("params must contain 'theta','phi','varphi' keys.")
-        return interferometer_params_to_unitary(
-            np.asarray(theta, dtype=np.float64),
-            np.asarray(phi, dtype=np.float64),
-            np.asarray(varphi, dtype=np.float64),
-            M,
-            mesh=mesh,
-        )
+
+        # Cache lookup
+        try:
+            t_arr = np.ascontiguousarray(theta, dtype=np.float64)
+            p_arr = np.ascontiguousarray(phi, dtype=np.float64)
+            v_arr = np.ascontiguousarray(varphi, dtype=np.float64)
+
+            # Key: (M, mesh, bytes of params)
+            key = (M, mesh, t_arr.tobytes(), p_arr.tobytes(), v_arr.tobytes())
+
+            if key in _UNITARY_CACHE:
+                return _UNITARY_CACHE[key]
+
+            U = interferometer_params_to_unitary(
+                t_arr,
+                p_arr,
+                v_arr,
+                M,
+                mesh=mesh,
+            )
+
+            if len(_UNITARY_CACHE) < _UNITARY_CACHE_LIMIT:
+                _UNITARY_CACHE[key] = U
+            else:
+                # Evict oldest (dict is ordered by insertion in Python 3.7+)
+                _UNITARY_CACHE.pop(next(iter(_UNITARY_CACHE)))
+                _UNITARY_CACHE[key] = U
+
+            return U
+
+        except Exception:
+            # Fallback
+            return interferometer_params_to_unitary(
+                np.asarray(theta, dtype=np.float64),
+                np.asarray(phi, dtype=np.float64),
+                np.asarray(varphi, dtype=np.float64),
+                M,
+                mesh=mesh,
+            )
 
     def _cache_key_for_unitary(self, U: np.ndarray):
         # cheap stable key: use shape + bytes hash; bytes can be large but OK for small unitaries
@@ -366,7 +420,7 @@ class GaussianHeraldCircuit:
         pnr_outcome: Sequence[int],
         signal_cutoff: int = 10,
         check_purity: bool = False,
-    ) -> Tuple[np.ndarray, float]:
+    ) -> Tuple[Union[np.ndarray, "jnp.ndarray"], float]:
         if not self._built:
             raise RuntimeError("Call build() before herald().")
         n_sig = self.n_signal
@@ -389,6 +443,7 @@ class GaussianHeraldCircuit:
             tuple(int(x) for x in pnr_outcome),
             int(signal_cutoff),
             bool(check_purity),
+            self.backend,  # Include backend in cache key
         )
         # Convert tuple to string key or rely on CacheManager to handle it (it handles pickleable objects)
         # But let's make a string key to be safe/clean
@@ -397,8 +452,45 @@ class GaussianHeraldCircuit:
         if self.cache_enabled:
             cached = self.cache.get(cache_key)
             if cached is not None:
+                # If backend is JAX, we might want to convert cached numpy array back to JAX array?
+                # Or just return numpy array and let caller handle it?
+                # For now, return as is (likely numpy array from pickle).
+                # If caller expects JAX array, they might need to convert.
+                # But typically cache stores CPU data.
+                if self.backend == "jax":
+                    return jnp.array(cached[0]), cached[1]
                 return cached
 
+        if self.backend == "jax":
+            # JAX path
+            # Convert inputs to JAX arrays
+            mu_jax = jnp.array(mu_xp)
+            cov_jax = jnp.array(cov_xp)
+            pnr_tuple = tuple(int(x) for x in pnr_outcome)
+
+            # Call JAX function
+            # Returns (amplitudes, prob)
+            # amplitudes shape: [cutoff, cutoff, ...] (n_sig times)
+            amp_jax, prob_jax = jax_pure_state_amplitude(
+                mu_jax, cov_jax, pnr_tuple, signal_cutoff, self.hbar
+            )
+
+            # Normalize
+            prob = float(prob_jax)  # Convert to python float
+            # jax_pure_state_amplitude returns normalized amplitudes!
+            # So we don't need to divide by sqrt(prob) again.
+            norm = amp_jax
+
+            # Store in cache (as numpy for persistence)
+            res = (norm, prob)
+            if self.cache_enabled:
+                # Convert to numpy for pickling
+                res_np = (np.array(norm), prob)
+                self.cache.set(cache_key, res_np)
+
+            return res
+
+        # TheWalrus path (CPU)
         # Precompute signal basis once per cutoff and n_signal using an internal cache
         basis_key = (n_sig, signal_cutoff)
         signal_basis = self._signal_basis_cache.get(basis_key)
