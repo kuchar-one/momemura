@@ -51,5 +51,5 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
 ## Performance Tips
 
 -   **GPU Utilization**: Use `--backend jax` and increase `--pop` (e.g., 100-500) to saturate the GPU.
--   **Memory**: Use `--low-mem` if you have limited VRAM (<8GB). This disables x64 precision and preallocation.
+-   **Memory**: Use `--low-mem` if you have limited VRAM (<8GB). This disables preallocation (precision is always `float32`).
 -   **Chunking**: The loop automatically adjusts chunk size. If you see OOM errors, try reducing `--pop` or manually lowering `chunk_size` in `run_mome.py`.

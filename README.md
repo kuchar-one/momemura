@@ -38,6 +38,7 @@ python run_mome.py --mode qdax --backend jax --pop 100 --iters 500 --cutoff 10
 ```bash
 python run_mome.py --mode qdax --backend jax --pop 50 --iters 200 --cutoff 10 --low-mem
 ```
+*Note: Both modes use `float32` precision by default.*
 
 **Arguments:**
 - `--mode`: `qdax` (evolutionary) or `random` (baseline).
@@ -47,7 +48,7 @@ python run_mome.py --mode qdax --backend jax --pop 50 --iters 200 --cutoff 10 --
 - `--cutoff`: Fock space truncation cutoff.
 - `--target-alpha`: Target GKP |0> coefficient (default 1.0).
 - `--target-beta`: Target GKP |1> coefficient (default 0.0).
-- `--low-mem`: Disables x64 precision and preallocation to save memory.
+- `--low-mem`: Disables JAX memory preallocation to save VRAM (precision remains `float32`).
 
 ### Profiling
 

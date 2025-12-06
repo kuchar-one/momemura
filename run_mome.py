@@ -38,12 +38,13 @@ os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 LOW_MEM = "--low-mem" in sys.argv
 
 # Enable JAX x64 mode unless low-mem is requested
-if not LOW_MEM:
-    os.environ["JAX_ENABLE_X64"] = "True"
-else:
-    os.environ["JAX_ENABLE_X64"] = "False"
+# We use float32 by default for performance in all modes (User Policy),
+# so we explicitly disable x64.
+os.environ["JAX_ENABLE_X64"] = "False"
+
+if LOW_MEM:
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    print("Low-memory mode enabled: x64 disabled, preallocation disabled.")
+    print("Low-memory mode enabled: preallocation disabled.")
 
 
 matplotlib.use("Agg")
@@ -58,13 +59,9 @@ except ImportError:
 try:
     import jax
 
-    # Enable x64 immediately after import if not low mem
-    if not LOW_MEM:
-        # JAX Config
-        # Use float32 for speed (User request)
-        jax.config.update("jax_enable_x64", False)
-    else:
-        jax.config.update("jax_enable_x64", False)
+    # JAX Config
+    # Use float32 for speed (User request)
+    jax.config.update("jax_enable_x64", False)
     import jax.numpy as jnp
 except ImportError:
     jax = None
