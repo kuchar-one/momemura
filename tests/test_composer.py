@@ -3,8 +3,8 @@ import numpy as np
 import os
 import time
 import sys
-from src.circuits.composer import Composer, global_composer_cache
-from src.circuits.gaussian_herald_circuit import (
+from src.simulation.cpu.composer import Composer, global_composer_cache
+from src.simulation.cpu.circuit import (
     GaussianHeraldCircuit,
     global_circuit_cache,
 )

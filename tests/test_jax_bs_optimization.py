@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from src.circuits.jax_composer import jax_u_bs, jax_apply_bs_vec, jax_compose_pair
+from src.simulation.jax.composer import jax_u_bs, jax_apply_bs_vec, jax_compose_pair
 
 # Ensure we test in float32 as requested
 jax.config.update("jax_enable_x64", False)

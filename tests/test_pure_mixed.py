@@ -1,7 +1,7 @@
 import numpy as np
 import math
 import pytest
-from src.circuits.composer import Composer, SuperblockTopology
+from src.simulation.cpu.composer import Composer, SuperblockTopology
 
 
 def test_hom_dip_pure_vs_mixed():

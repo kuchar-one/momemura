@@ -32,12 +32,13 @@ from src.utils.params import (
 )
 from src.utils.accel import njit_wrapper as njit
 from src.utils.cache_manager import CacheManager, _short_hash_bytes
-from src.circuits.ops import beamsplitter_2x2
+from src.simulation.cpu.ops import beamsplitter_2x2, HBAR
 
+# Fallback or shared logic if needed
 try:
     import jax
     import jax.numpy as jnp
-    from src.circuits.jax_herald import jax_pure_state_amplitude
+    from src.simulation.jax.herald import jax_pure_state_amplitude
 
     JAX_AVAILABLE = True
 except ImportError:

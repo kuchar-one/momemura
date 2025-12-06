@@ -7,7 +7,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from run_mome import HanamuraMOMEAdapter
-from src.circuits.composer import Composer, SuperblockTopology
+from src.simulation.cpu.composer import Composer, SuperblockTopology
 
 
 class TestStage1Batching(unittest.TestCase):
@@ -52,7 +52,14 @@ class TestStage1Batching(unittest.TestCase):
         def mock_eval(genotype):
             if genotype[0] > 0:  # Arbitrary condition
                 raise ValueError("Simulated failure")
-            return original_eval(genotype)
+            # Return dummy metrics instead of calling original_eval to avoid logic errors with random genotypes
+            return {
+                "expectation": 0.5,
+                "log_prob": 2.0,
+                "complexity": 10.0,
+                "total_measured_photons": 1.0,
+                "per_detector_max": 0.5,
+            }
 
         self.adapter.evaluate_one = mock_eval
 

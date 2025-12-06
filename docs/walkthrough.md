@@ -11,12 +11,12 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
     - Optimizes for: Expectation Value (minimize -Exp), Log Probability (minimize -LogP), Complexity (minimize), and Photon Count (minimize).
     - Located in `run_mome.py` (adapter logic).
 
-2.  **Circuit Composer (`src/circuits/composer.py`)**:
+2.  **Circuit Composer (`src/simulation/cpu/composer.py`)**:
     - Defines the high-level circuit structure (`GaussianHeraldCircuit`, `SuperblockTopology`).
     - Manages the "genotype to phenotype" mapping (parameters -> circuit components).
     - Handles CPU-based simulation via `thewalrus`.
 
-3.  **JAX Backend (`src/circuits/jax_composer.py`, `jax_runner.py`)**:
+3.  **JAX Backend (`src/simulation/jax/composer.py`, `runner.py`)**:
     - High-performance, GPU-accelerated simulation.
     - `jax_superblock`: Implements the core mixing logic (Depth-3 tree) using vectorized JAX operations (`vmap`).
     - `jax_herald`: Computes heralded state amplitudes.
@@ -26,6 +26,7 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
 
 1.  **Initialization**:
     - `run_mome.py` initializes a population of random genotypes.
+    - Selects the genotype design (e.g., `--genotype A`) which defines the circuit topology and parameter space.
     - Centroids for the MAP-Elites grid are generated based on descriptors (Complexity, Max PNR, Total Photons).
 
 2.  **Evaluation Loop**:

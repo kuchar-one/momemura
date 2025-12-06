@@ -5,7 +5,7 @@ from scipy.special import eval_hermite, factorial
 from scipy.linalg import expm
 import pytest
 
-from src.circuits.jax_composer import jax_u_bs, jax_hermite_phi_matrix
+from src.simulation.jax.composer import jax_u_bs, jax_hermite_phi_matrix
 
 HBAR = 2.0
 

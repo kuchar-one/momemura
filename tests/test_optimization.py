@@ -8,13 +8,14 @@ import math
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from src.circuits.ops import (
+from src.simulation.cpu.ops import (
+    annihilation_operator,
+    creation_operator,
+    build_beamsplitter_unitary,
     quadrature_vector,
     get_phi_matrix_cached,
-    HBAR,
-    quadrature_wavefunction,
 )
-from src.circuits.composer import Composer
+from src.simulation.cpu.composer import Composer
 
 
 class TestOptimization(unittest.TestCase):

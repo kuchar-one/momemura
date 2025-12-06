@@ -1,0 +1,385 @@
+import jax
+import jax.numpy as jnp
+from functools import partial
+from typing import Dict, Any, Tuple
+
+from src.genotypes.genotypes import get_genotype_decoder
+
+from src.simulation.jax.herald import (
+    vacuum_covariance,
+    two_mode_squeezer_symplectic,
+    expand_mode_symplectic,
+    passive_unitary_to_symplectic,
+    complex_alpha_to_qp,
+)
+from src.simulation.jax.composer import jax_hermite_phi_matrix
+
+# Constants from run_mome.py (should be shared ideally)
+MAX_MODES = 3  # 1 signal + 2 control
+MAX_SIGNAL = 1
+MAX_CONTROL = 2
+MAX_PNR = 3
+
+
+def jax_beamsplitter_2x2(theta: float, phi: float) -> jnp.ndarray:
+    """
+    2x2 complex beam-splitter matrix B(theta, phi).
+    B = [[cosθ, -e^{-iφ} sinθ],
+         [e^{iφ} sinθ, cosθ]].
+    """
+    t = jnp.cos(theta)
+    r = jnp.sin(theta)
+    exp_phi = jnp.exp(1j * phi)
+    exp_neg_phi = jnp.exp(-1j * phi)
+
+    row1 = jnp.array([t, -exp_neg_phi * r])
+    row2 = jnp.array([exp_phi * r, t])
+    return jnp.stack([row1, row2])
+
+
+def jax_interferometer_unitary(
+    theta: jnp.ndarray, phi: jnp.ndarray, varphi: jnp.ndarray, M: int
+) -> jnp.ndarray:
+    """
+    Constructs MxM unitary using rectangular mesh.
+    Unrolled for M=5 (max modes).
+    """
+    U = jnp.eye(M, dtype=jnp.complex_)
+
+    # We can't use Python loops over dynamic M if M is traced.
+    # But M is usually static (MAX_MODES or n_signal).
+    # Since we extract MAX_MODES params, we should use M=MAX_MODES?
+    # No, run_mome uses n_signal/n_control.
+    # We can use `jax.lax.fori_loop` or unroll if M is small.
+    # Let's assume M is static (passed as static arg to JIT).
+
+    # Rectangular mesh logic:
+    # for s in range(M):
+    #   start = 0 if s%2==0 else 1
+    #   for a in range(start, M-1, 2):
+    #     apply BS(theta[k], phi[k])
+
+    param_idx = 0
+
+    # We need to carry U and param_idx?
+    # No, we can just iterate.
+    # But we need to slice theta/phi.
+
+    # Since M is small (<=5), we can use Python loops for unrolling.
+    for s in range(M):
+        start = 0 if (s % 2 == 0) else 1
+        for a in range(start, M - 1, 2):
+            th = theta[param_idx]
+            ph = phi[param_idx]
+            param_idx += 1
+
+            B = jax_beamsplitter_2x2(th, ph)
+
+            # Update U rows [a, a+1]
+            sub_U = U[a : a + 2, :]
+            new_sub_U = B @ sub_U
+            U = U.at[a : a + 2, :].set(new_sub_U)
+
+    # Final phases
+    # R = diag(exp(i varphi))
+    phases = jnp.exp(1j * varphi)
+    U = U * phases[:, None]  # Broadcast over columns (row-wise multiplication)
+    return U
+
+
+def jax_creation_annihilation(cutoff: int):
+    """Returns a and a_dag matrices for Fock size cutoff."""
+    a = jnp.diag(jnp.sqrt(jnp.arange(1, cutoff)), k=1)
+    return a, a.T
+
+
+def jax_apply_final_gaussian(
+    state_vec: jnp.ndarray, params: Dict[str, Any], cutoff: int
+) -> jnp.ndarray:
+    """
+    Applies single-mode Gaussian unitary U_final to the state vector.
+    U_final = D(alpha) @ R(varphi) @ S(r, phi)
+    """
+    r = params["r"]
+    phi = params["phi"]
+    varphi = params["varphi"]
+    disp = params["disp"]  # complex alpha
+
+    a, adag = jax_creation_annihilation(cutoff)
+
+    # 1. Squeeze S(z) with z = r * exp(i * 2*phi)
+    # S(z) = exp(0.5 * (z.conj() * a^2 - z * adag^2))
+    # Using user formula: K = (r/2) * (exp(-2j*phi)*a^2 - exp(2j*phi)*adag^2)
+    # This matches standard S(z) definition if z = r * exp(2j*phi).
+
+    # We use jax.scipy.linalg.expm
+    term1 = jnp.exp(-2j * phi) * (a @ a)
+    term2 = jnp.exp(2j * phi) * (adag @ adag)
+    K_squeeze = (r / 2.0) * (term1 - term2)
+    U_squeeze = jax.scipy.linalg.expm(K_squeeze)
+
+    # 2. Rotation R(varphi) = exp(i * n * varphi)
+    n_op = jnp.arange(cutoff)
+    U_rot = jnp.diag(jnp.exp(1j * n_op * varphi))
+
+    # 3. Displacement D(alpha) = exp(alpha * adag - alpha.conj() * a)
+    K_disp = disp * adag - jnp.conj(disp) * a
+    U_disp = jax.scipy.linalg.expm(K_disp)
+
+    # Total U
+    # Order: U_final = U_disp @ R(varphi) @ U_squeeze (Applied right to left on ket)
+    # This matches common decompositions (Squeeze then Rotate then Displace)
+    U_final = U_disp @ U_rot @ U_squeeze
+
+    return U_final @ state_vec
+
+
+def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
+    """
+    Computes the heralded state for a single block (1 Signal, up to 2 Controls).
+    Canonical Form: 1 TMSS pair + Uc + Displacements.
+    """
+    # Extract params
+    n_ctrl = params["n_ctrl"]  # (1,) int
+    # tmss_r is now SCALAR (0-D array) after vmap slicing from (L,)
+    tmss_r = params["tmss_r"]
+    us_phase = params["us_phase"]  # (1,)
+    uc_theta = params["uc_theta"]  # (1,)
+    uc_phi = params["uc_phi"]  # (1,)
+    uc_varphi = params["uc_varphi"]  # (2,)
+    disp_s = params["disp_s"]  # (1,)
+    disp_c = params["disp_c"]  # (2,)
+    pnr = params["pnr"]  # (2,)
+
+    # Constants
+    hbar = 2.0
+
+    # 1. Gaussian State (Covariance & Mean)
+    # Modes: 0 (Signal), 1 (Ctrl0), 2 (Ctrl1)
+    N = MAX_SIGNAL + MAX_CONTROL  # 1 + 2 = 3
+    mu = jnp.zeros(2 * N)
+    cov = vacuum_covariance(N, hbar)
+
+    S_total = jnp.eye(2 * N)
+
+    # 2. TMSS Logic (Single Pair on 0,1)
+    # Only if n_ctrl >= 1
+    r0 = jnp.where(n_ctrl >= 1, tmss_r, 0.0)
+
+    # Construct Symplectic for TMSS(r0) on modes (0,1)
+    S_tmss_0 = two_mode_squeezer_symplectic(r0, 0.0)
+    S_big_0 = expand_mode_symplectic(S_tmss_0, jnp.array([0, 1]), N)
+    S_total = S_big_0 @ S_total
+
+    # 3. Interferometers
+    # US on Signal (Mode 0) - Phase rotation
+    phi_s = us_phase[0]
+    cp = jnp.cos(phi_s)
+    sp = jnp.sin(phi_s)
+    R_s = jnp.array([[cp, -sp], [sp, cp]])
+    S_us = expand_mode_symplectic(R_s, jnp.array([0]), N)
+    S_total = S_us @ S_total
+
+    # UC on Controls (Modes 1, 2)
+    # Linear optics coupling Control 0 and Control 1
+    ct = jnp.cos(uc_theta[0])
+    st = jnp.sin(uc_theta[0])
+    # BS
+    U_bs = jnp.array(
+        [[ct, -jnp.exp(-1j * uc_phi[0]) * st], [jnp.exp(1j * uc_phi[0]) * st, ct]]
+    )
+    # Phase
+    U_ph = jnp.diag(jnp.exp(1j * uc_varphi))
+    U_c = U_ph @ U_bs
+
+    S_uc_small = passive_unitary_to_symplectic(U_c)
+    S_uc = expand_mode_symplectic(S_uc_small, jnp.array([1, 2]), N)
+    S_total = S_uc @ S_total
+
+    # Apply Total Symplectic
+    cov = S_total @ cov @ S_total.T
+    mu = S_total @ mu
+
+    # 4. Displacements
+    alpha = jnp.concatenate([disp_s, disp_c])
+    r_disp = complex_alpha_to_qp(alpha, hbar)
+    mu = mu + r_disp
+
+    # 5. Herald
+    # Project auxiliary modes onto PNR
+    # If n_ctrl < 2, force pnr[1]=0
+    pnr_effective = jnp.where(
+        jnp.arange(2) < n_ctrl,
+        pnr,
+        0,
+    )
+
+    max_pnr_tuple = (MAX_PNR, MAX_PNR)
+
+    from src.simulation.jax.herald import jax_get_full_amplitudes
+
+    H_full = jax_get_full_amplitudes(mu, cov, max_pnr_tuple, cutoff, hbar)
+
+    p0 = pnr_effective[0]
+    p1 = pnr_effective[1]
+    vec_slice = H_full[:, p0, p1]
+
+    prob_slice = jnp.sum(jnp.abs(vec_slice) ** 2)
+
+    vec_norm = jax.lax.cond(
+        prob_slice > 0,
+        lambda _: vec_slice / jnp.sqrt(prob_slice),
+        lambda _: jnp.zeros_like(vec_slice),
+        None,
+    )
+
+    return (
+        vec_norm,
+        prob_slice,
+        1.0,
+        jnp.max(pnr_effective).astype(jnp.float_),
+        jnp.sum(pnr_effective).astype(jnp.float_),
+    )
+
+
+@partial(jax.jit, static_argnames=("cutoff", "genotype_name"))
+def _score_batch_shard(
+    genotypes: jnp.ndarray, cutoff: int, operator: jnp.ndarray, genotype_name: str
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    JIT-compiled scoring function for a single batch shard.
+    """
+    decoder = get_genotype_decoder(genotype_name)
+
+    def score_one(g):
+        params = decoder.decode(g, cutoff)
+
+        # 1. Get Leaf States
+        leaf_vecs, leaf_probs, leaf_modes, leaf_max_pnrs, leaf_total_pnrs = jax.vmap(
+            partial(jax_get_heralded_state, cutoff=cutoff)
+        )(params["leaf_params"])
+
+        # 2. Superblock
+        hom_x = params["homodyne_x"]
+        hom_win = params["homodyne_window"]
+
+        # Point homodyne
+        phi_mat = jax_hermite_phi_matrix(jnp.array([hom_x]), cutoff)
+        phi_vec = phi_mat[:, 0]
+
+        V_matrix = jnp.zeros((cutoff, 1))
+        dx_weights = jnp.zeros(1)
+
+        from src.simulation.jax.composer import jax_superblock
+
+        final_state, _, joint_prob, is_active, max_pnr, active_modes = jax_superblock(
+            leaf_vecs,
+            leaf_probs,
+            params["leaf_active"],
+            leaf_max_pnrs,
+            leaf_modes,
+            params["mix_params"],
+            params["mix_source"],
+            hom_x,
+            hom_win,
+            0.0,
+            phi_vec,
+            V_matrix,
+            dx_weights,
+            cutoff,
+            True,
+            False,
+            True,
+        )
+
+        # 3. Apply Final Global Gaussian
+        final_state_transformed = jax_apply_final_gaussian(
+            final_state, params["final_gauss"], cutoff
+        )
+
+        # 4. Expectation Value
+        op_psi = operator @ final_state_transformed
+        exp_val = jnp.real(jnp.vdot(final_state_transformed, op_psi))
+
+        # 5. Fitness & Descriptors
+        prob_clipped = jnp.maximum(joint_prob, 1e-30)
+        log_prob = -jnp.log10(prob_clipped)
+
+        total_photons = jnp.sum(jnp.where(params["leaf_active"], leaf_total_pnrs, 0.0))
+
+        # Fitness: [-exp_val, -log_prob, -complexity, -total_photons]
+        fitness = jnp.array([-exp_val, -log_prob, -active_modes, -total_photons])
+
+        # Descriptor: [active_modes, max_pnr, total_photons]
+        descriptor = jnp.array([active_modes, max_pnr, total_photons])
+
+        return fitness, descriptor
+
+    fitnesses, descriptors = jax.vmap(score_one)(genotypes)
+    return fitnesses, descriptors
+
+
+def jax_scoring_fn_batch(
+    genotypes: jnp.ndarray,
+    cutoff: int,
+    operator: jnp.ndarray,
+    genotype_name: str = "legacy",
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Batched scoring function.
+    Dispatches to multi-device pmap if devices > 1, else uses jit.
+    """
+    n_devices = jax.local_device_count()
+
+    if n_devices <= 1:
+        # Fallback to single-device JIT
+        return _score_batch_shard(genotypes, cutoff, operator, genotype_name)
+
+    # Multi-GPU Logic
+    # 1. Pad genotypes to be divisible by n_devices
+    batch_size = genotypes.shape[0]
+    remainder = batch_size % n_devices
+    padding = (n_devices - remainder) if remainder > 0 else 0
+
+    if padding > 0:
+        # Pad with zeros (or duplicates)
+        # Since these are extra, their results will be discarded.
+        # Zeros might cause numerical issues in eval?
+        # Better to pad with the first element to ensure validity.
+        pad_block = jnp.repeat(genotypes[:1], padding, axis=0)
+        g_padded = jnp.concatenate([genotypes, pad_block], axis=0)
+    else:
+        g_padded = genotypes
+
+    # 2. Reshape for pmap: (n_devices, shard_size, ...)
+    shard_size = g_padded.shape[0] // n_devices
+    g_sharded = g_padded.reshape((n_devices, shard_size, -1))
+
+    # 3. pmap execution
+
+    # NOTE: pmap args: (shard, cutoff, operator, genotype_name)
+    # in_axes=(0, None, None, None) -> shard divides axis 0, others replicated.
+
+    pmapped_fn = jax.pmap(
+        _score_batch_shard,
+        in_axes=(0, None, None, None),
+        static_broadcasted_argnums=(1, 3),  # cutoff(1) and genotype_name(3) are static
+    )
+
+    fitnesses_sharded, descriptors_sharded = pmapped_fn(
+        g_sharded, cutoff, operator, genotype_name
+    )
+
+    # 4. Reshape back
+    # fitnesses_sharded: (n_devices, shard_size, 4)
+    # descriptors_sharded: (n_devices, shard_size, 3)
+
+    fitnesses = fitnesses_sharded.reshape((-1, 4))
+    descriptors = descriptors_sharded.reshape((-1, 3))
+
+    # 5. Remove padding
+    if padding > 0:
+        fitnesses = fitnesses[:batch_size]
+        descriptors = descriptors[:batch_size]
+
+    return fitnesses, descriptors

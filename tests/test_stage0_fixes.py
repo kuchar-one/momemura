@@ -6,20 +6,26 @@ import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from run_mome import decode_genotype, custom_metrics, HanamuraMOMEAdapter
-from src.circuits.composer import Composer
+from run_mome import custom_metrics
+from src.simulation.cpu.composer import Composer
+from src.genotypes.genotypes import get_genotype_decoder
 
 
 class TestStage0Fixes(unittest.TestCase):
     def test_decode_genotype_unused_slots(self):
         """Test that decode_genotype handles unused slots correctly."""
-        # Create a dummy genotype
-        genotype = np.random.rand(100)
-        params = decode_genotype(genotype)
-        # Check that n_signal is 1 (forced)
-        self.assertEqual(params["n_signal"], 1)
+        # Create a dummy genotype of correct length
+        decoder = get_genotype_decoder("legacy")
+        length = decoder.get_length()
+        genotype = np.random.rand(length)
+
+        params = decoder.decode(genotype, cutoff=5)
+        # Check for expected keys instead of n_signal which is not returned by decode
+        self.assertIn("homodyne_x", params)
+        self.assertIn("leaf_params", params)
+        self.assertIn("mix_params", params)
         # Check that other params are decoded reasonably
-        self.assertIn("n_control", params)
+        self.assertIn("n_ctrl", params["leaf_params"])
 
     def test_custom_metrics_shape_handling(self):
         """Test custom_metrics with correct repertoire shape."""

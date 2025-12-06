@@ -1,10 +1,10 @@
 # JAX Optimization Genotype and Circuit Topology
 
-This document details the genotype encoding, parameter mappings, and circuit topology used in the JAX-based optimization backend for the Momemura project. The implementation is primarily located in `src/circuits/jax_runner.py`.
+This document details the genotype encoding, parameter mappings, and circuit topology used in the JAX-based optimization backend for the Momemura project. The implementation is primarily located in `src/simulation/jax/runner.py` and `src/genotypes/genotypes.py`.
 
 ## Overview
 
-The optimization uses a fixed-length real-valued vector (genotype) to map to a flexible quantum circuit architecture known as a "Maximal Superblock". The layout assumes a depth-3 binary tree structure leading to 8 leaf nodes.
+The optimization uses a real-valued vector (genotype) to map to a flexible quantum circuit architecture known as a "Maximal Superblock". The layout assumes a depth-3 binary tree structure leading to 8 leaf nodes.
 
 **Constants:**
 - `MAX_MODES`: 3 (1 Signal + 2 Control)
@@ -13,103 +13,134 @@ The optimization uses a fixed-length real-valued vector (genotype) to map to a f
 - `MAX_PNR`: 3
 - `SCHMIDT_RANK`: 2 (implicit in code, though usually effective rank is 1 for single signal)
 
-## Genotype Structure
+## Genotype Designs
 
-The genotype is a 1D `float32` array. If the input genotype is shorter than the target length (256), it is zero-padded.
+We support multiple genotype designs offering different trade-offs between expressivity and search space size.
 
-| Section | Description | Parameter Count | Indices (Approx) |
+
+| Design | Name | Description | Length (Depth 3) |
 | :--- | :--- | :--- | :--- |
-| **Global** | Homodyne measurement settings | 2 | 0-1 |
-| **Mix Nodes** | Internal tree nodes (mixing/routing) | 28 (7 nodes $\times$ 4 params) | 2-29 |
-| **Leaves** | Gaussian herald blocks | 136 (8 leaves $\times$ 17 params) | 30-165 |
-| **Padding** | Unused / Reserved | Variable | 166-255 |
+| **Legacy** | Original | Per-leaf unique parameters (Original logic mapped to canonical). | 256 |
+| **A** | Original (Canonical) | Per-leaf unique. 1 TMSS/leaf + Final Gauss. | 162 |
+| **B1** | Tied-Leaf (No Active) | Single shared block. 1 TMSS/block + Final Gauss. | 49 |
+| **B2** | Tied-Leaf (Active) | Same as B1 but with per-leaf active flags. | 57 |
+| **C1** | Tied-All (No Active) | Constant structure. | 25 |
+| **C2** | Tied-All (Active) | Same as C1 but with per-leaf active flags. | 33 |
 
----
+### 1. Global Parameters (All Designs)
 
-## 1. Global Parameters
-
-These parameters control the final homodyne measurement performed on the output state.
-
-| Parameter | Gene Mapping | Range / Values | Description |
-| :--- | :--- | :--- | :--- |
-| `homodyne_x` | $\tanh(g_0) \times 4.0$ | $[-4.0, 4.0]$ | Center position of the homodyne measurement window (or point). Rounded to 6 decimal places. |
-| `homodyne_window` | $|\tanh(g_1) \times 2.0|$ | $[0.0, 2.0]$ | Width of the homodyne window. Rounded to 6 decimal places. |
-
----
-
-## 2. Mix Nodes (Internal Topology)
-
-There are 7 mix nodes in the binary tree structure. Each node accepts inputs from two children (or sources) and produces one output.
-
-**Per-Node Parameters (4 genes):**
+All designs include global homodyne settings and a **Final Gaussian** block.
 
 | Parameter | Gene Mapping | Range | Description |
 | :--- | :--- | :--- | :--- |
-| `theta` | $\tanh(g_{i}) \times \frac{\pi}{2}$ | $[-\frac{\pi}{2}, \frac{\pi}{2}]$ | Beamsplitter mixing angle. |
-| `phi` | $\tanh(g_{i+1}) \times \frac{\pi}{2}$ | $[-\frac{\pi}{2}, \frac{\pi}{2}]$ | Beamsplitter phase. |
-| `varphi` | $\tanh(g_{i+2}) \times \frac{\pi}{2}$ | $[-\frac{\pi}{2}, \frac{\pi}{2}]$ | Output phase rotation. |
-| `source` | Thresholds on $g_{i+3}$ | $\{0, 1, 2\}$ | Source selector. <br> $< -0.33 \to 1$ (Left Child) <br> $> 0.33 \to 2$ (Right Child) <br> Else $\to 0$ (Default/Mix Both) |
+---
+
+
+### 2. Design A - Original (Per-Leaf Unique)
+
+This design allows every leaf block and every mix node to have unique parameters.
+
+**Formula**: $Length = G + L \cdot P_{leaf} + (L-1) \cdot P_{node} + F$
+For Depth 3 ($L=8$): $1 + 8 \times 16 + 7 \times 4 + 5 = 162$.
+
+**Structure**:
+- **Global**: `homodyne_x`.
+- **Leaves (8 blocks)**: Each block has 16 unique params (Active, N_Ctrl, TMSS, US, UC, Disp, PNR).
+- **Mix Nodes (7 nodes)**: Each node has 4 unique params (Theta, Phi, Varphi, Source).
+- **Final Gaussian**: 5 params.
 
 ---
 
-## 3. Leaf Nodes (Gaussian Blocks)
+### 3. Design B - Tied-Leaf (Shared Blocks)
 
-There are 8 leaf nodes. Each leaf represents a "Gaussian Herald Circuit" that generates a pure state to be fed into the tree.
+This design broadcasts a SINGLE set of block parameters to ALL leaves. This assumes identical physical resources for generation, but allows unique routing (Mix Nodes).
 
-**Per-Leaf Parameters (17 genes):**
+**Formula (B1)**: $Length = G + BP + (L-1) \cdot P_{node} + F$
+For Depth 3: $1 + 15 + 7 \times 4 + 5 = 49$.
 
-The 17 genes are mapped as follows (indices relative to the start of the leaf block):
+**Formula (B2)**: Adds $L$ active flags. $Length = 49 + 8 = 57$.
 
-### A. Configuration
-| Index | Parameter | mapping | Range / Description |
-| :--- | :--- | :--- | :--- |
-| 0 | `active` | $g > 0.0$ | `bool`. If False, this leaf contributes vacuum/zero state. |
-| 1 | `n_ctrl` | Thresholds on $g$ | $\{0, 1, 2\}$ <br> $< -0.33 \to 0$ <br> $> 0.33 \to 2$ <br> Else $\to 1$ |
-
-### B. Resources
-| Index | Parameter | Mapping | Range | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| 2-3 | `tmss_r` | $\tanh(g) \times 2.0$ | $[-2.0, 2.0]$ | Squeezing magnitude for TMSS pairs. `tmss_r[0]` used if `n_ctrl >= 1`, `tmss_r[1]` if `n_ctrl >= 2`. |
-| 4 | `us_phase` | $\tanh(g) \times \frac{\pi}{2}$ | $[-\frac{\pi}{2}, \frac{\pi}{2}]$ | Phase rotation for the Signal mode. |
-| 5-8 | `uc_params` | $\tanh(g) \times \frac{\pi}{2}$ | $[-\frac{\pi}{2}, \frac{\pi}{2}]$ | Unitary parameters for Control modes (2-mode unitary). <br> 5: `theta` <br> 6: `phi` <br> 7-8: `varphi` (2 values) |
-
-### C. Displacements
-| Index | Parameter | Mapping | Range |
-| :--- | :--- | :--- | :--- |
-| 9-10 | `disp_s` | $\tanh(g) \times 3.0$ | $[-3.0, 3.0]$ (Real, Imag) for Signal mode. |
-| 11-14 | `disp_c` | $\tanh(g) \times 3.0$ | $[-3.0, 3.0]$ (Real, Imag) for Control modes 1 & 2. |
-
-### D. Measurements
-| Index | Parameter | Mapping | Range |
-| :--- | :--- | :--- | :--- |
-| 15-16 | `pnr` | `round(clip(g, 0, 1) * 3)` | $\{0, 1, 2, 3\}$. Photon number resolution outcome to herald. |
+**Structure**:
+- **Global**: `homodyne_x`.
+- **Shared Block**: 15 Parameters (N_Ctrl, TMSS, US, UC, Disp, PNR) applied to ALL leaves.
+- **Mix Nodes**: 7 Unique nodes (same as Design A).
+- **Active Flags** (B2 only): 8 booleans at the end of the genotype to turn generic leaves on/off.
+- **Final Gaussian**: 5 params.
 
 ---
 
-## Circuit Construction & Evaluation
+### 4. Design C - Tied-All (Shared Blocks & Mixing)
 
-### 1. Leaf State Generation (`jax_get_heralded_state`)
-For each active leaf:
-1. **Vacuum**: Start with $N = 1 + n_{ctrl}$ modes in vacuum.
-2. **TMSS**: Apply Two-Mode Squeezing between Signal (Mode 0) and Control modes (1, 2) based on `tmss_r`.
-3. **Unitaries**: apply 1-mode rotation to Signal and 2-mode unitary to Controls.
-4. **Displacement**: Apply complex displacements `disp_s` and `disp_c`.
-5. **Heralding**: Project Control modes onto Fock states specified by `pnr`.
-    - If `n_ctrl < 1`, `pnr[0]` is ignored (effectively 0).
-    - If `n_ctrl < 2`, `pnr[1]` is effectively 0.
-6. **Normalization**: The resulting signal state slice is normalized.
+This design forces maximum symmetry. All blocks are identical, and all mix nodes are identical.
 
-### 2. Superblock Combination (`jax_superblock`)
-The leaves are combined according to the tree topology defined by the Mix Nodes.
-- **Tree Structure**: A fixed depth-3 binary tree.
-- **Propagation**: States propagate from leaves up to the root.
-- **Mixing**: At each node, if `source=0`, the two inputs are mixed on a beamsplitter defined by `theta`, `phi` and output phase `varphi`. If `source=1` or `2`, only the left or right input is passed through (with phase applied).
+**Formula (C1)**: $Length = G + BP + P_{node} + F$
+Constant Length: $1 + 15 + 4 + 5 = 25$.
 
-### 3. Scoring
-The final state at the root is evaluated against the target operator.
-- **Expectation**: $E = \langle \psi_{final} | O | \psi_{final} \rangle$.
-- **Fitness Objectives**:
-    1. Maximize Expectation (Minimize $-E$).
-    2. Maximize Probability (Minimize $-\log_{10}(P)$).
-    3. Minimize Complexity (Active Modes).
-    4. Minimize Total Photons.
+**Formula (C2)**: Adds $L$ active flags. $Length = 25 + 8 = 33$.
+
+**Structure**:
+- **Global**: `homodyne_x`.
+- **Shared Block**: 1 parameter set for all leaves.
+- **Shared Mix Node**: 1 parameter set (Theta, Phi, Varphi, Source) applied to ALL 7 mix nodes.
+- **Active Flags** (C2 only): 8 booleans.
+
+---
+
+## Parameter Mappings (New Designs)
+ 
+ New designs (A, B, C) use the following **defaults**, which can be customized via CLI arguments in `run_mome.py`:
+ - `H_X_SCALE` (Default `4.0`, CLI `--hx-scale`)
+ - `R_SCALE` (Default `2.0`, CLI `--r-scale`)
+ - `D_SCALE` (Default `3.0`, CLI `--d-scale`)
+ - `MAX_PNR` (Default `3`, CLI `--pnr-max`)
+ - `H_WINDOW` (Default `0.1`, CLI `--window`)
+
+### Leaf Block Parameters (Design A, P=16)
+
+Unique per leaf. Includes `Active` flag at index 0.
+
+| Index | Name | Map | Description |
+| :--- | :--- | :--- | :--- |
+| 0 | `active` | > 0.0 | Boolean Active Flag |
+| 1 | `n_ctrl` | Thresholds $\pm 0.33$ | {0, 1, 2} |
+| 2 | `tmss_r` | $\tanh \times 2.0$ | Squeezing (Single) |
+| 3 | `us_phase` | $\tanh \times \pi/2$ | Signal Phase |
+| 4-7 | `uc_params` | $\tanh \times \pi/2$ | Control Unitary (Theta, Phi, Varphi1, Varphi2) |
+| 8-9 | `disp_s` | $\tanh \times 3.0$ | Signal Disp (Re, Im) |
+| 10-13 | `disp_c` | $\tanh \times 3.0$ | Control Disp (Re1, Im1, Re2, Im2) |
+| 14-15 | `pnr` | Integers | {0..3} x 2 |
+
+### Shared Block Parameters (Design B/C, BP=15)
+
+Shared across all leaves. **No Active flag** (handled separately or implicitly True).
+
+| Index | Name | Map | Description |
+| :--- | :--- | :--- | :--- |
+| 0 | `n_ctrl` | Thresholds $\pm 0.33$ | {0, 1, 2} |
+| 1 | `tmss_r` | $\tanh \times 2.0$ | Squeezing |
+| 2 | `us_phase` | $\tanh \times \pi/2$ | Signal Phase |
+| 3-6 | `uc_params` | $\tanh \times \pi/2$ | Control Unitary |
+| 7-8 | `disp_s` | $\tanh \times 3.0$ | Signal Disp |
+| 9-12 | `disp_c` | $\tanh \times 3.0$ | Control Disp |
+| 13-14 | `pnr` | Integers | {0..3} |
+
+### Mix Node Parameters (PN = 4)
+
+| Index | Name | Map | Description |
+| :--- | :--- | :--- | :--- |
+| 0 | `theta` | $\tanh \times \pi/2$ | Mixing Angle |
+| 1 | `phi` | $\tanh \times \pi/2$ | Mixing Phase |
+| 2 | `varphi` | $\tanh \times \pi/2$ | Output Phase |
+| 3 | `source` | Thresholds $\pm 0.33$ | {0=Mix, 1=Left, 2=Right} |
+
+---
+
+## Circuit Evaluation
+
+Evaluation logic remains consistent across designs. State generation (`jax_get_heralded_state`) and Superblock combination (`jax_superblock`) consume the decoded parameters to produce a final state and score.
+
+Fitness objectives:
+1. Maximize Expectation (Minimize $-E$).
+2. Maximize Probability (Minimize $-\log_{10}(P)$).
+3. Minimize Complexity (Active Modes).
+4. Minimize Total Photons.

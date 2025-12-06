@@ -9,7 +9,12 @@ from typing import Dict, Any, List, Tuple
 from pathlib import Path
 
 # Project imports
-from src.circuits.jax_runner import jax_decode_genotype
+from src.genotypes.genotypes import get_genotype_decoder
+
+try:
+    import jax.numpy as jnp
+except ImportError:
+    jnp = None
 
 
 class OptimizationResult:
@@ -143,9 +148,22 @@ class OptimizationResult:
         genotype = self._cached_valid_genotypes[genotype_idx]
         cutoff = self.config.get("cutoff", 10)
 
-        # Use jax_decode_genotype
-        # Note: jax_decode_genotype returns JAX arrays, we convert to numpy/list for readability
-        params = jax_decode_genotype(genotype, cutoff=cutoff)
+        # Use generic decoder
+        algo = self.config.get("genotype", "legacy")
+        # Ensure genotype is JAX array
+        if jnp is not None:
+            g_arr = jnp.array(genotype)
+            # Extract depth from config if available
+            depth = int(self.config.get("depth", 3))
+            # Pass full config to decoder to respect limits (r_scale, etc.)
+            params = get_genotype_decoder(algo, depth=depth, config=self.config).decode(
+                g_arr, cutoff
+            )
+        else:
+            # If JAX missing but we need to decode JAX genotype, we are in trouble.
+            # But ResultManager serves analysis, maybe loaded on CPU only?
+            # For now assume JAX is present if we are decoding.
+            raise ImportError("JAX required to decode genotype parameters.")
 
         # Convert JAX arrays to native Python types for inspection
         def convert(obj):

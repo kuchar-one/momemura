@@ -7,7 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from thewalrus.quantum import pure_state_amplitude as walrus_pure_state_amplitude
-from src.circuits.jax_herald import (
+from src.simulation.jax.herald import (
+    jax_get_heralded_state,
     jax_pure_state_amplitude,
     vacuum_covariance,
     two_mode_squeezer_symplectic,

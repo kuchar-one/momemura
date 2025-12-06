@@ -46,9 +46,12 @@ python run_mome.py --mode qdax --backend jax --pop 50 --iters 200 --cutoff 10 --
 - `--pop`: Population size.
 - `--iters`: Number of generations.
 - `--cutoff`: Fock space truncation cutoff.
+- `--genotype`: Genotype design to use: `legacy` (default), `A` (Canonical), `B1`, `B2`, `C1`, `C2`. See `docs/jax_genotype_and_circuit.md` for details.
 - `--target-alpha`: Target GKP |0> coefficient (default 1.0).
-- `--target-beta`: Target GKP |1> coefficient (default 0.0).
+- `--target-beta`: Target GKP |1> coefficient (default 0.0, complex).
 - `--low-mem`: Disables JAX memory preallocation to save VRAM (precision remains `float32`).
+- `--profile`: Enable JAX profiling (saves trace to `./profiles`).
+- `--no-plot`: Disable plotting (useful for clusters).
 
 ### Profiling
 
@@ -59,10 +62,12 @@ python scripts/profile_mome.py
 
 ## Project Structure
 
-- `src/circuits`: Core quantum circuit logic (`Composer`, `GaussianHeraldCircuit`).
-- `src/circuits/jax_composer.py`: JAX-optimized circuit backend.
+- `src/genotypes`: Genotype definitions (Canonical Designs A, B, C).
+- `src/simulation`: Core simulation logic.
+  - `jax`: GPU-accelerated runner and modules.
+  - `cpu`: CPU reference implementation (TheWalrus/Numpy).
 - `src/utils`: Helpers for caching, GKP operators, and result management.
-- `tests`: Pytest suite for correctness and parity.
+- `tests`: Unified Pytest suite.
 - `output`: Optimization results (checkpoints, plots, animations).
 
 ## Documentation

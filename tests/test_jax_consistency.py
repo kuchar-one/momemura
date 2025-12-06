@@ -7,9 +7,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from src.circuits.composer import Composer
-from src.circuits.jax_composer import jax_superblock, jax_hermite_phi_matrix
-from src.circuits.jax_runner import jax_decode_genotype, jax_get_heralded_state
+from src.simulation.cpu.composer import Composer
+from src.simulation.jax.composer import (
+    jax_u_bs,
+    jax_apply_bs_vec,
+    jax_superblock,
+    jax_hermite_phi_matrix,
+)
+from src.simulation.jax.runner import jax_get_heralded_state
+from src.genotypes.genotypes import get_genotype_decoder
 
 
 def test_jax_superblock_consistency():
@@ -34,7 +40,8 @@ def test_jax_superblock_consistency():
     key = jax.random.PRNGKey(42)
     g = jax.random.normal(key, (300,))  # Enough for 256 params
 
-    params = jax_decode_genotype(g, cutoff)
+    # params = jax_decode_genotype(g, cutoff)
+    params = get_genotype_decoder("legacy").decode(g, cutoff)
 
     # Extract params
     leaf_params = params["leaf_params"]

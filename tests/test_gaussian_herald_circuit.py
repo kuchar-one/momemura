@@ -11,7 +11,7 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from circuits.gaussian_herald_circuit import (
+from src.simulation.cpu.circuit import (
     GaussianHeraldCircuit,
     interferometer_params_to_unitary,
 )

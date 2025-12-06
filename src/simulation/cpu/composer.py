@@ -20,12 +20,12 @@ import os
 import warnings
 
 from src.utils.cache_manager import CacheManager
-from src.circuits.ops import (
+from src.simulation.cpu.ops import (
+    HBAR,
     build_beamsplitter_unitary,
     kron_state_vector,
     contract_rho_with_phi,
     get_phi_matrix_cached,
-    HBAR,
 )
 from numpy.polynomial.legendre import leggauss
 
@@ -494,7 +494,7 @@ class Composer:
             dx_weights = jnp.array(dx_weights_np)
 
         # Call JIT function
-        from .jax_composer import jax_compose_pair
+        from src.simulation.jax.composer import jax_compose_pair
 
         return jax_compose_pair(
             stateA,

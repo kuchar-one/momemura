@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from src.circuits.jax_runner import jax_scoring_fn_batch, jax_decode_genotype
+from src.simulation.jax.runner import jax_scoring_fn_batch
 
 
 def test_jax_scoring_fn_batch_shapes():

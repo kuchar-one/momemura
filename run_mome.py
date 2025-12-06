@@ -21,14 +21,15 @@ import time
 import argparse
 import numpy as np
 from functools import partial
-import math
 from typing import Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib
 
 # === Project imports ===
-from src.circuits.gaussian_herald_circuit import GaussianHeraldCircuit
-from src.circuits.composer import Composer, SuperblockTopology
+from src.genotypes.genotypes import get_genotype_decoder
+
+from src.simulation.cpu.composer import Composer, SuperblockTopology
+from src.simulation.cpu.circuit import GaussianHeraldCircuit
 from src.utils.cache_manager import CacheManager
 
 # Set memory allocator to avoid fragmentation OOMs
@@ -84,162 +85,9 @@ class SimpleRepertoire:
 # -------------------------
 # Genotype -> params decoder
 # -------------------------
-def decode_genotype(
-    genotype: np.ndarray,
-    *,
-    max_signal: int = 2,
-    max_control: int = 2,
-    max_schmidt: int = 2,
-    max_pnr: int = 3,
-    max_modes_for_interf: int = 2,
-    cutoff: int = DEFAULT_CUTOFF,
-) -> Dict[str, Any]:
-    """Decode a 1D real genotype into Gaussian block parameters."""
-    g = np.asarray(genotype, dtype=float).flatten()
-    # Calculate expected length
-    expect_len = (
-        2
-        + max_schmidt
-        + 2 * ((max_modes_for_interf * (max_modes_for_interf - 1)) // 2)
-        + 2 * max_modes_for_interf
-        + 2 * ((max_modes_for_interf * (max_modes_for_interf - 1)) // 2)
-        + 2 * max_modes_for_interf
-        + 2 * max_signal
-        + 2 * max_control
-        + max_control
-        + 5
-    )
-    if g.size < expect_len:
-        g = np.concatenate([g, np.zeros(expect_len - g.size, dtype=float)])
 
-    idx = 0
-    # Discrete modes
-    # u_sig = np.clip(g[idx], 0.0, 1.0) # Unused since n_signal forced to 1
-    idx += 1
-    u_ctrl = np.clip(g[idx], 0.0, 1.0)
-    idx += 1
 
-    # FORCE pure-state pipeline single signal
-    # Note: genotype bits for n_signal are ignored to keep genotype length stable.
-    n_signal = 1
-    n_control = (
-        int(1 + math.floor(u_ctrl * (max_control - 1))) if max_control > 1 else 1
-    )
-
-    # Schmidt squeezings
-    raw_r = g[idx : idx + max_schmidt]
-    idx += max_schmidt
-    tmss_squeezing = [float(np.tanh(x) * 1.2) for x in raw_r]
-    schmidt_rank = min(len(tmss_squeezing), min(n_signal, n_control))
-    tmss_squeezing = tmss_squeezing[:schmidt_rank]
-
-    # Interferometer parameters
-    Lmax = max_modes_for_interf * (max_modes_for_interf - 1) // 2
-    us_theta_pack = g[idx : idx + Lmax]
-    idx += Lmax
-    us_phi_pack = g[idx : idx + Lmax]
-    idx += Lmax
-    us_varphi_pack = g[idx : idx + max_modes_for_interf]
-    idx += max_modes_for_interf
-    uc_theta_pack = g[idx : idx + Lmax]
-    idx += Lmax
-    uc_phi_pack = g[idx : idx + Lmax]
-    idx += Lmax
-    uc_varphi_pack = g[idx : idx + max_modes_for_interf]
-    idx += max_modes_for_interf
-
-    def map_angles(arr, scale=math.pi / 2):
-        return [float(np.tanh(x) * scale) for x in arr.tolist()]
-
-    M_us = max(n_signal, 1)
-    M_uc = max(n_control, 1)
-    us_theta = map_angles(us_theta_pack)[: (M_us * (M_us - 1) // 2)]
-    us_phi = map_angles(us_phi_pack)[: (M_us * (M_us - 1) // 2)]
-    us_varphi = map_angles(us_varphi_pack)[:M_us]
-    uc_theta = map_angles(uc_theta_pack)[: (M_uc * (M_uc - 1) // 2)]
-    uc_phi = map_angles(uc_phi_pack)[: (M_uc * (M_uc - 1) // 2)]
-    uc_varphi = map_angles(uc_varphi_pack)[:M_uc]
-
-    us_params = {
-        "theta": np.array(us_theta),
-        "phi": np.array(us_phi),
-        "varphi": np.array(us_varphi),
-    }
-    uc_params = {
-        "theta": np.array(uc_theta),
-        "phi": np.array(uc_phi),
-        "varphi": np.array(uc_varphi),
-    }
-
-    # Displacements
-    disp_s = []
-    for _ in range(max_signal):
-        real = float(np.tanh(g[idx]) * 1.0)
-        imag = float(np.tanh(g[idx + 1]) * 1.0)
-        disp_s.append(real + 1j * imag)
-        idx += 2
-    disp_s = disp_s[:n_signal]
-    disp_c = []
-    for _ in range(max_control):
-        real = float(np.tanh(g[idx]) * 1.0)
-        imag = float(np.tanh(g[idx + 1]) * 1.0)
-        disp_c.append(real + 1j * imag)
-        idx += 2
-    disp_c = disp_c[:n_control]
-
-    # PNR outcomes
-    pnr = []
-    for j in range(max_control):
-        u = float(np.clip(g[idx], 0.0, 1.0))
-        idx += 1
-        val = int(round(u * max_pnr))
-        pnr.append(val)
-    pnr = pnr[:n_control]
-
-    # Homodyne params
-    hom_x_raw = float(g[idx])
-    idx += 1
-    hom_win_raw = float(g[idx])
-    idx += 1
-    homodyne_x = float(np.tanh(hom_x_raw) * 4.0)
-    homodyne_window = float(np.abs(np.tanh(hom_win_raw) * 2.0))
-
-    # Round to ensure cache hits for quadrature matrices
-    homodyne_x = round(homodyne_x, 6)
-    homodyne_window = round(homodyne_window, 6)
-
-    if homodyne_window < 1e-3:
-        homodyne_window = None
-
-    # Force fixed beam splitter parameters for consistent caching/architecture
-    # We still consume the genotype slots to maintain compatibility
-    _ = float(np.tanh(g[idx]) * (math.pi / 2))
-    idx += 1
-    _ = float(np.tanh(g[idx]) * math.pi)
-    idx += 1
-    mix_theta = math.pi / 4.0
-    mix_phi = 0.0
-    final_rot = float(np.tanh(g[idx]) * math.pi)
-    idx += 1
-
-    return {
-        "n_signal": n_signal,
-        "n_control": n_control,
-        "tmss_squeezing": tmss_squeezing,
-        "us_params": us_params,
-        "uc_params": uc_params,
-        "U_s": None,
-        "U_c": None,
-        "disp_s": disp_s,
-        "disp_c": disp_c,
-        "pnr_outcome": pnr,
-        "homodyne_x": homodyne_x,
-        "homodyne_window": homodyne_window,
-        "mix_theta": mix_theta,
-        "mix_phi": mix_phi,
-        "final_rotation": final_rot,
-        "signal_cutoff": cutoff,
-    }
+# Genotype Decoder is imported at top level
 
 
 # -------------------------
@@ -324,6 +172,8 @@ class HanamuraMOMEAdapter:
         mode: str = "pure",
         homodyne_resolution: float = 0.01,
         backend: str = "thewalrus",
+        genotype_name: str = "legacy",
+        genotype_config: Dict[str, Any] = None,
     ):
         self.composer = composer
         self.topology = topology
@@ -332,6 +182,12 @@ class HanamuraMOMEAdapter:
         self.mode = mode
         self.homodyne_resolution = homodyne_resolution
         self.backend = backend
+        self.genotype_name = genotype_name
+        self.genotype_config = genotype_config or {}
+
+        # Instantiate decoder for local use
+        self.decoder = get_genotype_decoder(genotype_name, config=self.genotype_config)
+
         if hasattr(composer, "cutoff") and composer.cutoff != self.cutoff:
             raise ValueError("composer.cutoff != operator cutoff")
 
@@ -346,99 +202,186 @@ class HanamuraMOMEAdapter:
 
     def evaluate_one(self, genotype: np.ndarray) -> Dict[str, Any]:
         """Evaluate a single genotype and return metrics."""
-        params = decode_genotype(genotype, cutoff=self.cutoff)
+        # Use new decoder
+        # Only support "Legacy" format dict output needed for gaussian_block_builder?
+        # WAIT. gaussian_block_builder_from_params expects specific keys ("n_control", "tmss_squeezing", etc.)
+        # The new BaseGenotype.decode returns "leaf_params" structure which is DIFFERENT from legacy "flat" structure used in `run_mome.py`.
+        # This is a critical mismatch!
 
-        # If pure mode, we can optionally enforce n_signal=1 in decode or builder
-        # For now, builder enforces it.
+        # We need to adapt the new dict structure to what `gaussian_block_builder_from_params` expects,
+        # OR update `gaussian_block_builder_from_params` to understand the new structure.
+        # But `gaussian_block_builder_from_params` builds a `GaussianHeraldCircuit`.
 
-        try:
-            vec, prob_block = gaussian_block_builder_from_params(
-                params, cutoff=self.cutoff, backend=self.backend
+        # In JAX pipeline (jax_runner), we construct the circuit directly via JAX primitives (jax_get_heralded_state).
+        # In "random" mode (using HanamuraMOMEAdapter.evaluate_one), it uses `gaussian_block_builder_from_params` which uses `thewalrus`.
+
+        # Do we need to support "random" mode with "thewalrus" backend for NEW genotypes?
+        # The user implies full integration.
+        # BUT maintaining `thewalrus` builder for all new genotypes is complex because `GaussianHeraldCircuit` might not support broadcasting etc. easily.
+        # ACTUALLY, the JAX runner now supports all genotypes.
+        # Ideally, `run_mome.py` should prefer JAX backend even for "random" mode if available, or we update the adapter to use JAX for evaluate_one too?
+
+        # Current `evaluate_one` uses `gaussian_block_builder_from_params` -> `GaussianHeraldCircuit` -> standard pipeline.
+        # If we switch to new genotypes, `decode_genotype` is gone.
+
+        # Temporary Fix: Map params from new keys to legacy keys if possible?
+        # Legacy Genotype class returns:
+        # { "homodyne_x", "mix_params", ..., "leaf_params": { "n_ctrl", ... } }
+
+        # `gaussian_block_builder_from_params` needs: "n_signal", "n_control", "tmss_squeezing", "us_params", etc.
+
+        # It seems `gaussian_block_builder_from_params` was built around the SPECIFIC legacy decoding.
+        # The new designs (A, B, C) produce `leaf_params` arrays.
+        # `GaussianHeraldCircuit` (the Python class) expects lists of params.
+
+        # If we want to use the Python/Walrus backend with new genotypes, we need to bridge this.
+        # However, for `mode="qdax"`, it uses `jax_scoring_fn_batch` which works fine (it uses JAX runner).
+        # For `mode="random"`, `evaluate_one` is called on CPU.
+
+        # If JAX is available, `evaluate_one` is mostly used for debugging or non-JAX environments?
+        # But `run_mome` uses `jax_scoring_fn_batch` IF `self.backend == "jax"`.
+        # So for high performance, we use JAX.
+
+        # If we use new genotypes, we should probably enforce/prefer JAX backend.
+        # Implementing the bridge for `thewalrus` backend for all complex tied designs is tedious and maybe unnecessary if JAX is the future.
+
+        # The decoded dict has "leaf_params" with arrays of shape (8, ...).
+        # We need to construct `GaussianHeraldCircuit` for each leaf?
+        # `gaussian_block_builder_from_params` builds ONE block.
+        # The topology evaluation loops over leaves.
+
+        # This shows `evaluate_one` relies on the old "single genotype encodes single block params + global" assumption?
+        # WAIT. The legacy code was:
+        # `params = decode_genotype(...)`
+        # `vec, prob = gaussian_block_builder_from_params(params)`
+        # `fock_vecs = [vec for _ in range(n_leaves)]`
+        # This implies standard "random" mode ONLY supported the case where ALL leaves are identical?
+        # Yes, line 364: `fock_vecs = [vec.copy() for _ in range(n_leaves)]`.
+        # The legacy random search assumed a single block type replicated.
+
+        # The NEW genotypes allow heterogeneous leaves (Design A, B).
+        # So `evaluate_one` logic of "decode once -> build one block -> replicate" is WRONG for Design A/B.
+
+        # If we want to support Design A/B in `evaluate_one`, we must:
+        # 1. Decode genotype -> get params for EACH leaf.
+        # 2. Build circuit for EACH leaf.
+
+        # But `gaussian_block_builder_from_params` takes a dict for one block.
+        # We can reconstruct that dict 8 times.
+
+        # Let's write an adapter helper `_params_to_legacy_dict(new_params, leaf_idx)`.
+
+        # If backend is JAX, `evaluate_one` is NOT used in `scoring_fn_batch` (optimized path).
+        # It IS used in `scoring_fn_batch` fallback loop (lines 508+).
+
+        # For this task, I will implement a JAX-based `evaluate_one` if JAX is installed, or try to adapt.
+        # Actually, if we are in JAX mode, we should just use JAX function even for single evaluation?
+        # Yes.
+
+        # But `evaluate_one` returns a dict of metrics (expectation, complexity, etc.).
+        # JAX scoring function returns fitness array.
+        # We need to map back.
+
+        # Let's rely on JAX backend primarily.
+
+        # Refactoring `evaluate_one`:
+
+        # Convert genotype to JAX
+        g_jax = jnp.array(genotype)
+
+        # Use decoder
+        params = self.decoder.decode(g_jax, self.cutoff)
+
+        # To reuse `gaussian_block_builder_from_params`, we need conversion.
+        # But maybe we can skip that and use `jax_get_heralded_state`?
+        # If JAX is available, use JAX logic to compute state.
+
+        if jax is not None:
+            # Use JAX implementation of the block builder
+            from src.simulation.jax.runner import jax_get_heralded_state
+
+            # Map JAX params to leaf_params
+            leaf_params = params["leaf_params"]
+            # leaves: (8, ...)
+
+            # vmap to get all leaves
+            leaf_vecs, leaf_probs, leaf_modes, leaf_max_pnrs, leaf_total_pnrs = (
+                jax.vmap(partial(jax_get_heralded_state, cutoff=self.cutoff))(
+                    leaf_params
+                )
             )
-        except Exception as e:
-            # invalid genotype: too small prob or other failure -> mark as invalid
-            raise ValueError(f"Invalid block (herald/purity): {e}")
 
-        # Replicate per leaf
-        n_leaves = self.topology._count_leaves(self.topology.plan)
-        fock_vecs = [vec.copy() for _ in range(n_leaves)]
-        p_heralds = [prob_block for _ in range(n_leaves)]
+            # Convert to numpy for topology eval?
+            # Topology eval uses `self.topology.evaluate_topology` which expects numpy arrays and uses Composer (walrus/piquasso).
+            # Mixing JAX output with Walrus composer is inefficient but works (convert to np).
 
-        # Configure topology evaluation based on mode
-        is_pure_mode = self.mode == "pure"
-
-        # In pure mode, force window to None to ensure pure path
-        h_window = params.get("homodyne_window", None)
-        if is_pure_mode:
-            h_window = None
-
-        try:
-            # Force pure_only True to ensure whole topology remains pure
-            final_state, joint_prob = self.topology.evaluate_topology(
-                composer=self.composer,
-                fock_vecs=fock_vecs,
-                p_heralds=p_heralds,
-                homodyne_x=params.get("homodyne_x", None),
-                homodyne_window=h_window,
-                homodyne_resolution=self.homodyne_resolution if is_pure_mode else None,
-                theta=params.get("mix_theta", math.pi / 4.0),
-                phi=params.get("mix_phi", 0.0),
-                exact_mixed=False,  # allow fast path
-                n_hom_points=201,
-                pure_only=is_pure_mode,
-            )
-        except Exception as e:
-            # topology required mixed-state propagation -> mark invalid
-            raise ValueError(f"Topology not pure for genotype: {e}")
-
-        # Apply final rotation
-        final_rot = params.get("final_rotation", 0.0)
-        if abs(final_rot) > 1e-12:
-            Urot = np.diag(np.exp(1j * final_rot * np.arange(self.cutoff)))
-            if final_state.ndim == 1:
-                final_state = Urot @ final_state
+            # Unused analysis variables
+            # fock_vecs, p_heralds = ...
+            # Homodyne
+            h_x = float(params["homodyne_x"])
+            h_win = params["homodyne_window"]  # might be float or None (if -1)
+            if isinstance(h_win, (int, float, jnp.ndarray)) and h_win < 1e-3:
+                h_win = None
             else:
-                final_state = Urot @ final_state @ Urot.conj().T
+                h_win = float(h_win)
 
-        # Expectation value
-        if final_state.ndim == 1:
-            exp_val = float(
-                np.real(np.vdot(final_state, (self.operator @ final_state)))
+            # Mix params
+            # New genotypes have "mix_params" array (7, 3).
+            # Legacy topology evaluation assumes "mix_theta" constant?
+            # Line 384: `theta=params.get("mix_theta", ...)`
+            # The existing topology eval `evaluate_topology` assumes homogeneous mixing?
+
+            # Let's check `src/simulation/cpu/composer.py` `evaluate_topology`.
+            # If `evaluate_topology` doesn't support heterogeneous mixing arguments, we can't fully support Design A/B accurately with the old Python `SuperblockTopology` class.
+            # BUT `jax_runner.py` DOES support heterogeneous mixing in `jax_superblock`.
+
+            # So, for accurate evaluation of new genotypes, we MUST use `jax_superblock` logic, not the old `composer.py` logic.
+            # The old logic is insufficient for Design A (heterogeneous).
+
+            # Thus, `evaluate_one` should call `jax_superblock` effectively if we want consistency.
+            # `jax_scoring_fn_batch` (in `jax_runner.py`) does exactly this.
+
+            # So `evaluate_one` should wrapper `jax_scoring_fn_batch` for a batch of 1?
+            # Yes! That guarantees consistency.
+
+            # Prepare batch 1
+            g_batch = g_jax[None, :]
+            op_batch = jnp.array(self.operator)
+
+            from src.simulation.jax.runner import jax_scoring_fn_batch
+
+            fitnesses, descriptors = jax_scoring_fn_batch(
+                g_batch, self.cutoff, op_batch, genotype_name=self.genotype_name
             )
+
+            # Extract metrics
+            fit = fitnesses[0]
+            desc = descriptors[0]
+
+            # fitness = [-exp, -logP, -comp, -photons]
+            exp_val = -float(fit[0])
+            log_prob = -float(fit[1])
+            joint_prob = 10 ** (-log_prob)
+            complexity = -float(fit[2])
+            total_ph = -float(fit[3])
+
+            # descriptors = [active_modes, max_pnr, total_photons]
+            per_det_max = float(desc[1])
+
+            return {
+                "expectation": exp_val,
+                "joint_prob": joint_prob,
+                "log_prob": log_prob,
+                "complexity": complexity,
+                "total_measured_photons": total_ph,
+                "per_detector_max": per_det_max,
+                "homodyne_x": h_x,  # extra info
+            }
+
         else:
-            exp_val = float(np.real(np.trace(final_state @ self.operator)))
+            raise RuntimeError("JAX is required for generalized genotypes.")
 
-        # Metrics
-        def count_pairs(node):
-            if node[0] == "leaf":
-                return 0
-            return 1 + count_pairs(node[1]) + count_pairs(node[2])
-
-        topo = count_pairs(self.topology.plan)
-
-        # Include mode count in complexity as requested
-        # Complexity = tree_depth + number_of_modes
-        # Tree depth for 2-layer superblock is roughly 2
-        # Number of modes = n_signal + n_control
-        n_modes = params["n_signal"] + params["n_control"]
-        complexity = topo + n_modes
-
-        pnr = params.get("pnr_outcome", [])
-        total_ph = int(sum(pnr) * n_leaves)
-        per_det_max = int(max(pnr) if len(pnr) > 0 else 0)
-
-        # Log probability (clipped)
-        prob_clipped = max(float(joint_prob), 1e-300)
-        log_prob = -math.log10(prob_clipped)
-
-        return {
-            "expectation": exp_val,
-            "joint_prob": float(joint_prob),
-            "log_prob": log_prob,
-            "complexity": complexity,
-            "total_measured_photons": total_ph,
-            "per_detector_max": per_det_max,
-        }
+        # If JAX is missing, we fail. The project relies on JAX now.
 
     def scoring_fn_batch(
         self,
@@ -447,63 +390,85 @@ class HanamuraMOMEAdapter:
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """
         Batched scoring function.
-        Returns:
-          fitnesses: (batch_size, N_objectives)
-          descriptors: (batch_size, N_descriptors)
-          extra_scores: dict of arrays
         """
         batch_size = genotypes.shape[0]
-        fitnesses = np.zeros((batch_size, 4))  # 4 objectives
-        descriptors = np.zeros((batch_size, 3))  # 3 descriptors
-        extras = []
 
-        # Parallel evaluation
         if self.backend == "jax" and jax is not None:
             # JAX batch execution
-            from src.circuits.jax_runner import jax_scoring_fn_batch
+            from src.simulation.jax.runner import jax_scoring_fn_batch
 
-            # Ensure genotypes are JAX array
             g_jax = jnp.array(genotypes)
             op_jax = jnp.array(self.operator)
 
-            # Run batched scoring
-            # jax_scoring_fn_batch returns (fitnesses, descriptors)
-            # We need to handle potential compilation overhead on first run
             with jax.profiler.TraceAnnotation("jax_scoring_fn_batch"):
                 fitnesses_jax, descriptors_jax = jax_scoring_fn_batch(
-                    g_jax, self.cutoff, op_jax
+                    g_jax, self.cutoff, op_jax, genotype_name=self.genotype_name
                 )
-                # Force synchronization to ensure it's captured in profile
                 fitnesses_jax.block_until_ready()
                 descriptors_jax.block_until_ready()
 
-            # Convert back to numpy for QDax/compatibility
-            # (QDax might accept JAX arrays, but let's be safe if mixing)
-            # Actually QDax runs on JAX, so it expects JAX arrays!
-            # But run_mome.py seems to use numpy for adapter interface?
-            # "genotypes: np.ndarray" in type hint.
-            # If we are in "qdax" mode, genotypes might be JAX arrays.
-            # If we are in "random" mode, they are numpy.
-
-            # If input was numpy, return numpy. If jax, return jax?
-            # The signature says np.ndarray.
-            # But let's check if we need to convert.
-
-            # If we return JAX arrays, QDax is happy.
-            # If we return Numpy arrays, QDax might convert them.
-
-            # Let's return JAX arrays if input was JAX, else convert?
-            # Or just return JAX arrays and let caller handle.
-            # But `extras` needs to be constructed.
-
             fitnesses = fitnesses_jax
             descriptors = descriptors_jax
-
-            # Extras: we don't have per-individual metrics easily from vmap unless we modify it.
-            # For now return list of empty dicts to satisfy random search loop (extras[i]).
             extras = [{} for _ in range(batch_size)]
-
             return fitnesses, descriptors, extras
+
+        # Fallback to serial (for non-JAX backend or debug)
+        fitnesses = np.zeros((batch_size, 4))
+        descriptors = np.zeros((batch_size, 3))
+        extras = []
+
+        def eval_single(i):
+            try:
+                metrics = self.evaluate_one(genotypes[i, :])
+                return i, metrics, None
+            except Exception as e:
+                return i, None, str(e)
+
+        # Use persistent executor
+        futures = [self.executor.submit(eval_single, i) for i in range(batch_size)]
+        results = [f.result() for f in futures]
+
+        for i, metrics, error in results:
+            if error:
+                # invalid genotype
+                fitnesses[i, :] = -np.inf
+                descriptors[i, :] = np.array([-9999.0, -9999.0, -9999.0], dtype=float)
+                extras.append({"error": error})
+                continue
+
+            # Objectives (QDax maximizes all)
+            # 1. Expectation (maximize) -> f_expect
+            # 2. Log Prob (minimize -logP -> maximize logP) -> f_prob
+            # 3. Complexity (minimize) -> -complexity
+            # 4. Total Photons (minimize) -> -photons
+
+            f_expect = metrics["expectation"]
+            f_prob = metrics["log_prob"]  # usage suggests this is -log10(P), wait.
+            # In evaluate_one I set log_prob = -math.log10(prob). This is positive for tiny prob.
+            # Minimizing "log_prob" (which is usually decreasing with P).
+            # If we want to maximize probability, we minimize -log(P).
+            # The metrics["log_prob"] returned by existing evaluate_one is usually -log10(P).
+            # In my JAX update I set log_prob = metrics["log_prob"]...
+            # In original: f_prob = metrics["log_prob"].
+            # fitness[1] = -f_prob.
+            # If f_prob = -log10(P) (positive), then fitness = log10(P) (negative).
+            # Maximizing fitness (negative number) -> Maximizing P. Correct.
+
+            f_prob = metrics["log_prob"]
+            f_complex = float(metrics["complexity"])
+            f_photons = float(metrics["total_measured_photons"])
+
+            fitnesses[i, :] = np.array([f_expect, -f_prob, -f_complex, -f_photons])
+
+            # Descriptors (Match JAX runner order: [Complex, Max, Total])
+            d_total = float(metrics["total_measured_photons"])
+            d_max = float(metrics["per_detector_max"])
+            d_complex = float(metrics["complexity"])
+
+            descriptors[i, :] = np.array([d_complex, d_max, d_total])
+            extras.append(metrics)
+
+        return fitnesses, descriptors, extras
 
         def eval_single(i):
             try:
@@ -714,6 +679,8 @@ def run(
     target_alpha: complex = 2.0,
     target_beta: complex = 0.0,
     low_mem: bool = False,
+    genotype: str = "legacy",
+    genotype_config: Dict[str, Any] = None,
 ):
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
@@ -725,11 +692,6 @@ def run(
     topology = SuperblockTopology.build_layered(2)
 
     # Construct GKP operator
-    # Note: construct_gkp_operator handles backend-specific return types (numpy vs jax)
-    # But HanamuraMOMEAdapter expects a numpy array for initialization usually?
-    # Let's check. The adapter stores it.
-    # If backend is jax, we might want jax array.
-    # construct_gkp_operator(..., backend=backend) does the right thing.
     operator = construct_gkp_operator(
         cutoff, target_alpha, target_beta, backend=backend
     )
@@ -743,9 +705,22 @@ def run(
         mode=mode,
         homodyne_resolution=0.01,
         backend=backend,
+        genotype_name=genotype,
+        genotype_config=genotype_config,
     )
 
-    D = 256  # genotype dimension (increased for full tree)
+    # Calculate Genotype Dimension D
+    # We use valid depth=3 as default for genotype length logic
+    # Use config depth if available?
+    # Genotype length might depend on depth, which is usually part of init.
+    # Where does depth come from? CLI arg now!
+    depth_val = 3
+    if genotype_config and "depth" in genotype_config:
+        depth_val = int(genotype_config["depth"])
+
+    decoder = get_genotype_decoder(genotype, depth=depth_val, config=genotype_config)
+    D = decoder.get_length(depth_val)
+    print(f"Genotype '{genotype}' selected. Dimension D={D}")
 
     if mode == "qdax":
         try:
@@ -870,7 +845,7 @@ def run(
         # Define scoring function using jax.pure_callback
         # Define scoring function using jax.pure_callback
         # Define scoring function using JAX runner
-        from src.circuits.jax_runner import jax_scoring_fn_batch
+        from src.simulation.jax.runner import jax_scoring_fn_batch
 
         def scoring_fn(genotypes, key):
             """
@@ -887,7 +862,9 @@ def run(
             with jax.profiler.TraceAnnotation("jax_scoring_fn_batch_qdax"):
                 # Ensure operator is a JAX array
                 op_jax = jnp.array(operator)
-                fitnesses, descriptors = jax_scoring_fn_batch(genotypes, cutoff, op_jax)
+                fitnesses, descriptors = jax_scoring_fn_batch(
+                    genotypes, cutoff, op_jax, genotype_name=genotype
+                )
 
             # QDax expects extra scores (gradients/etc) but we don't have them.
             # We return empty dict for extras.
@@ -1155,6 +1132,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--low-mem", action="store_true", help="Enable low-memory mode")
+    parser.add_argument(
+        "--genotype",
+        type=str,
+        default="legacy",
+        help="Genotype design (legacy, A, B1, B2, C1, C2)",
+    )
     parser.add_argument("--profile", action="store_true", help="Enable JAX profiling")
     parser.add_argument(
         "--target-beta",
@@ -1162,7 +1145,32 @@ def main():
         default=0.0,
         help="Target superposition beta (complex)",
     )
+
+    # Parameter Limits
+    parser.add_argument("--depth", type=int, default=3, help="Circuit depth")
+    parser.add_argument(
+        "--r-scale", type=float, default=2.0, help="Max squeezing (tanh scale)"
+    )
+    parser.add_argument(
+        "--d-scale", type=float, default=3.0, help="Max displacement scale"
+    )
+    parser.add_argument("--hx-scale", type=float, default=4.0, help="Homodyne X scale")
+    parser.add_argument(
+        "--window", type=float, default=0.1, help="Homodyne window width"
+    )
+    parser.add_argument("--pnr-max", type=int, default=3, help="Max PNR outcome")
+
     args = parser.parse_args()
+
+    # Build config dict
+    genotype_config = {
+        "depth": args.depth,
+        "r_scale": args.r_scale,
+        "d_scale": args.d_scale,
+        "hx_scale": args.hx_scale,
+        "window": args.window,
+        "pnr_max": args.pnr_max,
+    }
 
     # Profiling context
     if args.profile and args.backend == "jax" and jax is not None:
@@ -1180,6 +1188,7 @@ def main():
                 target_alpha=args.target_alpha,
                 target_beta=args.target_beta,
                 low_mem=args.low_mem,
+                genotype_config=genotype_config,
             )
         finally:
             jax.profiler.stop_trace()
@@ -1196,6 +1205,7 @@ def main():
             target_alpha=args.target_alpha,
             target_beta=args.target_beta,
             low_mem=args.low_mem,
+            genotype_config=genotype_config,
         )
 
 
