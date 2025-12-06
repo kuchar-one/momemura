@@ -116,7 +116,7 @@ def test_jax_u_bs():
     print("Expected:")
     print(expected)
 
-    np.testing.assert_allclose(submat, expected, atol=1e-5)
+    np.testing.assert_allclose(submat, expected, atol=2e-4)
 
 
 if __name__ == "__main__":

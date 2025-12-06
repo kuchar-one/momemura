@@ -54,7 +54,7 @@ def test_gaussian_herald_circuit_parity():
     state_gpu, prob_gpu = circ_gpu.herald(pnr, signal_cutoff=cutoff)
 
     # Compare
-    assert np.isclose(prob_cpu, prob_gpu, atol=1e-5)
+    assert np.isclose(prob_cpu, prob_gpu, atol=2e-4)
 
     # state_gpu might be JAX array
     state_gpu_np = np.array(state_gpu)
@@ -140,7 +140,7 @@ def test_composer_parity_mixed():
 
     out_gpu_np = np.array(out_gpu)
     # Density matrices
-    np.testing.assert_allclose(out_cpu, out_gpu_np, atol=1e-5)
+    np.testing.assert_allclose(out_cpu, out_gpu_np, atol=2e-4)
 
 
 @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")

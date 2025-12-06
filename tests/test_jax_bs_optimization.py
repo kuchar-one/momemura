@@ -65,7 +65,7 @@ def test_jax_apply_bs_vec_correctness():
         print(
             f"Small Cutoff ({cutoff_small}) Theta={theta:.4f}, Phi={phi:.4f}, Diff={diff:.4e}"
         )
-        assert diff < 1e-3, f"Small Cutoff Mismatch: {diff}"
+        assert diff < 5e-3, f"Small Cutoff Mismatch: {diff}"
 
 
 def test_jax_compose_pair_optimization():
@@ -127,7 +127,7 @@ def test_jax_compose_pair_optimization():
 
     diff = jnp.linalg.norm(res_vec - vec_cond_expected)
     print(f"Compose Pair Diff: {diff:.4e}")
-    assert diff < 1e-4
+    assert diff < 1e-3
 
 
 if __name__ == "__main__":

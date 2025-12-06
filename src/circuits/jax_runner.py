@@ -481,11 +481,18 @@ def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
     )
 
 
-def jax_scoring_fn_batch(
+# -------------------------
+# Batched Scoring
+# -------------------------
+
+
+@partial(jax.jit, static_argnames=("cutoff",))
+def _score_batch_shard(
     genotypes: jnp.ndarray, cutoff: int, operator: jnp.ndarray
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Batched scoring function.
+    JIT-compiled scoring function for a single batch shard.
+    This runs on one device.
     """
 
     def score_one(g):
@@ -569,4 +576,79 @@ def jax_scoring_fn_batch(
         return fitness, descriptor
 
     fitnesses, descriptors = jax.vmap(score_one)(genotypes)
+    return fitnesses, descriptors
+
+
+def jax_scoring_fn_batch(
+    genotypes: jnp.ndarray, cutoff: int, operator: jnp.ndarray
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Batched scoring function.
+    Dispatches to multi-device pmap if devices > 1, else uses jit.
+    """
+    n_devices = jax.local_device_count()
+
+    if n_devices <= 1:
+        # Fallback to single-device JIT
+        return _score_batch_shard(genotypes, cutoff, operator)
+
+    # Multi-GPU Logic
+    # 1. Pad genotypes to be divisible by n_devices
+    batch_size = genotypes.shape[0]
+    remainder = batch_size % n_devices
+    padding = (n_devices - remainder) if remainder > 0 else 0
+
+    if padding > 0:
+        # Pad with zeros (or duplicates)
+        # Since these are extra, their results will be discarded.
+        # Zeros might cause numerical issues in eval?
+        # Better to pad with the first element to ensure validity.
+        pad_block = jnp.repeat(genotypes[:1], padding, axis=0)
+        g_padded = jnp.concatenate([genotypes, pad_block], axis=0)
+    else:
+        g_padded = genotypes
+
+    # 2. Reshape for pmap: (n_devices, shard_size, ...)
+    shard_size = g_padded.shape[0] // n_devices
+    g_sharded = g_padded.reshape((n_devices, shard_size, -1))
+
+    # 3. pmap execution
+    # Operator needs to be replicated? pmap can handle broadcast if not mapped.
+    # We map axis 0 of g_sharded. operator is constant (broadcasted).
+    # cutoff is static.
+    # We need a pmapped function.
+    # Note: pmap JIT compiles automatically.
+
+    # We define pmapped function outside or cache it?
+    # pmap is expensive to re-compile if partials change.
+    # _score_batch_shard is JIT compressed.
+    # We can use pmap(_score_batch_shard, in_axes=(0, None, None))
+
+    # NOTE: pmap args: (shard, cutoff, operator)
+    # in_axes=(0, None, None) -> shard divides axis 0, others replicated.
+
+    pmapped_fn = jax.pmap(
+        _score_batch_shard,
+        in_axes=(0, None, None),
+        static_broadcasted_argnums=(1,),  # cutoff is arg 1
+    )
+
+    # Replicate operator?
+    # Actually, for pmap with None in_axes, the arg is broadcasted to all devices.
+    # But for array args, it's efficient to do it implicitly.
+
+    fitnesses_sharded, descriptors_sharded = pmapped_fn(g_sharded, cutoff, operator)
+
+    # 4. Reshape back
+    # fitnesses_sharded: (n_devices, shard_size, 4)
+    # descriptors_sharded: (n_devices, shard_size, 3)
+
+    fitnesses = fitnesses_sharded.reshape((-1, 4))
+    descriptors = descriptors_sharded.reshape((-1, 3))
+
+    # 5. Remove padding
+    if padding > 0:
+        fitnesses = fitnesses[:batch_size]
+        descriptors = descriptors[:batch_size]
+
     return fitnesses, descriptors
