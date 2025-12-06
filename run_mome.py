@@ -1188,6 +1188,7 @@ def main():
                 target_alpha=args.target_alpha,
                 target_beta=args.target_beta,
                 low_mem=args.low_mem,
+                genotype=args.genotype,
                 genotype_config=genotype_config,
             )
         finally:
@@ -1205,6 +1206,7 @@ def main():
             target_alpha=args.target_alpha,
             target_beta=args.target_beta,
             low_mem=args.low_mem,
+            genotype=args.genotype,
             genotype_config=genotype_config,
         )
 
