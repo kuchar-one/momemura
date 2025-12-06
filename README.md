@@ -21,7 +21,7 @@ momemura is a high-performance framework for optimizing GKP (Gottesman-Kitaev-Pr
     pip install -r requirements.txt
     ```
 
-    *Note: For GPU support, ensure you install the correct JAX version for your CUDA setup (e.g., `pip install "jax[cuda12]"`).*
+    *Note: For GPU support, ensure you install the correct JAX version for your CUDA setup (e.g., `pip install "jax[cuda]"`).*
 
 ## Usage
 
