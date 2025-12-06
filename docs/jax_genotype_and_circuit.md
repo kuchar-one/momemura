@@ -103,12 +103,12 @@ Unique per leaf. Includes `Active` flag at index 0.
 | :--- | :--- | :--- | :--- |
 | 0 | `active` | > 0.0 | Boolean Active Flag |
 | 1 | `n_ctrl` | Thresholds $\pm 0.33$ | {0, 1, 2} |
-| 2 | `tmss_r` | $\tanh \times 2.0$ | Squeezing (Single) |
+| 2 | `tmss_r` | $\tanh \times R\_SCALE$ | Squeezing (Single) |
 | 3 | `us_phase` | $\tanh \times \pi/2$ | Signal Phase |
 | 4-7 | `uc_params` | $\tanh \times \pi/2$ | Control Unitary (Theta, Phi, Varphi1, Varphi2) |
-| 8-9 | `disp_s` | $\tanh \times 3.0$ | Signal Disp (Re, Im) |
-| 10-13 | `disp_c` | $\tanh \times 3.0$ | Control Disp (Re1, Im1, Re2, Im2) |
-| 14-15 | `pnr` | Integers | {0..3} x 2 |
+| 8-9 | `disp_s` | $\tanh \times D\_SCALE$ | Signal Disp (Re, Im) |
+| 10-13 | `disp_c` | $\tanh \times D\_SCALE$ | Control Disp (Re1, Im1, Re2, Im2) |
+| 14-15 | `pnr` | Integers | {0..`MAX_PNR`} x 2 |
 
 ### Shared Block Parameters (Design B/C, BP=15)
 
@@ -117,12 +117,12 @@ Shared across all leaves. **No Active flag** (handled separately or implicitly T
 | Index | Name | Map | Description |
 | :--- | :--- | :--- | :--- |
 | 0 | `n_ctrl` | Thresholds $\pm 0.33$ | {0, 1, 2} |
-| 1 | `tmss_r` | $\tanh \times 2.0$ | Squeezing |
+| 1 | `tmss_r` | $\tanh \times R\_SCALE$ | Squeezing |
 | 2 | `us_phase` | $\tanh \times \pi/2$ | Signal Phase |
 | 3-6 | `uc_params` | $\tanh \times \pi/2$ | Control Unitary |
-| 7-8 | `disp_s` | $\tanh \times 3.0$ | Signal Disp |
-| 9-12 | `disp_c` | $\tanh \times 3.0$ | Control Disp |
-| 13-14 | `pnr` | Integers | {0..3} |
+| 7-8 | `disp_s` | $\tanh \times D\_SCALE$ | Signal Disp |
+| 9-12 | `disp_c` | $\tanh \times D\_SCALE$ | Control Disp |
+| 13-14 | `pnr` | Integers | {0..`MAX_PNR`} |
 
 ### Mix Node Parameters (PN = 4)
 
