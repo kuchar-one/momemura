@@ -681,6 +681,7 @@ def run(
     low_mem: bool = False,
     genotype: str = "legacy",
     genotype_config: Dict[str, Any] = None,
+    seed_scan: bool = False,
 ):
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
@@ -904,14 +905,80 @@ def run(
             batch_size=emitter_batch_size,
         )
 
+        # --- SEEDING STRATEGY ---
+        # 1. Vacuum Seed (Identity) -> Index 0
+        from src.genotypes.converter import create_vacuum_genotype, upgrade_genotype
+        from src.utils.result_scanner import scan_results_for_seeds
+
+        print("Applying Seeding Strategy...")
+        # Inject Vacuum
+        vacuum = create_vacuum_genotype(
+            genotype, depth=depth_val, config=genotype_config
+        )
+        # Verify length
+        if len(vacuum) == D:
+            genotypes = genotypes.at[0].set(vacuum)
+            print("  - Injected Vacuum State at index 0")
+        else:
+            print(f"Warning: Vacuum len {len(vacuum)} != D {D}. Skipping vacuum.")
+
+        # 2. Result Scanning
+        if seed_scan:
+            # Find best candidates (mix of Exp and Prob?)
+            # Let's get top 20 by expectation
+            seeds = scan_results_for_seeds("output", top_k=20, metric="expectation")
+
+            injected_count = 0
+            # Start injecting at index 1
+            idx = 1
+            for g_src, name_src, score in seeds:
+                if idx >= pop_size:
+                    break
+
+                try:
+                    # Upgrade to current genotype
+                    g_new = upgrade_genotype(
+                        g_src,
+                        name_src,
+                        genotype,
+                        depth=depth_val,
+                        config=genotype_config,
+                    )
+                    if len(g_new) == D:
+                        genotypes = genotypes.at[idx].set(g_new)
+                        idx += 1
+                        injected_count += 1
+                except Exception:
+                    # Conversion failed (e.g. Legacy)
+                    # print(f"Skipping seed from {name_src}: {e}")
+                    pass
+
+            if injected_count > 0:
+                print(f"  - Injected {injected_count} seeds from previous runs.")
+            else:
+                print("  - No valid seeds found or converted.")
+
         # Grid-based Centroids
-        # D1: Active Modes (Complexity): 1..8 (8 bins)
-        # D2: Max PNR: 0..4 (5 bins)
-        # D3: Total Photons: 0..24 (25 bins)
-        # Total = 8 * 5 * 25 = 1000 cells
-        d1 = jnp.linspace(1, 8, 8)
-        d2 = jnp.linspace(0, 4, 5)
-        d3 = jnp.linspace(0, 24, 25)
+        # D1: Active Modes (Complexity): 0..2^depth (Inclusive, so +1 bin)
+        # Note: 0 active modes is Vacuum.
+        max_active = 2**depth_val
+        n_bins_d1 = max_active + 1
+        d1 = jnp.linspace(0, max_active, n_bins_d1)
+
+        # D2: Max PNR: 0..pnr_max (Inclusive, so +1 bin)
+        pnr_max_val = 3
+        if genotype_config and "pnr_max" in genotype_config:
+            pnr_max_val = int(genotype_config["pnr_max"])
+
+        max_pnr_grid = pnr_max_val
+        n_bins_d2 = int(max_pnr_grid + 1)
+        d2 = jnp.linspace(0, max_pnr_grid, n_bins_d2)
+
+        # D3: Total Photons: 0..max_active * pnr_max (Inclusive)
+        max_photons = max_active * pnr_max_val
+        # 1 bin per photon -> max_photons + 1 bins
+        n_bins_d3 = int(max_photons + 1)
+        d3 = jnp.linspace(0, max_photons, n_bins_d3)
         grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
         centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
 
@@ -1073,7 +1140,14 @@ def run(
         "backend": backend,
         "target_alpha": str(target_alpha),
         "target_beta": str(target_beta),
+        "genotype": genotype,  # Explicitly store seed config
     }
+
+    # Modes handling for results
+    modes_val = 2
+    if genotype_config and "modes" in genotype_config:
+        modes_val = int(genotype_config["modes"])
+    config["modes"] = modes_val
 
     # Create Result object
     # Pass history_fronts if available (only in qdax mode)
@@ -1159,6 +1233,17 @@ def main():
         "--window", type=float, default=0.1, help="Homodyne window width"
     )
     parser.add_argument("--pnr-max", type=int, default=3, help="Max PNR outcome")
+    parser.add_argument(
+        "--modes",
+        type=int,
+        default=2,
+        help="Number of optical modes (1 Signal + N-1 Control)",
+    )
+    parser.add_argument(
+        "--seed-scan",
+        action="store_true",
+        help="Scan output/ dir for high-fitness seeds",
+    )
 
     args = parser.parse_args()
 
@@ -1170,6 +1255,7 @@ def main():
         "hx_scale": args.hx_scale,
         "window": args.window,
         "pnr_max": args.pnr_max,
+        "modes": args.modes,
     }
 
     # Profiling context
@@ -1190,6 +1276,7 @@ def main():
                 low_mem=args.low_mem,
                 genotype=args.genotype,
                 genotype_config=genotype_config,
+                seed_scan=args.seed_scan,
             )
         finally:
             jax.profiler.stop_trace()
@@ -1208,6 +1295,7 @@ def main():
             low_mem=args.low_mem,
             genotype=args.genotype,
             genotype_config=genotype_config,
+            seed_scan=args.seed_scan,
         )
 
 

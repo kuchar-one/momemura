@@ -29,42 +29,50 @@ We support multiple genotype designs offering different trade-offs between expre
 
 ### 1. Global Parameters (All Designs)
 
-All designs include global homodyne settings and a **Final Gaussian** block.
-
-| Parameter | Gene Mapping | Range | Description |
-| :--- | :--- | :--- | :--- |
----
-
+All designs include global homodyne settings and a **Final Gaussian** block ($F=5$).
+The structure scales with the number of control modes $N_C = N_{modes} - 1$.
 
 ### 2. Design A - Original (Per-Leaf Unique)
 
 This design allows every leaf block and every mix node to have unique parameters.
 
 **Formula**: $Length = G + L \cdot P_{leaf} + (L-1) \cdot P_{node} + F$
-For Depth 3 ($L=8$): $1 + 8 \times 16 + 7 \times 4 + 5 = 162$.
+where:
+- $P_{node} = 4$ (Mix params)
+- $F = 5$ (Final Gaussian)
+- $P_{leaf} = 1 (Active) + 1 (N_{Ctrl}) + 1 (TMSS) + 1 (US) + [N_C^2 + 3N_C + 2] (UC, Disp, PNR)$
+  $= N_C^2 + 3N_C + 6$
+
+**For N=3 (N_C=2)**: $P_{leaf} = 4 + 6 + 6 = 16$.
+Total (Depth 3): $1 + 8 \times 16 + 7 \times 4 + 5 = 162$.
 
 **Structure**:
 - **Global**: `homodyne_x`.
-- **Leaves (8 blocks)**: Each block has 16 unique params (Active, N_Ctrl, TMSS, US, UC, Disp, PNR).
-- **Mix Nodes (7 nodes)**: Each node has 4 unique params (Theta, Phi, Varphi, Source).
-- **Final Gaussian**: 5 params.
+- **Leaves (L blocks)**: Each block has $P_{leaf}$ params.
+- **Mix Nodes (L-1 nodes)**: Each node has 4 unique params.
+- **Final Gaussian**: 5 params (R, Phi, Varphi, Disp_Re, Disp_Im).
 
 ---
 
 ### 3. Design B - Tied-Leaf (Shared Blocks)
 
-This design broadcasts a SINGLE set of block parameters to ALL leaves. This assumes identical physical resources for generation, but allows unique routing (Mix Nodes).
+This design broadcasts a SINGLE set of block parameters to ALL leaves.
 
 **Formula (B1)**: $Length = G + BP + (L-1) \cdot P_{node} + F$
-For Depth 3: $1 + 15 + 7 \times 4 + 5 = 49$.
+where $BP = P_{leaf} - 1$ (No per-block active flag).
+$BP = N_C^2 + 3N_C + 5$.
 
-**Formula (B2)**: Adds $L$ active flags. $Length = 49 + 8 = 57$.
+**For N=3**: $BP = 15$.
+Total (Depth 3): $1 + 15 + 7 \times 4 + 5 = 49$.
+
+**Formula (B2)**: Adds $L$ active flags. $Length = B1 + L$.
+For Depth 3: $49 + 8 = 57$.
 
 **Structure**:
 - **Global**: `homodyne_x`.
-- **Shared Block**: 15 Parameters (N_Ctrl, TMSS, US, UC, Disp, PNR) applied to ALL leaves.
-- **Mix Nodes**: 7 Unique nodes (same as Design A).
-- **Active Flags** (B2 only): 8 booleans at the end of the genotype to turn generic leaves on/off.
+- **Shared Block**: $BP$ Parameters applied to ALL leaves.
+- **Mix Nodes**: $L-1$ Unique nodes.
+- **Active Flags** (B2 only): $L$ booleans.
 - **Final Gaussian**: 5 params.
 
 ---
@@ -74,15 +82,18 @@ For Depth 3: $1 + 15 + 7 \times 4 + 5 = 49$.
 This design forces maximum symmetry. All blocks are identical, and all mix nodes are identical.
 
 **Formula (C1)**: $Length = G + BP + P_{node} + F$
-Constant Length: $1 + 15 + 4 + 5 = 25$.
+Constant Length: $1 + BP + 4 + 5 = BP + 10$.
 
-**Formula (C2)**: Adds $L$ active flags. $Length = 25 + 8 = 33$.
+**For N=3**: $15 + 10 = 25$.
+
+**Formula (C2)**: Adds $L$ active flags. $Length = C1 + L$.
+For Depth 3: $25 + 8 = 33$.
 
 **Structure**:
 - **Global**: `homodyne_x`.
-- **Shared Block**: 1 parameter set for all leaves.
-- **Shared Mix Node**: 1 parameter set (Theta, Phi, Varphi, Source) applied to ALL 7 mix nodes.
-- **Active Flags** (C2 only): 8 booleans.
+- **Shared Block**: $BP$ params.
+- **Shared Mix Node**: 4 params applied to ALL mix nodes.
+- **Active Flags** (C2 only): $L$ booleans.
 
 ---
 

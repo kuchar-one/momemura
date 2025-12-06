@@ -23,8 +23,13 @@ class BaseGenotype(ABC):
         self.d_scale = self.config.get("d_scale", 3.0)
         self.hx_scale = self.config.get("hx_scale", 4.0)
         self.window = self.config.get("window", 0.1)
+        self.window = self.config.get("window", 0.1)
         self.pnr_max = int(self.config.get("pnr_max", 3))
         self.active_threshold = 0.0
+
+        # Dynamic Modes (1 Signal + N-1 Controls)
+        self.n_modes = int(self.config.get("modes", 2))
+        self.n_control = max(1, self.n_modes - 1)
 
     @abstractmethod
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
@@ -204,14 +209,39 @@ class DesignAGenotype(BaseGenotype):
         # Note: P_leaf_full is 16 now (was 17)
         self.P_leaf_full = 16
         self.PN = 4
+        self.P_leaf_full = 16  # This will be dynamically calculated by get_length
+        self.PN = 4
         self.G = 1
         self.F = 5
 
     def get_length(self, depth: int = 3) -> int:
         L = 2**depth
-        # 1(HomX) + 16*L + 4*(L-1) + 5
-        # = 1 + 16L + 4L - 4 + 5 = 20L + 2
-        return 20 * L + 2
+
+        # Per leaf:
+        n_ctrl_modes = self.n_control
+
+        # 0: Active (1)
+        # 1: Num Ctrl (1)
+        # 2: TMSS (1) -> Changed from 2 to 1 for Canonical
+        # 3: US Phase (1)
+        # 4...: UC + Disp + PNR
+
+        n_uc_pairs = (n_ctrl_modes * (n_ctrl_modes - 1)) // 2
+        len_uc = 2 * n_uc_pairs + n_ctrl_modes
+        len_disp_c = 2 * n_ctrl_modes
+        len_pnr = n_ctrl_modes
+
+        # Total per leaf:
+        params_per_leaf = 1 + 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        # Global
+        # Hom(1)
+        # Mix(Nodes * 4)
+        len_mix = (L - 1) * 4
+        # Final Gauss (5)
+        len_final = 5
+
+        return 1 + L * params_per_leaf + len_mix + len_final
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
         idx = 0
@@ -224,50 +254,88 @@ class DesignAGenotype(BaseGenotype):
 
         # 2. Leaves (L * 16)
         n_leaves = self.leaves
-        n_leaf_params = self.P_leaf_full
+        # Calculate n_leaf_params dynamically based on n_control
+        n_ctrl_modes = self.n_control
+        n_uc_pairs = (n_ctrl_modes * (n_ctrl_modes - 1)) // 2
+        len_uc = 2 * n_uc_pairs + n_ctrl_modes
+        len_disp_c = 2 * n_ctrl_modes
+        len_pnr = n_ctrl_modes
+        n_leaf_params = 1 + 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
         leaves_flat = g[idx : idx + n_leaves * n_leaf_params]
         idx += n_leaves * n_leaf_params
         leaves_reshaped = leaves_flat.reshape((n_leaves, n_leaf_params))
 
-        # Decode Leaf Block (indices 0..15)
+        # Decode Leaf Block
         # 0: Active
         leaf_active = leaves_reshaped[:, 0] > 0.0
 
-        # 1: n_ctrl
-        val = leaves_reshaped[:, 1]
-        leaf_n_ctrl = jnp.ones(n_leaves, dtype=jnp.int32)
-        leaf_n_ctrl = jnp.where(val < -0.33, 0, leaf_n_ctrl)
-        leaf_n_ctrl = jnp.where(val > 0.33, 2, leaf_n_ctrl)
+        # 1: Num Controls
+        n_ctrl_raw = leaves_reshaped[:, 1]
+        # Map [-1, 1] to [0, n_control]
+        norm_val = (n_ctrl_raw + 1.0) / 2.0  # 0..1
+        leaf_n_ctrl = jnp.round(norm_val * self.n_control).astype(jnp.int32)
+        leaf_n_ctrl = jnp.clip(leaf_n_ctrl, 0, self.n_control)
 
-        # 2: tmss_r (Single Scalar)
-        tmss_r = jnp.tanh(leaves_reshaped[:, 2]) * self.r_scale  # shape (L,)
+        # 2: TMSS (Single Scalar)
+        tmss_r = jnp.tanh(leaves_reshaped[:, 2]) * self.r_scale
 
-        # 3: us_phase
+        # 3: US Phase
         us_phase = jnp.tanh(leaves_reshaped[:, 3:4]) * (jnp.pi / 2)
 
-        # 4-7: uc_params
-        uc_raw = leaves_reshaped[:, 4:8]
-        uc_theta = jnp.tanh(uc_raw[:, 0:1]) * (jnp.pi / 2)
-        uc_phi = jnp.tanh(uc_raw[:, 1:2]) * (jnp.pi / 2)
-        uc_varphi = jnp.tanh(uc_raw[:, 2:4]) * (jnp.pi / 2)
+        # 4...: UC Params
+        # Start idx 4. Len calculated above.
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        # theta, phi per pair
+        len_pairs = 2 * n_uc_pairs
+        len_phases = N_C
+        len_uc = len_pairs + len_phases
 
-        # 8-9: disp_s
-        disp_s_raw = leaves_reshaped[:, 8:10]
+        uc_slice = leaves_reshaped[:, 4 : 4 + len_uc]
+        idx_offset = 4 + len_uc
+
+        # Split into theta, phi, varphi
+        # For N=1 (Control=1), pairs=0. Just phase (1).
+        # For N=2 (Control=2), pairs=1. Theta, Phi, Ph1, Ph2. Total 4.
+        # For N=3 (Control=3), pairs=3. 3*2 + 3 = 9.
+
+        if n_uc_pairs > 0:
+            uc_pairs_raw = uc_slice[:, :len_pairs]
+            uc_theta = jnp.tanh(uc_pairs_raw[:, 0::2]) * (jnp.pi / 2)
+            uc_phi = jnp.tanh(uc_pairs_raw[:, 1::2]) * (jnp.pi / 2)
+        else:
+            uc_theta = jnp.zeros((n_leaves, 0))
+            uc_phi = jnp.zeros((n_leaves, 0))
+
+        uc_varphi_raw = uc_slice[:, len_pairs:]
+        uc_varphi = jnp.tanh(uc_varphi_raw) * (jnp.pi / 2)
+
+        # 6. Disp S (2 params)
+        disp_s_slice = leaves_reshaped[:, idx_offset : idx_offset + 2]
+        idx_offset += 2
+
         disp_s = (
-            jnp.tanh(disp_s_raw[:, 0]) * self.d_scale
-            + 1j * jnp.tanh(disp_s_raw[:, 1]) * self.d_scale
+            jnp.tanh(disp_s_slice[:, 0]) * self.d_scale
+            + 1j * jnp.tanh(disp_s_slice[:, 1]) * self.d_scale
         )
         disp_s = disp_s[:, None]
 
-        # 10-13: disp_c
-        disp_c_raw = leaves_reshaped[:, 10:14]
+        # 7. Disp C (2 * N_C params)
+        len_disp_c = 2 * N_C
+        disp_c_slice = leaves_reshaped[:, idx_offset : idx_offset + len_disp_c]
+        idx_offset += len_disp_c
+
         disp_c = (
-            jnp.tanh(disp_c_raw[:, 0::2]) * self.d_scale
-            + 1j * jnp.tanh(disp_c_raw[:, 1::2]) * self.d_scale
+            jnp.tanh(disp_c_slice[:, 0::2]) * self.d_scale
+            + 1j * jnp.tanh(disp_c_slice[:, 1::2]) * self.d_scale
         )
 
-        # 14-15: pnr
-        pnr_raw = jnp.clip(leaves_reshaped[:, 14:16], 0.0, 1.0)
+        # 8. PNR (N_C params)
+        len_pnr = N_C
+        pnr_slice = leaves_reshaped[:, idx_offset : idx_offset + len_pnr]
+
+        pnr_raw = jnp.clip(pnr_slice, 0.0, 1.0)
         pnr = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
 
         leaf_params = {
@@ -341,8 +409,32 @@ class DesignB1Genotype(BaseGenotype):
 
     def get_length(self, depth: int = 3) -> int:
         L = 2**depth
-        # 1 + 15 + 4*(L-1) + 5 = 21 + 4L - 4 = 17 + 4L
-        return 17 + 4 * L
+
+        # B1 Length:
+        # 1(Hom) + BP(Shared) + 4*(L-1)(Mix) + 5(Final)
+        L = 2**depth
+
+        # Shared Block (BP)
+        # Old: ~... + 2(TMSS) ...
+        # New: ~... + 1(TMSS) ...
+        # Calculate BP dynamically
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        len_pnr = N_C
+
+        # Shared Block Params:
+        # 0: NCtrl(1)
+        # 1: TMSS(1)
+        # 2: US(1)
+        # 3...: UC + Disp + PNR
+        # BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+        self.BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        # Mix = 4 * (L-1)
+
+        return 1 + self.BP + 4 * (L - 1) + 5
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
         idx = 0
@@ -351,59 +443,81 @@ class DesignB1Genotype(BaseGenotype):
         homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
         homodyne_window = self.window
 
-        # Shared Block (15 params)
-        bp_raw = g[idx : idx + self.BP]
-        idx += self.BP
+        # Shared Params
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        len_pnr = N_C
+        BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        bp_raw = g[idx : idx + BP]
+        idx += BP
 
         # 0: n_ctrl
         val = bp_raw[0]
-        n_ctrl_int = 1
-        n_ctrl_int = jnp.where(val < -0.33, 0, n_ctrl_int)
-        n_ctrl_int = jnp.where(val > 0.33, 2, n_ctrl_int)
+        norm_val = (val + 1.0) / 2.0
+        n_ctrl_int = jnp.round(norm_val * self.n_control).astype(jnp.int32)
+        n_ctrl_int = jnp.clip(n_ctrl_int, 0, self.n_control)
 
-        # 1: tmss_r (single)
+        # 1: tmss_r (Single Scalar)
         tmss_r_val = jnp.tanh(bp_raw[1]) * self.r_scale
 
-        # 2: us_phase (index shift from here)
+        # 2: us_phase
         us_phase_val = jnp.tanh(bp_raw[2:3]) * (jnp.pi / 2)
 
-        # 3-6: uc_params
-        uc_params_val = jnp.tanh(bp_raw[3:7]) * (jnp.pi / 2)
-        uc_theta_val = uc_params_val[0:1]
-        uc_phi_val = uc_params_val[1:2]
-        uc_varphi_val = uc_params_val[2:4]
+        # 3...: UC
+        len_pairs = 2 * n_uc_pairs
+        uc_slice = bp_raw[3 : 3 + len_uc]
 
-        # 7-8: disp_s
-        disp_s_raw = bp_raw[7:9]
+        if n_uc_pairs > 0:
+            uc_pairs_raw = uc_slice[:len_pairs]
+            uc_theta_val = jnp.tanh(uc_pairs_raw[0::2]) * (jnp.pi / 2)
+            uc_phi_val = jnp.tanh(uc_pairs_raw[1::2]) * (jnp.pi / 2)
+        else:
+            uc_theta_val = jnp.zeros(0)
+            uc_phi_val = jnp.zeros(0)
+
+        uc_varphi_raw = uc_slice[len_pairs:]
+        uc_varphi_val = jnp.tanh(uc_varphi_raw) * (jnp.pi / 2)
+
+        idx_offset = 3 + len_uc
+
+        # Disp S
+        disp_s_raw = bp_raw[idx_offset : idx_offset + 2]
+        idx_offset += 2
         disp_s_val = (
             jnp.tanh(disp_s_raw[0]) * self.d_scale
             + 1j * jnp.tanh(disp_s_raw[1]) * self.d_scale
         )
         disp_s_val = disp_s_val[None]
 
-        # 9-12: disp_c
-        disp_c_raw = bp_raw[9:13]
+        # Disp C
+        disp_c_raw = bp_raw[idx_offset : idx_offset + len_disp_c]
+        idx_offset += len_disp_c
         disp_c_val = (
             jnp.tanh(disp_c_raw[0::2]) * self.d_scale
             + 1j * jnp.tanh(disp_c_raw[1::2]) * self.d_scale
         )
 
-        # 13-14: pnr (end of new BP=15)
-        pnr_raw = jnp.clip(bp_raw[13:15], 0.0, 1.0)
+        # PNR
+        pnr_raw = jnp.clip(bp_raw[idx_offset : idx_offset + len_pnr], 0.0, 1.0)
         pnr_val = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
 
         # Broadcast
         n_leaves = self.leaves
         leaf_params = {
             "n_ctrl": jnp.broadcast_to(n_ctrl_int, (n_leaves,)),
-            "tmss_r": jnp.broadcast_to(tmss_r_val, (n_leaves,)),  # 1D
+            "tmss_r": jnp.broadcast_to(
+                tmss_r_val, (n_leaves,)
+            ),  # Single scalar per leaf (L,)
             "us_phase": jnp.broadcast_to(us_phase_val, (n_leaves, 1)),
-            "uc_theta": jnp.broadcast_to(uc_theta_val, (n_leaves, 1)),
-            "uc_phi": jnp.broadcast_to(uc_phi_val, (n_leaves, 1)),
-            "uc_varphi": jnp.broadcast_to(uc_varphi_val, (n_leaves, 2)),
+            "uc_theta": jnp.broadcast_to(uc_theta_val, (n_leaves, n_uc_pairs)),
+            "uc_phi": jnp.broadcast_to(uc_phi_val, (n_leaves, n_uc_pairs)),
+            "uc_varphi": jnp.broadcast_to(uc_varphi_val, (n_leaves, N_C)),
             "disp_s": jnp.broadcast_to(disp_s_val, (n_leaves, 1)),
-            "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, 2)),
-            "pnr": jnp.broadcast_to(pnr_val, (n_leaves, 2)),
+            "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, N_C)),
+            "pnr": jnp.broadcast_to(pnr_val, (n_leaves, N_C)),
         }
         leaf_active = jnp.ones(n_leaves, dtype=bool)
 
@@ -455,73 +569,151 @@ class DesignB2Genotype(DesignB1Genotype):
 
     def get_length(self, depth: int = 3) -> int:
         L = 2**depth
-        # B1 (17+4L) + L = 17 + 5L
-        return 17 + 5 * L  # Correct matches spec
+        # B1 Length + L (Active flags)
+        b1_len = super().get_length(depth)
+        return b1_len + L
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        # Copied from B1 logic then add Active at end
+        # B1 Length
+        b1_len = super().get_length(self.depth)
+
+        # Decode B1 part
+        b1_part = g[:b1_len]
+        decoded = super().decode(b1_part, cutoff)
+
+        # Add Active Flags (Last self.leaves params)
+        active_raw = g[b1_len : b1_len + self.leaves]
+        leaf_active = active_raw > self.active_threshold
+        decoded["leaf_active"] = leaf_active
+
+        return decoded
+
+
+class DesignC1Genotype(BaseGenotype):
+    """
+    Design C1: Tied-all, no active flags.
+    """
+
+    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
+        super().__init__(depth, config)
+        self.leaves = 2**depth
+        self.nodes = self.leaves - 1
+        self.BP = 15
+        self.PN = 4
+        self.G = 1
+        self.F = 5
+
+    def get_length(self, depth: int = 3) -> int:
+        # C1 Length:
+        # 1(Hom) + P_Shared + 4(Mix) + 5(Final)
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        len_pnr = N_C
+
+        params_shared = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        return 1 + params_shared + 4 + 5
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
         idx = 0
         hom_x_raw = g[idx]
         idx += 1
         homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
         homodyne_window = self.window
 
-        bp_raw = g[idx : idx + self.BP]
-        idx += self.BP
+        # Shared Block
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        len_pnr = N_C
+        P_shared = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
 
-        # Block params (same indices as B1)
+        bp_raw = g[idx : idx + P_shared]
+        idx += P_shared
+
+        # 0: n_ctrl
         val = bp_raw[0]
-        n_ctrl_int = 1
-        n_ctrl_int = jnp.where(val < -0.33, 0, n_ctrl_int)
-        n_ctrl_int = jnp.where(val > 0.33, 2, n_ctrl_int)
+        norm_val = (val + 1.0) / 2.0
+        n_ctrl_int = jnp.round(norm_val * self.n_control).astype(jnp.int32)
+        n_ctrl_int = jnp.clip(n_ctrl_int, 0, self.n_control)
 
+        # 1: tmss_r
         tmss_r_val = jnp.tanh(bp_raw[1]) * self.r_scale
-        us_phase_val = jnp.tanh(bp_raw[2:3]) * (jnp.pi / 2)
-        uc_params_val = jnp.tanh(bp_raw[3:7]) * (jnp.pi / 2)
-        uc_theta_val = uc_params_val[0:1]
-        uc_phi_val = uc_params_val[1:2]
-        uc_varphi_val = uc_params_val[2:4]
 
-        disp_s_raw = bp_raw[7:9]
+        # 2: us_phase
+        us_phase_val = jnp.tanh(bp_raw[2:3]) * (jnp.pi / 2)
+
+        # 3...: UC
+        len_pairs = 2 * n_uc_pairs
+        uc_slice = bp_raw[3 : 3 + len_uc]
+
+        if n_uc_pairs > 0:
+            uc_pairs_raw = uc_slice[:len_pairs]
+            uc_theta_val = jnp.tanh(uc_pairs_raw[0::2]) * (jnp.pi / 2)
+            uc_phi_val = jnp.tanh(uc_pairs_raw[1::2]) * (jnp.pi / 2)
+        else:
+            uc_theta_val = jnp.zeros(0)
+            uc_phi_val = jnp.zeros(0)
+
+        uc_varphi_raw = uc_slice[len_pairs:]
+        uc_varphi_val = jnp.tanh(uc_varphi_raw) * (jnp.pi / 2)
+
+        idx_offset = 3 + len_uc
+
+        # Disp S
+        disp_s_raw = bp_raw[idx_offset : idx_offset + 2]
+        idx_offset += 2
         disp_s_val = (
             jnp.tanh(disp_s_raw[0]) * self.d_scale
             + 1j * jnp.tanh(disp_s_raw[1]) * self.d_scale
         )
         disp_s_val = disp_s_val[None]
 
-        disp_c_raw = bp_raw[9:13]
+        # Disp C
+        disp_c_raw = bp_raw[idx_offset : idx_offset + len_disp_c]
+        idx_offset += len_disp_c
         disp_c_val = (
             jnp.tanh(disp_c_raw[0::2]) * self.d_scale
             + 1j * jnp.tanh(disp_c_raw[1::2]) * self.d_scale
         )
 
-        pnr_raw = jnp.clip(bp_raw[13:15], 0.0, 1.0)
+        # PNR
+        pnr_raw = jnp.clip(bp_raw[idx_offset : idx_offset + len_pnr], 0.0, 1.0)
         pnr_val = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
 
+        # Broadcast
         n_leaves = self.leaves
         leaf_params = {
             "n_ctrl": jnp.broadcast_to(n_ctrl_int, (n_leaves,)),
             "tmss_r": jnp.broadcast_to(tmss_r_val, (n_leaves,)),
             "us_phase": jnp.broadcast_to(us_phase_val, (n_leaves, 1)),
-            "uc_theta": jnp.broadcast_to(uc_theta_val, (n_leaves, 1)),
-            "uc_phi": jnp.broadcast_to(uc_phi_val, (n_leaves, 1)),
-            "uc_varphi": jnp.broadcast_to(uc_varphi_val, (n_leaves, 2)),
+            "uc_theta": jnp.broadcast_to(uc_theta_val, (n_leaves, n_uc_pairs)),
+            "uc_phi": jnp.broadcast_to(uc_phi_val, (n_leaves, n_uc_pairs)),
+            "uc_varphi": jnp.broadcast_to(uc_varphi_val, (n_leaves, N_C)),
             "disp_s": jnp.broadcast_to(disp_s_val, (n_leaves, 1)),
-            "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, 2)),
-            "pnr": jnp.broadcast_to(pnr_val, (n_leaves, 2)),
+            "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, N_C)),
+            "pnr": jnp.broadcast_to(pnr_val, (n_leaves, N_C)),
         }
+        leaf_active = jnp.ones(n_leaves, dtype=bool)
 
-        # Mix params
+        # Mix (Tied: 1 node)
+        mix_params_slice = g[idx : idx + self.PN]
+        idx += self.PN
+        mix_params_reshaped = mix_params_slice.reshape((1, self.PN))
+        mix_angles_one = jnp.tanh(mix_params_reshaped[:, :3]) * (jnp.pi / 2)
+
+        src_raw = mix_params_reshaped[:, 3]
+        mix_src_one = jnp.zeros(1, dtype=jnp.int32)
+        mix_src_one = jnp.where(src_raw < -0.33, 1, mix_src_one)
+        mix_src_one = jnp.where(src_raw > 0.33, 2, mix_src_one)
+
+        # Broadcast Mix
         n_mix = self.nodes
-        mix_params_flat = g[idx : idx + n_mix * self.PN]
-        idx += n_mix * self.PN
-        mix_reshaped = mix_params_flat.reshape((n_mix, self.PN))
-        mix_angles = jnp.tanh(mix_reshaped[:, :3]) * (jnp.pi / 2)
-
-        src_raw = mix_reshaped[:, 3]
-        mix_source = jnp.zeros(n_mix, dtype=jnp.int32)
-        mix_source = jnp.where(src_raw < -0.33, 1, mix_source)
-        mix_source = jnp.where(src_raw > 0.33, 2, mix_source)
+        mix_angles = jnp.broadcast_to(mix_angles_one, (n_mix, 3))
+        mix_source = jnp.broadcast_to(mix_src_one, (n_mix,))
 
         # Final Gaussian
         final_raw = g[idx : idx + self.F]
@@ -540,129 +732,11 @@ class DesignB2Genotype(DesignB1Genotype):
             "disp": disp_final,
         }
 
-        # Active Flags
-        active_raw = g[idx : idx + n_leaves]
-        idx += n_leaves
-        leaf_active = active_raw > self.active_threshold
-
         return {
             "homodyne_x": homodyne_x,
             "homodyne_window": homodyne_window,
             "mix_params": mix_angles,
             "mix_source": mix_source,
-            "leaf_active": leaf_active,
-            "leaf_params": leaf_params,
-            "final_gauss": final_gauss,
-        }
-
-
-class DesignC1Genotype(BaseGenotype):
-    """
-    Design C1: Tied-all, no active flags.
-    BP=15, PN=4, G=1, F=5.
-    Total = 1 + 15 + 4 + 5 = 25.
-    """
-
-    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
-        super().__init__(depth, config)
-        self.leaves = 2**depth
-        self.nodes = self.leaves - 1
-        self.BP = 15
-        self.PN = 4
-        self.G = 1
-        self.F = 5
-
-    def get_length(self, depth: int = 3) -> int:
-        return 25
-
-    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        idx = 0
-        hom_x_raw = g[idx]
-        idx += 1
-        homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
-        homodyne_window = self.window
-
-        # Shared Block (15)
-        bp_raw = g[idx : idx + self.BP]
-        idx += self.BP
-
-        val = bp_raw[0]
-        n_ctrl_int = 1
-        n_ctrl_int = jnp.where(val < -0.33, 0, n_ctrl_int)
-        n_ctrl_int = jnp.where(val > 0.33, 2, n_ctrl_int)
-
-        tmss_r_val = jnp.tanh(bp_raw[1]) * self.r_scale  # single
-        us_phase_val = jnp.tanh(bp_raw[2:3]) * (jnp.pi / 2)
-        uc_params_val = jnp.tanh(bp_raw[3:7]) * (jnp.pi / 2)
-        uc_theta_val = uc_params_val[0:1]
-        uc_phi_val = uc_params_val[1:2]
-        uc_varphi_val = uc_params_val[2:4]
-
-        disp_s_raw = bp_raw[7:9]
-        disp_s_val = (
-            jnp.tanh(disp_s_raw[0]) * self.d_scale
-            + 1j * jnp.tanh(disp_s_raw[1]) * self.d_scale
-        )
-        disp_s_val = disp_s_val[None]
-
-        disp_c_raw = bp_raw[9:13]
-        disp_c_val = (
-            jnp.tanh(disp_c_raw[0::2]) * self.d_scale
-            + 1j * jnp.tanh(disp_c_raw[1::2]) * self.d_scale
-        )
-
-        pnr_raw = jnp.clip(bp_raw[13:15], 0.0, 1.0)
-        pnr_val = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
-
-        n_leaves = self.leaves
-        leaf_params = {
-            "n_ctrl": jnp.broadcast_to(n_ctrl_int, (n_leaves,)),
-            "tmss_r": jnp.broadcast_to(tmss_r_val, (n_leaves,)),
-            "us_phase": jnp.broadcast_to(us_phase_val, (n_leaves, 1)),
-            "uc_theta": jnp.broadcast_to(uc_theta_val, (n_leaves, 1)),
-            "uc_phi": jnp.broadcast_to(uc_phi_val, (n_leaves, 1)),
-            "uc_varphi": jnp.broadcast_to(uc_varphi_val, (n_leaves, 2)),
-            "disp_s": jnp.broadcast_to(disp_s_val, (n_leaves, 1)),
-            "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, 2)),
-            "pnr": jnp.broadcast_to(pnr_val, (n_leaves, 2)),
-        }
-        leaf_active = jnp.ones(n_leaves, dtype=bool)
-
-        # Shared Mix Node (4)
-        mix_raw = g[idx : idx + self.PN]
-        idx += self.PN
-        mix_angles = jnp.tanh(mix_raw[:3]) * (jnp.pi / 2)
-        src_raw = mix_raw[3]
-        mix_source_val = 0
-        mix_source_val = jnp.where(src_raw < -0.33, 1, mix_source_val)
-        mix_source_val = jnp.where(src_raw > 0.33, 2, mix_source_val)
-
-        n_mix = self.nodes
-        mix_params_all = jnp.broadcast_to(mix_angles, (n_mix, 3))
-        mix_source_all = jnp.broadcast_to(mix_source_val, (n_mix,))
-
-        # Final Gaussian (5)
-        final_raw = g[idx : idx + self.F]
-        idx += self.F
-        r_final = jnp.tanh(final_raw[0]) * self.r_scale
-        phi_final = jnp.tanh(final_raw[1]) * (jnp.pi / 2)
-        varphi_final = jnp.tanh(final_raw[2]) * (jnp.pi / 2)
-        disp_final = (
-            jnp.tanh(final_raw[3]) * self.d_scale
-            + 1j * jnp.tanh(final_raw[4]) * self.d_scale
-        )
-        final_gauss = {
-            "r": r_final,
-            "phi": phi_final,
-            "varphi": varphi_final,
-            "disp": disp_final,
-        }
-
-        return {
-            "homodyne_x": homodyne_x,
-            "homodyne_window": homodyne_window,
-            "mix_params": mix_params_all,
-            "mix_source": mix_source_all,
             "leaf_active": leaf_active,
             "leaf_params": leaf_params,
             "final_gauss": final_gauss,
@@ -676,20 +750,21 @@ class DesignC2Genotype(DesignC1Genotype):
     """
 
     def get_length(self, depth: int = 3) -> int:
+        c1_len = super().get_length(depth)
         L = 2**depth
-        return 25 + L
+        return c1_len + L
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        result = super().decode(g, cutoff)
+        c1_len = super().get_length(self.depth)
 
-        # C1 uses 25 genes.
-        # C2 appends L actives.
-        n_leaves = self.leaves
-        actives_raw = g[25 : 25 + n_leaves]
-        leaf_active = actives_raw > self.active_threshold
+        c1_part = g[:c1_len]
+        decoded = super().decode(c1_part, cutoff)
 
-        result["leaf_active"] = leaf_active
-        return result
+        active_raw = g[c1_len : c1_len + self.leaves]
+        leaf_active = active_raw > self.active_threshold
+        decoded["leaf_active"] = leaf_active
+
+        return decoded
 
 
 GENOTYPE_REGISTRY = {

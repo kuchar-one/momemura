@@ -137,42 +137,43 @@ def jax_apply_final_gaussian(
 def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
     """
     Computes the heralded state for a single block (1 Signal, up to 2 Controls).
-    Canonical Form: 1 TMSS pair + Uc + Displacements.
     """
     # Extract params
-    n_ctrl = params["n_ctrl"]  # (1,) int
+    n_ctrl_eff = params["n_ctrl"]  # (1,) int
     # tmss_r is now SCALAR (0-D array) after vmap slicing from (L,)
     tmss_r = params["tmss_r"]
-    us_phase = params["us_phase"]  # (1,)
-    uc_theta = params["uc_theta"]  # (1,)
-    uc_phi = params["uc_phi"]  # (1,)
-    uc_varphi = params["uc_varphi"]  # (2,)
-    disp_s = params["disp_s"]  # (1,)
-    disp_c = params["disp_c"]  # (2,)
-    pnr = params["pnr"]  # (2,)
+    us_phase = params["us_phase"]
+    uc_theta = params["uc_theta"]
+    uc_phi = params["uc_phi"]
+    uc_varphi = params["uc_varphi"]
+    disp_s = params["disp_s"]
+    disp_c = params["disp_c"]
+    pnr = params["pnr"]
 
-    # Constants
+    # Determine dimensions dynamically
+    # We infer N_C from pnr or disp_c shape.
+    N_C = pnr.shape[-1]
+    N = 1 + N_C  # 1 Signal + N_C Controls
+
     hbar = 2.0
-
-    # 1. Gaussian State (Covariance & Mean)
-    # Modes: 0 (Signal), 1 (Ctrl0), 2 (Ctrl1)
-    N = MAX_SIGNAL + MAX_CONTROL  # 1 + 2 = 3
     mu = jnp.zeros(2 * N)
     cov = vacuum_covariance(N, hbar)
 
     S_total = jnp.eye(2 * N)
 
-    # 2. TMSS Logic (Single Pair on 0,1)
-    # Only if n_ctrl >= 1
-    r0 = jnp.where(n_ctrl >= 1, tmss_r, 0.0)
+    # 2. TMSS (Signal 0 + Control 0)
+    # Only if N_C >= 1
+    # n_ctrl_eff tells us how many controls are active
+    r0 = jnp.where(n_ctrl_eff >= 1, tmss_r, 0.0)
 
-    # Construct Symplectic for TMSS(r0) on modes (0,1)
-    S_tmss_0 = two_mode_squeezer_symplectic(r0, 0.0)
-    S_big_0 = expand_mode_symplectic(S_tmss_0, jnp.array([0, 1]), N)
-    S_total = S_big_0 @ S_total
+    # We always have at least 1 signal. If N_C > 0:
+    if N_C > 0:
+        S_tmss_0 = two_mode_squeezer_symplectic(r0, 0.0)
+        S_big_0 = expand_mode_symplectic(S_tmss_0, jnp.array([0, 1]), N)
+        S_total = S_big_0 @ S_total
 
     # 3. Interferometers
-    # US on Signal (Mode 0) - Phase rotation
+    # US on Signal (Mode 0)
     phi_s = us_phase[0]
     cp = jnp.cos(phi_s)
     sp = jnp.sin(phi_s)
@@ -180,52 +181,92 @@ def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
     S_us = expand_mode_symplectic(R_s, jnp.array([0]), N)
     S_total = S_us @ S_total
 
-    # UC on Controls (Modes 1, 2)
-    # Linear optics coupling Control 0 and Control 1
-    ct = jnp.cos(uc_theta[0])
-    st = jnp.sin(uc_theta[0])
-    # BS
-    U_bs = jnp.array(
-        [[ct, -jnp.exp(-1j * uc_phi[0]) * st], [jnp.exp(1j * uc_phi[0]) * st, ct]]
-    )
-    # Phase
-    U_ph = jnp.diag(jnp.exp(1j * uc_varphi))
-    U_c = U_ph @ U_bs
+    # UC on Controls (Modes 1..N_C)
+    # Construct unitary U_c for controls
+    if N_C > 0:
+        # Identity
+        U_c = jnp.eye(N_C, dtype=jnp.complex64)
 
-    S_uc_small = passive_unitary_to_symplectic(U_c)
-    S_uc = expand_mode_symplectic(S_uc_small, jnp.array([1, 2]), N)
-    S_total = S_uc @ S_total
+        pair_idx = 0
+        # Iterate pairs (i, j) for i<j?
+        for i in range(N_C):
+            for j in range(i + 1, N_C):
+                # Extract params
+                th = uc_theta[pair_idx]
+                ph = uc_phi[pair_idx]
+
+                ct = jnp.cos(th)
+                st = jnp.sin(th)
+
+                # BS matrix on i, j
+                row_i = U_c[i, :].copy()
+                row_j = U_c[j, :].copy()
+
+                U_c = U_c.at[i, :].set(ct * row_i - jnp.exp(-1j * ph) * st * row_j)
+                U_c = U_c.at[j, :].set(jnp.exp(1j * ph) * st * row_i + ct * row_j)
+
+                pair_idx += 1
+
+        # Phases at output
+        # uc_varphi has size N_C
+        U_ph = jnp.diag(jnp.exp(1j * uc_varphi))
+        U_c = U_ph @ U_c
+
+        S_uc_small = passive_unitary_to_symplectic(U_c)
+        ctrl_indices = jnp.arange(1, N)
+        S_uc = expand_mode_symplectic(S_uc_small, ctrl_indices, N)
+        S_total = S_uc @ S_total
 
     # Apply Total Symplectic
     cov = S_total @ cov @ S_total.T
     mu = S_total @ mu
 
     # 4. Displacements
+    # disp_s is (1,), disp_c is (N_C,)
     alpha = jnp.concatenate([disp_s, disp_c])
     r_disp = complex_alpha_to_qp(alpha, hbar)
     mu = mu + r_disp
 
     # 5. Herald
-    # Project auxiliary modes onto PNR
-    # If n_ctrl < 2, force pnr[1]=0
-    pnr_effective = jnp.where(
-        jnp.arange(2) < n_ctrl,
-        pnr,
-        0,
-    )
+    # Project auxiliary modes (1..N_C) onto PNR
 
-    max_pnr_tuple = (MAX_PNR, MAX_PNR)
+    ctrl_indices_local = jnp.arange(N_C)  # 0..N_C-1
+    # n_ctrl_eff is integer 0..N_C
+
+    # Mask PNR: Use provided PNR for active controls, 0 for inactive
+    pnr_effective = jnp.where(ctrl_indices_local < n_ctrl_eff, pnr, 0)
+
+    MAX_PNR_LOCAL = 3  # Local constant fallback
 
     from src.simulation.jax.herald import jax_get_full_amplitudes
 
+    max_pnr_sequence = [MAX_PNR_LOCAL] * N_C
+    max_pnr_tuple = tuple(max_pnr_sequence)
+
     H_full = jax_get_full_amplitudes(mu, cov, max_pnr_tuple, cutoff, hbar)
 
-    p0 = pnr_effective[0]
-    p1 = pnr_effective[1]
-    vec_slice = H_full[:, p0, p1]
+    H_flat_ctrl = H_full.reshape(cutoff, -1)
 
+    # Calculate flat index from pnr_effective
+    D_ctrl = MAX_PNR_LOCAL + 1
+
+    flat_idx = 0
+    # Iterate backwards?
+    # H[c, i, j] -> linear [c, i*D + j]
+    for i in range(N_C):
+        # pnr index for control i
+        p = pnr_effective[i]
+        # power of D: (N_C - 1 - i)
+        power = N_C - 1 - i
+        stride = D_ctrl**power
+        flat_idx += p * stride
+
+    vec_slice = H_flat_ctrl[:, flat_idx]
+
+    # Calculate probability of heralding
     prob_slice = jnp.sum(jnp.abs(vec_slice) ** 2)
 
+    # Normalize
     vec_norm = jax.lax.cond(
         prob_slice > 0,
         lambda _: vec_slice / jnp.sqrt(prob_slice),

@@ -21,13 +21,17 @@ CUTOFF = 10
     ],
 )
 def test_genotype_lengths(design_name, expected_length_fn):
-    decoder = get_genotype_decoder(design_name, depth=DEPTH)
+    # Test assumes 3 modes (1 Signal + 2 Control)
+    config = {"modes": 3}
+    decoder = get_genotype_decoder(design_name, depth=DEPTH, config=config)
     assert decoder.get_length(DEPTH) == expected_length_fn(LEAVES)
 
 
 @pytest.mark.parametrize("design_name", ["legacy", "A", "B1", "B2", "C1", "C2"])
 def test_genotype_decode_shapes(design_name):
-    decoder = get_genotype_decoder(design_name, depth=DEPTH)
+    # Test assumes 3 modes
+    config = {"modes": 3}
+    decoder = get_genotype_decoder(design_name, depth=DEPTH, config=config)
     L = LEAVES
     length = decoder.get_length(DEPTH)
 

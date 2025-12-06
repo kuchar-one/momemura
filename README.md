@@ -60,6 +60,8 @@ python run_mome.py --mode qdax --backend jax --pop 50 --iters 200 --cutoff 10 --
 - `--hx-scale`: Homodyne X scale (default 4.0).
 - `--window`: Homodyne window width (default 0.1).
 - `--pnr-max`: Max PNR outcome (default 3).
+- `--modes`: Total number of modes (1 Signal + N-1 Controls) to simulate (default 3). Genotypes automatically scale to fit.
+- `--seed-scan`: Scan `output/` directory for high-fitness seeds from previous runs and inject them into the initial population (converting genotype designs if needed).
 
 ### Profiling
 

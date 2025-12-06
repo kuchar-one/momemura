@@ -28,6 +28,7 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
     - `run_mome.py` initializes a population of random genotypes.
     - Selects the genotype design (e.g., `--genotype A`) which defines the circuit topology and parameter space.
     - Parameter limits can be customized via CLI (e.g., `--depth 3`, `--r-scale 2.0`, `--d-scale 3.0`).
+    - The number of modes can be set with `--modes N` (default 3), allowing scaling to any 1 Signal + (N-1) Control configuration.
     - Centroids for the MAP-Elites grid are generated based on descriptors (Complexity, Max PNR, Total Photons).
 
 2.  **Evaluation Loop**:
@@ -42,6 +43,12 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
     - Results are stored in `OptimizationResult` (pickled).
     - `run_mome.py` tracks the Pareto front and metrics history.
     - An animation (`history.gif`) is generated to visualize the evolution of the Pareto front.
+
+## Seeding Strategy
+
+The optimization can be seeded to accelerate convergence:
+-   **Vacuum Seed**: The first individual is always initialized as a "Vacuum" state (identity parameters), ensuring a reliable baseline.
+-   **Result Scanning**: Using `--seed-scan`, the optimizer scans the `output/` directory for high-fitness results from previous runs. It converts them to the current genotype design (e.g., C1 -> A) and injects them into the initial population.
 
 ## Key Files
 
