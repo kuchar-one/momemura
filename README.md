@@ -53,6 +53,14 @@ python run_mome.py --mode qdax --backend jax --pop 50 --iters 200 --cutoff 10 --
 - `--profile`: Enable JAX profiling (saves trace to `./profiles`).
 - `--no-plot`: Disable plotting (useful for clusters).
 
+**Parameter Limits:**
+- `--depth`: Circuit depth (default 3).
+- `--r-scale`: Max squeezing scale (default 2.0, approx 17dB).
+- `--d-scale`: Max displacement scale (default 3.0).
+- `--hx-scale`: Homodyne X scale (default 4.0).
+- `--window`: Homodyne window width (default 0.1).
+- `--pnr-max`: Max PNR outcome (default 3).
+
 ### Profiling
 
 To profile the optimization loop:
