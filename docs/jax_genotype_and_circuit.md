@@ -24,6 +24,7 @@ We support multiple genotype designs offering different trade-offs between expre
 | **A** | Original (Canonical) | Per-leaf unique. 1 TMSS/leaf + Final Gauss. | 162 |
 | **B1** | Tied-Leaf (No Active) | Single shared block. 1 TMSS/block + Final Gauss. | 49 |
 | **B2** | Tied-Leaf (Active) | Same as B1 but with per-leaf active flags. | 57 |
+| **B3** | Semi-Tied (Per-Leaf PNR) | Shared continuous parameters, UNIQUE integer parameters (PNR, NCtrl) per leaf. | 37 (N=3) |
 | **C1** | Tied-All (No Active) | Constant structure. | 25 |
 | **C2** | Tied-All (Active) | Same as C1 but with per-leaf active flags. | 33 |
 
@@ -74,6 +75,29 @@ For Depth 3: $49 + 8 = 57$.
 - **Mix Nodes**: $L-1$ Unique nodes.
 - **Active Flags** (B2 only): $L$ booleans.
 - **Final Gaussian**: 5 params.
+
+### 3b. Design B3 - Semi-Tied (Shared Continuous, Unique Discrete)
+
+This design addresses the redundancy in B2 by separating parameters into "Shared" and "Unique" groups.
+- **Shared**: Expensive continuous parameters (TMSS, Unitaries, Displacements).
+- **Unique**: Integer/Boolean parameters (Active, NCtrl, PNR).
+
+**Benefit**: Allows every leaf to target a different photon signature (e.g., `|3,0>` or `|1,2>`) while using the same optical hardware settings.
+
+**Formula**: $Length = G + Shared + L \cdot Unique + (L-1) \cdot P_{node} + F$
+Where:
+- $Shared = 1(TMSS) + 1(US) + Len(UC) + Len(Disp)$
+- $Unique = 1(Active) + 1(NCtrl) + Len(PNR)$
+
+**For N=3 Modes (N_C=2)**:
+- $Shared = 12$ ($1 + 1 + 4 + 6$).
+- $Unique = 4$ ($1 + 1 + 2$).
+- Total (Depth 3, 8 leaves): $1 + 12 + 32 + 28 + 5 = 78$.
+
+**For N=2 Modes (N_C=1)**:
+- $Shared = 7$.
+- $Unique = 3$.
+- Total (Depth 2, 4 leaves): $1 + 7 + 12 + 12 + 5 = 37$.
 
 ---
 
@@ -155,3 +179,19 @@ Fitness objectives:
 2. Maximize Probability (Minimize $-\log_{10}(P)$).
 3. Minimize Complexity (Active Modes).
 4. Minimize Total Photons.
+
+## Dynamic Parameter Limits (Advanced)
+
+The backend supports a **Dynamic Limits** mode to allow exploration of parameter spaces that would normally overflow the finite Fock basis.
+
+### Mechanism: Dual-Cutoff Simulation
+When enabled via `--dynamic-limits`:
+1.  **Scaling**: Parameter limits (`R_SCALE`, `D_SCALE`) are relaxed significantly (e.g., $2.0 \to 20.0$), allowing the generation of high-energy states.
+2.  **Simulation (`correction_cutoff`)**: The circuit is simulated in a larger Hilbert space dimension (Defaults to `cutoff + 15`).
+3.  **Leakage Detection**: The system calculates the probability mass "leaking" outside the target `cutoff`.
+    $$ Leakage = 1.0 - \sum_{n=0}^{cutoff-1} | \psi_{sim}[n] |^2 $$
+4.  **Penalty**: A soft penalty is added to the fitness function (minimizing expectation).
+    $$ Penalty = 1.0 \times Leakage $$
+5.  **Truncation**: The state is effectively truncated and renormalized to the target `cutoff` for final processing.
+
+This allows the optimizer to find solutions that naturally fit within the bounds without being constrained by artificial parameter clamps.

@@ -56,7 +56,7 @@ def test_jax_superblock_consistency():
     # But we can use the leaf states directly!
 
     # Get leaf states from JAX
-    leaf_vecs, leaf_probs, leaf_modes, leaf_pnrs, _ = jax.vmap(
+    leaf_vecs, leaf_probs, _, leaf_pnrs, leaf_total_pnrs, leaf_modes = jax.vmap(
         lambda p: jax_get_heralded_state(p, cutoff)
     )(leaf_params)  # Wait, jax_get_heralded_state takes params dict now?
     # Yes, I updated it to take params dict.
@@ -164,11 +164,12 @@ def test_jax_superblock_consistency():
     V_matrix = jnp.zeros((cutoff, 1))
     dx_weights = jnp.zeros(1)
 
-    final_state_jax, _, joint_prob_jax, _, _, _ = jax_superblock(
+    final_state_jax, _, joint_prob_jax, _, _, _, _ = jax_superblock(
         leaf_vecs,
         leaf_probs,
         params["leaf_active"],
         leaf_pnrs,
+        leaf_pnrs,  # Using leaf_pnrs as total_pnrs (since 1 mode per leaf in this test)
         leaf_modes,
         mix_params,
         mix_source,

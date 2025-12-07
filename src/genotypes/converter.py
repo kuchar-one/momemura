@@ -112,6 +112,50 @@ def _extract_to_expanded(g, name, depth, config):
 
         return hom_x, blocks_raw, mix_raw, final_raw, active_raw
 
+    elif name == "B3":
+        # B3: Hom(1) + Shared(Sharedv) + L*Unique(U) + Mix + Final
+        # Need to reconstruct "Logical Blocks" (BP) for compatibility.
+        # BP Layout: NCtrl, TMSS, US, UC, Disp, PNR.
+
+        shared_start = 1
+        shared_len = decoder.Sharedv
+        shared_raw = g[shared_start : shared_start + shared_len]
+
+        unique_start = shared_start + shared_len
+        unique_len = L * decoder.Unique
+        unique_raw = g[unique_start : unique_start + unique_len].reshape(
+            L, decoder.Unique
+        )
+
+        # B3 Unique: Active(0), NCtrl(1), PNR(2...)
+        active_raw = unique_raw[:, 0]
+        n_ctrl_raw = unique_raw[:, 1:2]
+        pnr_raw = unique_raw[:, 2:]
+
+        # B3 Shared: TMSS(0), US(1), UC..., Disp...
+        tmss_us_uc_disp = shared_raw  # All shared params
+
+        # Broadcast Shared
+        broadcast_shared = np.tile(tmss_us_uc_disp, (L, 1))
+
+        # Reassemble Logical Blocks (BP)
+        # Order: NCtrl, Shared(TMSS..Disp), PNR
+        # Note: shared_raw order in B3 is TMSS, US, UC, Disp.
+        # BP order in A/B1: NCtrl, TMSS, US, UC, Disp, PNR.
+        # So we sandwich Shared between NCtrl and PNR.
+        blocks_list = [n_ctrl_raw, broadcast_shared, pnr_raw]
+        blocks_raw = np.hstack(blocks_list)
+
+        mix_start = unique_start + unique_len
+        mix_len = nodes * decoder.PN
+        mix_raw = g[mix_start : mix_start + mix_len].reshape(nodes, decoder.PN)
+
+        final_start = mix_start + mix_len
+        final_len = decoder.F
+        final_raw = g[final_start : final_start + final_len]
+
+        return hom_x, blocks_raw, mix_raw, final_raw, active_raw
+
     elif name in ["C1", "C2"]:
         # C1: Hom + Shared(BP) + SharedMix(PN) + Final
         shared_start = 1
@@ -185,6 +229,48 @@ def _flatten_from_expanded(expanded, name, depth, config):
 
         if name == "B2":
             parts.append(active_raw)
+
+    elif name == "B3":
+        # B3: Shared(TMSS..Disp) + Unique(Act, NCtrl, PNR)
+
+        # 1. Extract Shared (Mean of blocks)
+        # Logical Block: NCtrl(0), Shared(1..-PNR), PNR(-PNR..)
+        # We need to identify indices.
+        # decoder = get_genotype_decoder("B3", depth=depth, config=config)
+        # But we don't have decoder here easily? We passed depth/config.
+        # We can instantiate dummy decoder to get lengths.
+        from src.genotypes.genotypes import get_genotype_decoder
+
+        decoder = get_genotype_decoder("B3", depth=depth, config=config)
+
+        # Calculate indices based on Sharedv
+        # Sharedv in B3 = TMSS(1)+US(1)+UC+Disp = Total Shared Params.
+        # In Logical Block (BP), these are indices 1 to 1+Sharedv.
+        # Col 0 is NCtrl.
+        # Col 1..1+Sharedv is Shared.
+        # Col 1+Sharedv..End is PNR.
+
+        shared_start_idx = 1
+        shared_end_idx = 1 + decoder.Sharedv
+
+        # Take mean of shared columns
+        shared_cols = blocks_raw[:, shared_start_idx:shared_end_idx]
+        avg_shared = np.mean(shared_cols, axis=0)
+        parts.append(avg_shared)
+
+        # 2. Extract Unique (Per Leaf)
+        # Active (from active_raw), NCtrl (Col 0), PNR (Col -PNR..)
+
+        n_ctrl_col = blocks_raw[:, 0:1]  # (L, 1)
+        pnr_cols = blocks_raw[:, shared_end_idx:]  # (L, N_C)
+        active_col = active_raw[:, None]  # (L, 1)
+
+        # B3 Unique Order: Active, NCtrl, PNR
+        unique_block = np.hstack([active_col, n_ctrl_col, pnr_cols])  # (L, Unique)
+        parts.append(unique_block.flatten())
+
+        parts.append(mix_raw.flatten())
+        parts.append(final_raw)
 
     elif name in ["C1", "C2"]:
         # C: Shared Block + Shared Mix

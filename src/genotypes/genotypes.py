@@ -561,6 +561,177 @@ class DesignB1Genotype(BaseGenotype):
         }
 
 
+class DesignB3Genotype(BaseGenotype):
+    """
+    Design B3: Semi-Tied.
+    - Shared: Continuous Block (TMSS, US, UC, DispS, DispC).
+    - Unique Per Leaf: Discrete Block (Active, NCtrl, PNR).
+    """
+
+    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
+        super().__init__(depth, config)
+        self.leaves = 2**depth
+        self.nodes = self.leaves - 1
+
+        # Calculate lengths
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+
+        # Shared Continuous Block length
+        # TMSS(1) + US(1) + UC(len_uc) + DispS(2) + DispC(2*N_C)
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        self.Sharedv = 1 + 1 + len_uc + 2 + len_disp_c
+
+        # Unique Discrete Block length (Per Leaf)
+        # Active(1) + NCtrl(1) + PNR(N_C)
+        self.Unique = 1 + 1 + N_C
+
+        self.F = 5
+
+    def get_length(self, depth: int = 3) -> int:
+        L = 2**depth
+        # Total = Hom(1) + Shared + L*Unique + Mix(4*(L-1)) + Final(5)
+        return 1 + self.Sharedv + L * self.Unique + 4 * (L - 1) + 5
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        idx = 0
+
+        # 1. Homodyne
+        hom_x_raw = g[idx]
+        idx += 1
+        homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
+        homodyne_window = self.window
+
+        # 2. Shared Continuous Block
+        # Layout: TMSS, US, UC, DispS, DispC
+        shared_raw = g[idx : idx + self.Sharedv]
+        idx += self.Sharedv
+
+        s_idx = 0
+        # TMSS
+        tmss_r = jnp.tanh(shared_raw[s_idx]) * self.r_scale
+        s_idx += 1
+
+        # US Phase
+        us_phase = jnp.tanh(shared_raw[s_idx : s_idx + 1]) * (jnp.pi / 2)
+        s_idx += 1
+
+        # UC
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        uc_raw = shared_raw[s_idx : s_idx + len_uc]
+        s_idx += len_uc
+
+        if n_uc_pairs > 0:
+            uc_pairs = uc_raw[: 2 * n_uc_pairs]
+            uc_theta = jnp.tanh(uc_pairs[0::2]) * (jnp.pi / 2)
+            uc_phi = jnp.tanh(uc_pairs[1::2]) * (jnp.pi / 2)
+        else:
+            uc_theta = jnp.array([])
+            uc_phi = jnp.array([])
+
+        uc_varphi = jnp.tanh(uc_raw[2 * n_uc_pairs :]) * (jnp.pi / 2)
+
+        # Disp S
+        disp_s_sub = shared_raw[s_idx : s_idx + 2]
+        s_idx += 2
+        disp_s = (
+            jnp.tanh(disp_s_sub[0]) * self.d_scale
+            + 1j * jnp.tanh(disp_s_sub[1]) * self.d_scale
+        )
+        disp_s = disp_s[None]  # (1,)
+
+        # Disp C
+        len_disp_c = 2 * N_C
+        disp_c_sub = shared_raw[s_idx : s_idx + len_disp_c]
+        s_idx += len_disp_c
+        disp_c = (
+            jnp.tanh(disp_c_sub[0::2]) * self.d_scale
+            + 1j * jnp.tanh(disp_c_sub[1::2]) * self.d_scale
+        )
+
+        # 3. Unique Discrete Block (Per Leaf)
+        # Layout per leaf: Active, NCtrl, PNR
+        # Shape (L, Unique)
+        unique_total = self.leaves * self.Unique
+        unique_raw = g[idx : idx + unique_total]
+        idx += unique_total
+
+        unique_reshaped = unique_raw.reshape((self.leaves, self.Unique))
+
+        # Active (Idx 0)
+        leaf_active = unique_reshaped[:, 0] > 0.0
+
+        # NCtrl (Idx 1)
+        n_ctrl_raw = unique_reshaped[:, 1]
+        norm_val = (n_ctrl_raw + 1.0) / 2.0
+        # Map roughly to 3 bins
+        leaf_n_ctrl = jnp.round(norm_val * self.n_control).astype(jnp.int32)
+        leaf_n_ctrl = jnp.clip(leaf_n_ctrl, 0, self.n_control)
+
+        # PNR (Idx 2..2+N_C)
+        pnr_raw = jnp.clip(unique_reshaped[:, 2 : 2 + N_C], 0.0, 1.0)
+        leaf_pnr = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
+
+        # Broadcast Shared Params to (L, ...)
+        L = self.leaves
+
+        leaf_params = {
+            "n_ctrl": leaf_n_ctrl,  # (L,)
+            "tmss_r": jnp.broadcast_to(tmss_r, (L,)),
+            "us_phase": jnp.broadcast_to(us_phase, (L, 1)),
+            "uc_theta": jnp.broadcast_to(uc_theta, (L, n_uc_pairs)),
+            "uc_phi": jnp.broadcast_to(uc_phi, (L, n_uc_pairs)),
+            "uc_varphi": jnp.broadcast_to(uc_varphi, (L, N_C)),
+            "disp_s": jnp.broadcast_to(disp_s, (L, 1)),
+            "disp_c": jnp.broadcast_to(disp_c, (L, N_C)),
+            "pnr": leaf_pnr,  # (L, N_C)
+        }
+
+        # 4. Mix Nodes and Final
+        mix_len = 4 * (self.nodes)
+        if mix_len > 0:
+            mix_raw = g[idx : idx + mix_len]
+            idx += mix_len
+            mix_reshaped = mix_raw.reshape((self.nodes, 4))
+            mix_angles = jnp.tanh(mix_reshaped[:, :3]) * (jnp.pi / 2)
+            src_raw = mix_reshaped[:, 3]
+            mix_source = jnp.zeros(self.nodes, dtype=jnp.int32)
+            mix_source = jnp.where(src_raw < -0.33, 1, mix_source)
+            mix_source = jnp.where(src_raw > 0.33, 2, mix_source)
+        else:
+            mix_angles = jnp.zeros((0, 3))
+            mix_source = jnp.zeros((0,), dtype=jnp.int32)
+
+        final_raw = g[idx : idx + 5]
+        # Same as A/B
+        r_final = jnp.tanh(final_raw[0]) * self.r_scale
+        phi_final = jnp.tanh(final_raw[1]) * (jnp.pi / 2)
+        varphi_final = jnp.tanh(final_raw[2]) * (jnp.pi / 2)
+        disp_final = (
+            jnp.tanh(final_raw[3]) * self.d_scale
+            + 1j * jnp.tanh(final_raw[4]) * self.d_scale
+        )
+        final_gauss = {
+            "r": r_final,
+            "phi": phi_final,
+            "varphi": varphi_final,
+            "disp": disp_final,
+        }
+
+        return {
+            "homodyne_x": homodyne_x,
+            "homodyne_window": homodyne_window,
+            "mix_params": mix_angles,
+            "mix_source": mix_source,
+            "leaf_active": leaf_active,
+            "leaf_params": leaf_params,
+            "final_gauss": final_gauss,
+        }
+
+
 class DesignB2Genotype(DesignB1Genotype):
     """
     Design B2: Tied-leaf with per-leaf active flags.
@@ -772,6 +943,7 @@ GENOTYPE_REGISTRY = {
     "A": DesignAGenotype,
     "B1": DesignB1Genotype,
     "B2": DesignB2Genotype,
+    "B3": DesignB3Genotype,
     "C1": DesignC1Genotype,
     "C2": DesignC2Genotype,
 }

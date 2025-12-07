@@ -279,45 +279,76 @@ def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
         prob_slice,
         1.0,
         jnp.max(pnr_effective).astype(jnp.float_),
-        jnp.sum(pnr_effective).astype(jnp.float_),
+        jnp.sum(pnr_effective).astype(jnp.float_),  # Total PNR sum
+        1.0 + n_ctrl_eff.astype(jnp.float_),  # 1 Signal + N_Ctrl active
     )
 
 
-@partial(jax.jit, static_argnames=("cutoff", "genotype_name"))
+@partial(
+    jax.jit,
+    static_argnames=("cutoff", "genotype_name", "genotype_config", "correction_cutoff"),
+)
 def _score_batch_shard(
-    genotypes: jnp.ndarray, cutoff: int, operator: jnp.ndarray, genotype_name: str
+    genotypes: jnp.ndarray,
+    cutoff: int,
+    operator: jnp.ndarray,
+    genotype_name: str,
+    genotype_config: Any = None,  # Can be dict or tuple(items)
+    correction_cutoff: int = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     JIT-compiled scoring function for a single batch shard.
+    Supports dynamic limits via correction_cutoff simulation.
     """
-    decoder = get_genotype_decoder(genotype_name)
+    # Reconstruct config dict if passed as tuple
+    if genotype_config is not None and isinstance(genotype_config, tuple):
+        config_dict = dict(genotype_config)
+    else:
+        config_dict = genotype_config
+
+    decoder = get_genotype_decoder(genotype_name, config=config_dict)
+
+    # Determine Simulation Cutoff
+    use_correction = (correction_cutoff is not None) and (correction_cutoff > cutoff)
+    sim_cutoff = correction_cutoff if use_correction else cutoff
 
     def score_one(g):
-        params = decoder.decode(g, cutoff)
+        # Decode using simulation cutoff (scales applied here if any)
+        # Note: Decoder limits (r_scale) are in config/decoder, not passed here.
+        params = decoder.decode(g, sim_cutoff)
 
-        # 1. Get Leaf States
-        leaf_vecs, leaf_probs, leaf_modes, leaf_max_pnrs, leaf_total_pnrs = jax.vmap(
-            partial(jax_get_heralded_state, cutoff=cutoff)
+        # 1. Get Leaf States (in sim_cutoff)
+        leaf_vecs, leaf_probs, _, leaf_max_pnrs, leaf_total_pnrs, leaf_modes = jax.vmap(
+            partial(jax_get_heralded_state, cutoff=sim_cutoff)
         )(params["leaf_params"])
 
-        # 2. Superblock
+        # 2. Superblock (in sim_cutoff)
         hom_x = params["homodyne_x"]
         hom_win = params["homodyne_window"]
 
         # Point homodyne
-        phi_mat = jax_hermite_phi_matrix(jnp.array([hom_x]), cutoff)
+        phi_mat = jax_hermite_phi_matrix(jnp.array([hom_x]), sim_cutoff)
         phi_vec = phi_mat[:, 0]
 
-        V_matrix = jnp.zeros((cutoff, 1))
+        V_matrix = jnp.zeros((sim_cutoff, 1))
         dx_weights = jnp.zeros(1)
 
         from src.simulation.jax.composer import jax_superblock
 
-        final_state, _, joint_prob, is_active, max_pnr, active_modes = jax_superblock(
+        (
+            final_state,
+            _,
+            joint_prob,
+            is_active,
+            max_pnr,
+            total_sum_pnr,
+            active_modes,
+        ) = jax_superblock(
             leaf_vecs,
             leaf_probs,
             params["leaf_active"],
             leaf_max_pnrs,
+            leaf_total_pnrs,
             leaf_modes,
             params["mix_params"],
             params["mix_source"],
@@ -327,26 +358,66 @@ def _score_batch_shard(
             phi_vec,
             V_matrix,
             dx_weights,
-            cutoff,
+            sim_cutoff,
             True,
             False,
             True,
         )
 
-        # 3. Apply Final Global Gaussian
+        # 3. Apply Final Global Gaussian (in sim_cutoff)
         final_state_transformed = jax_apply_final_gaussian(
-            final_state, params["final_gauss"], cutoff
+            final_state, params["final_gauss"], sim_cutoff
         )
 
-        # 4. Expectation Value
-        op_psi = operator @ final_state_transformed
-        exp_val = jnp.real(jnp.vdot(final_state_transformed, op_psi))
+        # --- Dynamic Limits Logic ---
+        leakage_penalty = 0.0
+
+        if use_correction:
+            # Calculate Leakage: Probability mass outside 'cutoff'
+            # final_state_transformed is vector in sim_cutoff
+            probs = jnp.abs(final_state_transformed) ** 2
+            prob_total = jnp.sum(probs)
+            # Safe normalize if tiny?
+
+            # Mass in [0, cutoff]
+            mass_in = jnp.sum(probs[:cutoff])
+            leakage = 1.0 - (mass_in / jnp.maximum(prob_total, 1e-12))
+
+            # Truncate state for evaluation
+            # Simply slice [0:cutoff]
+            state_trunc = final_state_transformed[:cutoff]
+
+            # Renormalize truncated state
+            norm_trunc = jnp.linalg.norm(state_trunc)
+            state_eval = jax.lax.cond(
+                norm_trunc > 1e-9, lambda x: x / norm_trunc, lambda x: x, state_trunc
+            )
+
+            # Leakage Penalty
+            # If leakage > 0.05 (5%), apply heavy penalty?
+            # Or continuous penalty?
+            # Continuous: penalty = leakage * 100.0
+            leakage_penalty = leakage * 1.0
+
+        else:
+            state_eval = final_state_transformed
+
+        # 4. Expectation Value (using original operator in 'cutoff')
+        # Operator shape: (cutoff, cutoff)
+        # state_eval shape: (cutoff,)
+        op_psi = operator @ state_eval
+        raw_exp_val = jnp.real(jnp.vdot(state_eval, op_psi))
+
+        # Penalize zero-probability states
+        exp_val = jnp.where(joint_prob > 1e-12, raw_exp_val, 1000.0)
+
+        # Add Leakage Penalty
+        exp_val += leakage_penalty
 
         # 5. Fitness & Descriptors
         prob_clipped = jnp.maximum(joint_prob, 1e-30)
         log_prob = -jnp.log10(prob_clipped)
-
-        total_photons = jnp.sum(jnp.where(params["leaf_active"], leaf_total_pnrs, 0.0))
+        total_photons = total_sum_pnr
 
         # Fitness: [-exp_val, -log_prob, -complexity, -total_photons]
         fitness = jnp.array([-exp_val, -log_prob, -active_modes, -total_photons])
@@ -365,16 +436,31 @@ def jax_scoring_fn_batch(
     cutoff: int,
     operator: jnp.ndarray,
     genotype_name: str = "legacy",
+    genotype_config: Dict = None,
+    correction_cutoff: int = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Batched scoring function.
+    Batched scoring function for QDax.
     Dispatches to multi-device pmap if devices > 1, else uses jit.
     """
     n_devices = jax.local_device_count()
 
     if n_devices <= 1:
         # Fallback to single-device JIT
-        return _score_batch_shard(genotypes, cutoff, operator, genotype_name)
+        # Ensure config is hashable (dict -> tuple of items)
+        if genotype_config is not None and isinstance(genotype_config, dict):
+            config_hashable = tuple(sorted(genotype_config.items()))
+        else:
+            config_hashable = genotype_config
+
+        return _score_batch_shard(
+            genotypes,
+            cutoff,
+            operator,
+            genotype_name,
+            config_hashable,
+            correction_cutoff,
+        )
 
     # Multi-GPU Logic
     # 1. Pad genotypes to be divisible by n_devices
@@ -401,14 +487,42 @@ def jax_scoring_fn_batch(
     # NOTE: pmap args: (shard, cutoff, operator, genotype_name)
     # in_axes=(0, None, None, None) -> shard divides axis 0, others replicated.
 
+    # score_shard args: (genotypes, cutoff, operator, genotype_name, genotype_config, correction_cutoff)
+    # Argnum Map:
+    # 0: genotypes (Sharded)
+    # 1: cutoff (Static)
+    # 2: operator (Broadcasted)
+    # 3: genotype_name (Static)
+    # 4: genotype_config (Static)
+    # 5: correction_cutoff (Static)
+
+    # operator is array, so we BROADCAST it (None in in_axes).
+    # Cutoff, name, config, correction are constants -> STATIC.
+
     pmapped_fn = jax.pmap(
         _score_batch_shard,
-        in_axes=(0, None, None, None),
-        static_broadcasted_argnums=(1, 3),  # cutoff(1) and genotype_name(3) are static
+        in_axes=(0, None, None, None, None, None),
+        static_broadcasted_argnums=(
+            1,
+            3,
+            4,
+            5,
+        ),  # cutoff(1), name(3), config(4), correction(5) static
     )
 
+    # Ensure config is hashable for pmap static arg
+    if genotype_config is not None and isinstance(genotype_config, dict):
+        config_hashable = tuple(sorted(genotype_config.items()))
+    else:
+        config_hashable = genotype_config
+
     fitnesses_sharded, descriptors_sharded = pmapped_fn(
-        g_sharded, cutoff, operator, genotype_name
+        g_sharded,
+        cutoff,
+        operator,
+        genotype_name,
+        config_hashable,
+        correction_cutoff,
     )
 
     # 4. Reshape back

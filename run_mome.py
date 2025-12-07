@@ -174,7 +174,23 @@ class HanamuraMOMEAdapter:
         backend: str = "thewalrus",
         genotype_name: str = "legacy",
         genotype_config: Dict[str, Any] = None,
+        correction_cutoff: int = None,
     ):
+        """
+        Initialize the MOME Adapter.
+
+        Args:
+            composer (Composer): Composer instance for circuit evaluation.
+            topology (SuperblockTopology): Topology of the superblock.
+            operator (np.ndarray): Target operator for fidelity calculation.
+            cutoff (int): Simulation cutoff dimension (N).
+            mode (str): "pure" or "mixed" (currently only "pure" is supported).
+            homodyne_resolution (float): Resolution for homodyne measurement.
+            backend (str): "thewalrus" or "jax".
+            genotype_name (str): Name of the genotype to use (e.g., "legacy", "A").
+            genotype_config (dict): Configuration dictionary for the genotype.
+            correction_cutoff (int): Higher cutoff for leakage correction.
+        """
         self.composer = composer
         self.topology = topology
         self.operator = operator
@@ -184,6 +200,7 @@ class HanamuraMOMEAdapter:
         self.backend = backend
         self.genotype_name = genotype_name
         self.genotype_config = genotype_config or {}
+        self.correction_cutoff = correction_cutoff
 
         # Instantiate decoder for local use
         self.decoder = get_genotype_decoder(genotype_name, config=self.genotype_config)
@@ -351,7 +368,12 @@ class HanamuraMOMEAdapter:
             from src.simulation.jax.runner import jax_scoring_fn_batch
 
             fitnesses, descriptors = jax_scoring_fn_batch(
-                g_batch, self.cutoff, op_batch, genotype_name=self.genotype_name
+                g_batch,
+                self.cutoff,
+                op_batch,
+                genotype_name=self.genotype_name,
+                genotype_config=self.genotype_config,
+                correction_cutoff=self.correction_cutoff,
             )
 
             # Extract metrics
@@ -402,7 +424,12 @@ class HanamuraMOMEAdapter:
 
             with jax.profiler.TraceAnnotation("jax_scoring_fn_batch"):
                 fitnesses_jax, descriptors_jax = jax_scoring_fn_batch(
-                    g_jax, self.cutoff, op_jax, genotype_name=self.genotype_name
+                    g_jax,
+                    self.cutoff,
+                    op_jax,
+                    self.genotype_name,
+                    self.genotype_config,
+                    self.correction_cutoff,
                 )
                 fitnesses_jax.block_until_ready()
                 descriptors_jax.block_until_ready()
@@ -509,14 +536,15 @@ class HanamuraMOMEAdapter:
             )  # QDax maximizes fitness
 
             # Descriptors (for map)
-            # 1. Total Photons
-            d_total = float(metrics["total_measured_photons"])
-            # 2. Max Photons
-            d_max = float(metrics["per_detector_max"])
-            # 3. Complexity
+            # Match JAX Runner: [Complexity, Max_PNR, Total_Photons]
+            # 1. Complexity (Active Modes)
             d_complex = float(metrics["complexity"])
+            # 2. Max Photons (Max PNR)
+            d_max = float(metrics["per_detector_max"])
+            # 3. Total Photons
+            d_total = float(metrics["total_measured_photons"])
 
-            descriptors[i, :] = np.array([d_total, d_max, d_complex])
+            descriptors[i, :] = np.array([d_complex, d_max, d_total])
             extras.append(metrics)
 
         # Convert extras to dict of arrays (for QDax compatibility if needed, though QDax ignores extras usually)
@@ -682,7 +710,8 @@ def run(
     genotype: str = "legacy",
     genotype_config: Dict[str, Any] = None,
     seed_scan: bool = False,
-):
+    correction_cutoff: int = None,
+) -> Any:
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
 
@@ -697,17 +726,16 @@ def run(
         cutoff, target_alpha, target_beta, backend=backend
     )
 
-    # Adapter
+    # --- Setup MOME Adapter ---
     adapter = HanamuraMOMEAdapter(
         composer,
         topology,
         operator,
-        cutoff=cutoff,
-        mode=mode,
-        homodyne_resolution=0.01,
+        cutoff,
         backend=backend,
         genotype_name=genotype,
         genotype_config=genotype_config,
+        correction_cutoff=correction_cutoff,
     )
 
     # Calculate Genotype Dimension D
@@ -881,8 +909,20 @@ def run(
 
         # Create initial population
         key, subkey = jax.random.split(key)
+
+        # Initialization Range
+        # If dynamic limits are on, [-2, 2] maps to [-20, 20] which is massive energy (10^16 photons).
+        # This collapses all individuals to the edge of the grid, resulting in 0% coverage.
+        # We use a tighter range [-0.1, 0.1] which maps to [-2, 2] (approx) to start in reasonable space.
+        is_dynamic = genotype_config and genotype_config.get("dynamic_limits", False)
+        init_range = 0.1 if is_dynamic else 2.0
+
         genotypes = jax.random.uniform(
-            subkey, (pop_size, D), minval=-2.0, maxval=2.0, dtype=jnp.float32
+            subkey,
+            (pop_size, D),
+            minval=-init_range,
+            maxval=init_range,
+            dtype=jnp.float32,
         )
 
         # Emitter setup
@@ -911,6 +951,9 @@ def run(
         from src.utils.result_scanner import scan_results_for_seeds
 
         print("Applying Seeding Strategy...")
+        if "modes" not in genotype_config:
+            genotype_config["modes"] = 2
+
         # Inject Vacuum
         vacuum = create_vacuum_genotype(
             genotype, depth=depth_val, config=genotype_config
@@ -960,25 +1003,32 @@ def run(
 
         # Grid-based Centroids
         # D1: Active Modes (Complexity): 0..2^depth (Inclusive, so +1 bin)
-        # Note: 0 active modes is Vacuum.
         max_active = 2**depth_val
         n_bins_d1 = max_active + 1
         d1 = jnp.linspace(0, max_active, n_bins_d1)
 
-        # D2: Max PNR: 0..pnr_max (Inclusive, so +1 bin)
+        # D2: Max PNR
+        # Coarse Gridding for high PNR
         pnr_max_val = 3
         if genotype_config and "pnr_max" in genotype_config:
             pnr_max_val = int(genotype_config["pnr_max"])
 
-        max_pnr_grid = pnr_max_val
-        n_bins_d2 = int(max_pnr_grid + 1)
-        d2 = jnp.linspace(0, max_pnr_grid, n_bins_d2)
+        # Target ~10 bins for PNR dimension if range is large
+        n_bins_d2 = min(pnr_max_val + 1, 10)
+        d2 = jnp.linspace(0, pnr_max_val, n_bins_d2)
 
-        # D3: Total Photons: 0..max_active * pnr_max (Inclusive)
+        # D3: Total Photons
+        # Coarse Gridding for high photon counts
+        # Max theoretical photons = max_active * pnr_max_val
         max_photons = max_active * pnr_max_val
-        # 1 bin per photon -> max_photons + 1 bins
-        n_bins_d3 = int(max_photons + 1)
+
+        # Target ~25 bins for Total dimension
+        n_bins_d3 = min(max_photons + 1, 25)
         d3 = jnp.linspace(0, max_photons, n_bins_d3)
+
+        print(
+            f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), D3(0-{max_photons})"
+        )
         grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
         centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
 
@@ -1037,9 +1087,18 @@ def run(
 
         all_metrics = {k: [] for k in init_metrics.keys()}
 
+        # -------------------------
+        # Progress Bar Setup
+        # -------------------------
+        op_jax = jnp.array(operator)
+        gs_eig = float(jnp.linalg.eigvalsh(op_jax)[0])
+        gaussian_limit = 2.0 / 3.0
+
         print(
-            f"Starting optimization: {n_iters} iterations in {n_chunks} chunks (sizes={chunks})."
+            f"Starting optimization: {n_iters} iterations in {n_chunks} chunks (sizes={chunks}).\n"
+            f"Target: GS Eig = {gs_eig:.6f}, Gaussian Limit = {gaussian_limit:.6f}"
         )
+        print(f"[{' ' * 20}] Iter 0/{n_iters} | Waiting...", end="\r", flush=True)
 
         start_time = time.time()
         history_fronts = []
@@ -1048,6 +1107,8 @@ def run(
         snapshot_interval = max(1, n_iters // 50)
 
         completed = 0
+
+        chunk_start_time = time.time()
 
         for chunk_len in chunks:
             # Re-compile scan for each unique chunk length?
@@ -1110,11 +1171,15 @@ def run(
 
             print(
                 f"[{bar}] Iter {completed}/{n_iters} | "
-                f"ETR: {etr_str} | "
+                f"Chunk: {time.time() - chunk_start_time:.1f}s | "
+                f"ETA: {etr_str} | "
                 f"Cov: {cov:.1f}% | "
-                f"Best Exp: {best_exp:.4f} | "
-                f"Best Prob: {best_prob:.2e}"
+                f"Exp: {best_exp:.4f} (vs GS: {best_exp - gs_eig:+.4f}, vs G: {best_exp - gaussian_limit:+.4f})",
+                end="\r",
+                flush=True,
             )
+
+            chunk_start_time = time.time()
 
         print("QDax MOME finished.")
 
@@ -1244,17 +1309,54 @@ def main():
         action="store_true",
         help="Scan output/ dir for high-fitness seeds",
     )
+    # Dynamic Limits
+    parser.add_argument(
+        "--dynamic-limits",
+        action="store_true",
+        help="Enable dynamic parameter limits (discovery mode)",
+    )
+    parser.add_argument(
+        "--correction-cutoff",
+        type=int,
+        default=None,
+        help="Higher cutoff for leakage check (default: cutoff + 15)",
+    )
 
     args = parser.parse_args()
+
+    # Dynamic Limits Override
+    r_scale_val = args.r_scale
+    d_scale_val = args.d_scale
+    corr_cutoff_val = args.correction_cutoff
+    pnr_max_val = args.pnr_max
+
+    if args.dynamic_limits:
+        print("!!! Dynamic Limits Enabled !!!")
+        print("  - Overriding r_scale/d_scale to 20.0 (Unbounded Discovery)")
+        r_scale_val = 20.0
+        d_scale_val = 20.0
+        # User requested override: pnr_max -> cutoff - 1
+        pnr_override = args.cutoff - 1
+        if pnr_override > 0:
+            print(f"  - Overriding pnr_max to {pnr_override} (cutoff-1)")
+            pnr_max_val = pnr_override
+        else:
+            print(
+                f"  - Warning: Cutoff {args.cutoff} too small for pnr override, using default {pnr_max_val}"
+            )
+
+        if corr_cutoff_val is None:
+            corr_cutoff_val = args.cutoff + 15
+        print(f"  - Correction Cutoff: {corr_cutoff_val}")
 
     # Build config dict
     genotype_config = {
         "depth": args.depth,
-        "r_scale": args.r_scale,
-        "d_scale": args.d_scale,
+        "r_scale": r_scale_val,
+        "d_scale": d_scale_val,
         "hx_scale": args.hx_scale,
         "window": args.window,
-        "pnr_max": args.pnr_max,
+        "pnr_max": pnr_max_val,
         "modes": args.modes,
     }
 
@@ -1277,6 +1379,7 @@ def main():
                 genotype=args.genotype,
                 genotype_config=genotype_config,
                 seed_scan=args.seed_scan,
+                correction_cutoff=corr_cutoff_val,
             )
         finally:
             jax.profiler.stop_trace()
@@ -1296,6 +1399,7 @@ def main():
             genotype=args.genotype,
             genotype_config=genotype_config,
             seed_scan=args.seed_scan,
+            correction_cutoff=corr_cutoff_val,
         )
 
 

@@ -483,6 +483,7 @@ def jax_superblock(
     leaf_probs: jnp.ndarray,  # (8,)
     leaf_active: jnp.ndarray,  # (8,) boolean
     leaf_pnr: jnp.ndarray,  # (8,) max PNR for each leaf
+    leaf_total_pnr: jnp.ndarray,  # (8,) sum PNR for each leaf (NEW)
     leaf_modes: jnp.ndarray,  # (8,) mode count for each leaf (usually 1 or 2)
     mix_params: jnp.ndarray,  # (7, 3) theta, phi, varphi
     mix_source: jnp.ndarray,  # (7,) int: 0=Mix, 1=PassLeft, 2=PassRight
@@ -496,10 +497,10 @@ def jax_superblock(
     homodyne_window_is_none: bool,
     homodyne_x_is_none: bool,
     homodyne_resolution_is_none: bool,
-) -> Tuple[jnp.ndarray, float, float, float, float]:
+) -> Tuple[jnp.ndarray, float, float, float, float, float, float]:
     """
     Implements a fixed-depth binary tree of blocks (Depth 3 = 8 leaves).
-    Returns (final_state, final_prob, joint_prob, active_modes_count, max_pnr).
+    Returns (final_state, final_prob, joint_prob, active_modes_count, max_pnr, total_sum_pnr).
     """
 
     # Helper to mix or pass
@@ -512,6 +513,8 @@ def jax_superblock(
         activeB,
         pnrA,
         pnrB,
+        sumPnrA,
+        sumPnrB,
         modesA,
         modesB,
         params,
@@ -519,88 +522,17 @@ def jax_superblock(
     ):
         # source: 0=Mix, 1=PassLeft, 2=PassRight
 
-        # Default Mix result
-        # We need to handle potential shape mismatch if states are vectors/matrices
-        # But jax_compose_pair handles both if we ensure they are correct rank.
-        # leaf_states are likely all same rank (vectors or matrices).
-
-        # Pass Left
-        # rho_left = stateA
-        # p_left = probA
-        # If we pass left, we ignore right. So joint prob is just probA * 1.0 (right ignored)
-        # But wait, probA is "probability of this branch so far".
-        # joint_mix = probA * probB * p_measure
-        # If pass left, joint = probA
-
-        # Pass Right
-        # rho_right = stateB
-        # p_right = probB
-
-        # Select based on source
-        # 0: Mix, 1: Left, 2: Right
-
-        # We use lax.switch or nested cond
         def do_mix(_):
             theta, phi, varphi = params
-            # If we can skip U construction, we pass dummy U
 
-            # Optimization:
-            # If we are in the pure state path (leaves are vectors, homodyne is point),
-            # we don't need U. jax_compose_pair will use jax_apply_bs_vec.
-            # However, we don't know for sure if we are in that path here (static analysis tricky).
-            # But we can pass U as a dummy if we are confident, or just compute it.
-            # Computing U is slow.
-            # Let's pass a dummy U if we are sure?
-            # No, jax_compose_pair might fall back to mixed path if homodyne_window is used.
-            # But we know homodyne_window_is_none is passed in.
-
-            # If homodyne_window_is_none is True, and inputs are vectors, we use optimized path.
-            # We can't check inputs are vectors here easily (they are tracers).
-            # But we can check homodyne_window_is_none.
-
-            # If homodyne_window_is_none is True, we can skip U construction?
-            # But jax_compose_pair expects U.
-            # We can pass a dummy U (zeros) and rely on jax_compose_pair to not use it.
-            # But if it DOES use it (e.g. mixed inputs), we get wrong results.
-            # Safe bet: Construct U only if needed?
-            # jax.lax.cond?
-
-            # Actually, for C=25, constructing U is the bottleneck.
-            # We should try to avoid it.
-            # If we pass U=None, JIT fails.
-            # If we pass U=zeros, and it's used, we get garbage.
-
-            # Let's use a conditional construction of U?
-            # U = jax.lax.cond(should_construct_U, ...)
-            # When should we? If mixed path.
-            # Mixed path if: not (is_vec_A and is_vec_B and homodyne_window_is_none).
-            # We don't know is_vec inside jax_superblock easily without inspecting shapes.
-            # leaf_states shape is (8, cutoff) or (8, cutoff, cutoff).
-            # If ndim=2, it's vector (batch of vectors).
-            # If ndim=3, it's matrix (batch of matrices).
-            # Wait, leaf_states is passed in.
-            # If leaf_states.ndim == 2, then they are vectors.
-            # So we know statically!
-
-            # Check leaf_states ndim
+            # Optimization: Skip U if pure vectors & point homodyne
             are_leaves_vectors = leaf_states.ndim == 2
-
-            # If leaves are vectors, and homodyne_window_is_none is True,
-            # AND homodyne_x is point (which implies output is vector),
-            # then we stay in vector land.
-            # homodyne_x is float. homodyne_x_is_none is bool.
-            # If homodyne_x_is_none is True (Partial Trace), output is matrix (mixed).
-            # If homodyne_x_is_none is False (Point Homodyne), output is vector (pure).
-
-            # So:
-            # So:
             can_skip_U = (
                 are_leaves_vectors
                 and homodyne_window_is_none
                 and (not homodyne_x_is_none)
             )
 
-            # Construct U only if needed
             def construct_U():
                 return jax_u_bs(theta, phi, cutoff)
 
@@ -632,73 +564,40 @@ def jax_superblock(
             )
 
             # Descriptors logic
-            # Complexity: sum of modes if active
-            # If we mix, we use both branches.
-            # If activeA and activeB are true, we sum modes.
-            # But wait, activeA/B are booleans.
-            # We track modesA and modesB (counts).
             new_modes = modesA + modesB
-
-            # Max PNR: max of pnrA and pnrB
             new_pnr = jnp.maximum(pnrA, pnrB)
-
-            # Active status: if we mix, result is active if either input is active?
-            # Or both?
-            # If we mix, we consume both. If one is inactive (vacuum), we still mix.
-            # But if both are inactive, result is inactive.
+            new_total_pnr = sumPnrA + sumPnrB
             new_active = activeA | activeB
 
-            return res_state, p_mix, joint, new_active, new_pnr, new_modes
+            return (
+                res_state,
+                p_mix,
+                joint,
+                new_active,
+                new_pnr,
+                new_total_pnr,
+                new_modes,
+            )
 
         def do_left(_):
-            # Pass Left
-            # We need to return same shape tuple
-            # joint prob is just probA (assuming right branch didn't happen or is ignored)
-            # But we must be careful about probability normalization.
-            # If we select "Pass Left", we are saying the circuit structure is just Left.
-            # So probB is irrelevant.
-            return stateA, 1.0, probA, activeA, pnrA, modesA
+            return stateA, 1.0, probA, activeA, pnrA, sumPnrA, modesA
 
         def do_right(_):
-            # Pass Right
-            return stateB, 1.0, probB, activeB, pnrB, modesB
+            return stateB, 1.0, probB, activeB, pnrB, sumPnrB, modesB
 
         return jax.lax.switch(source, [do_mix, do_left, do_right], None)
 
-        # rho_mix, rho_left, rho_right must have same shape.
-        # If leaf_states are vectors, rho_mix might be vector or matrix depending on homodyne.
-        # If homodyne is point/window, result is vector/matrix.
-        # If leaf_states are pure vectors, and homodyne is point, result is vector.
-        # If leaf_states are mixed, result is matrix.
-        # We should ensure everything is matrix (density matrix) to be safe?
-        # Or rely on jax_compose_pair's behavior.
-        # If we start with pure states, jax_compose_pair returns pure if homodyne point.
-        # Let's assume consistent types.
-
-        res = jax.lax.switch(source, [do_mix, do_left, do_right], None)
-        return res
-
     # Tree Construction
-    # Leaves: 0..7
-    # Layer 1: 0+1->8, 2+3->9, 4+5->10, 6+7->11
-    # Layer 2: 8+9->12, 10+11->13
-    # Layer 3: 12+13->14 (Root)
-
-    # We work with stacked arrays
     current_states = leaf_states
     current_probs = leaf_probs
     current_actives = leaf_active
     current_pnrs = leaf_pnr
+    current_sum_pnrs = leaf_total_pnr
     current_modes = leaf_modes
 
     mix_idx = 0
 
-    # 3 Layers
-    # We unroll the layers because batch size changes (4 -> 2 -> 1)
-    # But we vmap within each layer.
-
     # Layer 0 (8 -> 4)
-    # Pairs: 4
     n_pairs = 4
     params_0 = mix_params[mix_idx : mix_idx + n_pairs]
     source_0 = mix_source[mix_idx : mix_idx + n_pairs]
@@ -712,21 +611,21 @@ def jax_superblock(
     actB = current_actives[1::2]
     pnrA = current_pnrs[0::2]
     pnrB = current_pnrs[1::2]
+    sumA = current_sum_pnrs[0::2]
+    sumB = current_sum_pnrs[1::2]
     mA = current_modes[0::2]
     mB = current_modes[1::2]
 
-    # vmap mix_node
-    # mix_node captures constants (homodyne_x, etc.)
-    # We vmap over all arguments
     (
         current_states,
         _,
         current_probs,
         current_actives,
         current_pnrs,
+        current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, mA, mB, params_0, source_0
+        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_0, source_0
     )
 
     # Layer 1 (4 -> 2)
@@ -743,6 +642,8 @@ def jax_superblock(
     actB = current_actives[1::2]
     pnrA = current_pnrs[0::2]
     pnrB = current_pnrs[1::2]
+    sumA = current_sum_pnrs[0::2]
+    sumB = current_sum_pnrs[1::2]
     mA = current_modes[0::2]
     mB = current_modes[1::2]
 
@@ -752,9 +653,10 @@ def jax_superblock(
         current_probs,
         current_actives,
         current_pnrs,
+        current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, mA, mB, params_1, source_1
+        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_1, source_1
     )
 
     # Layer 2 (2 -> 1)
@@ -771,6 +673,8 @@ def jax_superblock(
     actB = current_actives[1::2]
     pnrA = current_pnrs[0::2]
     pnrB = current_pnrs[1::2]
+    sumA = current_sum_pnrs[0::2]
+    sumB = current_sum_pnrs[1::2]
     mA = current_modes[0::2]
     mB = current_modes[1::2]
 
@@ -780,17 +684,18 @@ def jax_superblock(
         current_probs,
         current_actives,
         current_pnrs,
+        current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, mA, mB, params_2, source_2
+        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_2, source_2
     )
 
     # Final result
-    # current_states is (1, cutoff)
     root_state = current_states[0]
     root_prob = current_probs[0]
     root_modes = current_modes[0]
     root_pnr = current_pnrs[0]
+    root_sum_pnr = current_sum_pnrs[0]
     root_active = current_actives[0]
 
-    return root_state, 1.0, root_prob, root_active, root_pnr, root_modes
+    return root_state, 1.0, root_prob, root_active, root_pnr, root_sum_pnr, root_modes
