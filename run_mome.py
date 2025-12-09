@@ -63,6 +63,16 @@ try:
     # JAX Config
     # Use float32 for speed (User request)
     jax.config.update("jax_enable_x64", False)
+
+    # Memory optimization: don't preallocate all GPU memory
+    # This helps with multi-GPU workloads and reduces fragmentation
+    import os
+
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+    # Limit memory growth to avoid OOM on large batches
+    # os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
+
     import jax.numpy as jnp
 except ImportError:
     jax = None
@@ -711,6 +721,7 @@ def run(
     genotype_config: Dict[str, Any] = None,
     seed_scan: bool = False,
     correction_cutoff: int = None,
+    max_chunk_size: int = 100,
 ) -> Any:
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
@@ -892,7 +903,12 @@ def run(
                 # Ensure operator is a JAX array
                 op_jax = jnp.array(operator)
                 fitnesses, descriptors = jax_scoring_fn_batch(
-                    genotypes, cutoff, op_jax, genotype_name=genotype
+                    genotypes,
+                    cutoff,
+                    op_jax,
+                    genotype_name=genotype,
+                    genotype_config=genotype_config,
+                    correction_cutoff=correction_cutoff,
                 )
 
             # QDax expects extra scores (gradients/etc) but we don't have them.
@@ -911,11 +927,10 @@ def run(
         key, subkey = jax.random.split(key)
 
         # Initialization Range
-        # If dynamic limits are on, [-2, 2] maps to [-20, 20] which is massive energy (10^16 photons).
-        # This collapses all individuals to the edge of the grid, resulting in 0% coverage.
-        # We use a tighter range [-0.1, 0.1] which maps to [-2, 2] (approx) to start in reasonable space.
+        # Wider range = more initial diversity (important for coverage)
+        # Dynamic limits can handle wider values now with adaptive scaling
         is_dynamic = genotype_config and genotype_config.get("dynamic_limits", False)
-        init_range = 0.1 if is_dynamic else 2.0
+        init_range = 0.5 if is_dynamic else 2.0
 
         genotypes = jax.random.uniform(
             subkey,
@@ -929,10 +944,10 @@ def run(
         crossover_function = partial(polynomial_crossover, proportion_var_to_change=0.5)
         mutation_function = partial(
             polynomial_mutation,
-            eta=1.0,
+            eta=0.5,  # Lower = stronger mutations (was 1.0)
             minval=-5.0,
             maxval=5.0,
-            proportion_to_mutate=0.6,
+            proportion_to_mutate=0.8,  # Higher = more genes mutated (was 0.6)
         )
 
         # Adjust batch size for low memory
@@ -1019,8 +1034,13 @@ def run(
 
         # D3: Total Photons
         # Coarse Gridding for high photon counts
-        # Max theoretical photons = max_active * pnr_max_val
-        max_photons = max_active * pnr_max_val
+        # Max theoretical photons = max_active * pnr_max_val * n_control
+        # Each leaf has n_control detectors, each detecting up to pnr_max photons
+        n_modes_val = 2  # Default
+        if genotype_config and "modes" in genotype_config:
+            n_modes_val = int(genotype_config["modes"])
+        n_control = max(1, n_modes_val - 1)
+        max_photons = max_active * pnr_max_val * n_control
 
         # Target ~25 bins for Total dimension
         n_bins_d3 = min(max_photons + 1, 25)
@@ -1032,13 +1052,67 @@ def run(
         grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
         centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
 
+        # Count achievable bins for accurate coverage calculation
+        # Constraints: total_photons in [max_pnr, active * n_control * pnr_max]
+        n_achievable_bins = 0
+        d3_width = float(d3[1] - d3[0]) if len(d3) > 1 else 1.0
+        for active_val in np.array(d1):
+            active_int = int(round(active_val))
+            for max_pnr_bin_val in np.array(d2):
+                for total_val in np.array(d3):
+                    if active_int == 0:
+                        # Only (0, ~0, ~0) is valid
+                        if max_pnr_bin_val < d3_width and total_val < d3_width:
+                            n_achievable_bins += 1
+                    else:
+                        min_total = max_pnr_bin_val
+                        max_total = active_int * n_control * pnr_max_val
+                        # Check if bin center is in valid range (with half-bin tolerance)
+                        if (
+                            total_val >= min_total - d3_width / 2
+                            and total_val <= max_total + d3_width / 2
+                        ):
+                            n_achievable_bins += 1
+
         print(f"Generated {centroids.shape[0]} centroids.")
+        print(
+            f"Achievable bins: {n_achievable_bins}/{centroids.shape[0]} ({100 * n_achievable_bins / centroids.shape[0]:.1f}%)"
+        )
+
+        # Store for metrics (closure will capture this)
+        _n_achievable = n_achievable_bins
+
+        # Create local metrics function with correct achievable bins
+        def local_metrics(repertoire):
+            """Custom metrics with accurate achievable coverage."""
+            valid_mask = repertoire.fitnesses[:, 0, 0] != -jnp.inf
+            # Use achievable bins as denominator, not total grid
+            coverage = jnp.sum(valid_mask) / _n_achievable
+
+            flat_fitnesses = repertoire.fitnesses.reshape(
+                -1, repertoire.fitnesses.shape[-1]
+            )
+            flat_valid = flat_fitnesses[:, 0] != -jnp.inf
+            min_expectation = -jnp.max(
+                jnp.where(flat_valid, flat_fitnesses[:, 0], -jnp.inf)
+            )
+            min_log_prob = -jnp.max(
+                jnp.where(flat_valid, flat_fitnesses[:, 1], -jnp.inf)
+            )
+            max_prob = jnp.power(10.0, -min_log_prob)
+
+            return {
+                "coverage": coverage,
+                "min_expectation": min_expectation,
+                "min_log_prob": min_log_prob,
+                "max_probability": max_prob,
+            }
 
         # MOME instance
         mome = MOME(
             scoring_function=scoring_fn,
             emitter=mixing_emitter,
-            metrics_function=metrics_function,
+            metrics_function=local_metrics,  # Use local metrics with correct coverage
             pareto_front_max_length=5,  # As requested
         )
 
@@ -1063,11 +1137,8 @@ def run(
         # jax.lax.scan compiles the body once, so larger chunk_size doesn't increase graph size,
         # only the execution time per chunk.
 
-        # Aggressive chunking: target ~50-100 steps per chunk
-        if LOW_MEM:
-            target_chunk = 50
-        else:
-            target_chunk = 100
+        # Use user-specified chunk size (or lower for low memory)
+        target_chunk = min(max_chunk_size, 50 if LOW_MEM else max_chunk_size)
 
         chunk_size = min(n_iters, target_chunk)
         n_chunks = n_iters // chunk_size
@@ -1321,6 +1392,12 @@ def main():
         default=None,
         help="Higher cutoff for leakage check (default: cutoff + 15)",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=100,
+        help="Maximum iterations per chunk for progress reporting (default: 100)",
+    )
 
     args = parser.parse_args()
 
@@ -1332,18 +1409,45 @@ def main():
 
     if args.dynamic_limits:
         print("!!! Dynamic Limits Enabled !!!")
-        print("  - Overriding r_scale/d_scale to 20.0 (Unbounded Discovery)")
-        r_scale_val = 20.0
-        d_scale_val = 20.0
-        # User requested override: pnr_max -> cutoff - 1
-        pnr_override = args.cutoff - 1
-        if pnr_override > 0:
-            print(f"  - Overriding pnr_max to {pnr_override} (cutoff-1)")
-            pnr_max_val = pnr_override
+
+        # Adaptive r_scale based on cutoff:
+        # Mean photon number for squeezed vacuum ~ sinh^2(r)
+        # To keep mean photons roughly at cutoff, use r ~ asinh(sqrt(cutoff))
+        r_scale_val = float(np.arcsinh(np.sqrt(args.cutoff)))
+
+        # Adaptive d_scale based on cutoff:
+        # Mean photon number for coherent state ~ |alpha|^2
+        # To keep mean photons at cutoff, use alpha ~ sqrt(cutoff)
+        d_scale_val = float(np.sqrt(args.cutoff))
+
+        print(
+            f"  - Adaptive r_scale: {r_scale_val:.2f} (mean photons ~ {int(np.sinh(r_scale_val) ** 2)})"
+        )
+        print(
+            f"  - Adaptive d_scale: {d_scale_val:.2f} (mean photons ~ {int(d_scale_val**2)})"
+        )
+
+        # Determine pnr_max:
+        # 1. If user explicitly set --pnr-max, use that
+        # 2. Otherwise use min(cutoff-1, 15) to avoid OOM
+        # The default pnr_max is 3, so if it's still 3, user didn't override
+        user_set_pnr = args.pnr_max != 3  # Check if user explicitly set it
+
+        if user_set_pnr:
+            pnr_max_val = args.pnr_max
+            print(f"  - Using user-specified pnr_max: {pnr_max_val}")
         else:
-            print(
-                f"  - Warning: Cutoff {args.cutoff} too small for pnr override, using default {pnr_max_val}"
-            )
+            # Use sensible default that won't OOM
+            pnr_override = min(args.cutoff - 1, 15)  # Cap at 15 to prevent OOM
+            if pnr_override > 0:
+                print(
+                    f"  - Auto pnr_max: {pnr_override} (min(cutoff-1, 15) for memory safety)"
+                )
+                pnr_max_val = pnr_override
+            else:
+                print(
+                    f"  - Warning: Cutoff {args.cutoff} too small for pnr override, using default {pnr_max_val}"
+                )
 
         if corr_cutoff_val is None:
             corr_cutoff_val = args.cutoff + 15
@@ -1380,6 +1484,7 @@ def main():
                 genotype_config=genotype_config,
                 seed_scan=args.seed_scan,
                 correction_cutoff=corr_cutoff_val,
+                max_chunk_size=args.chunk_size,
             )
         finally:
             jax.profiler.stop_trace()
@@ -1400,6 +1505,7 @@ def main():
             genotype_config=genotype_config,
             seed_scan=args.seed_scan,
             correction_cutoff=corr_cutoff_val,
+            max_chunk_size=args.chunk_size,
         )
 
 

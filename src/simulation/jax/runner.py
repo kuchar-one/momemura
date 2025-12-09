@@ -134,9 +134,16 @@ def jax_apply_final_gaussian(
     return U_final @ state_vec
 
 
-def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
+def jax_get_heralded_state(
+    params: Dict[str, jnp.ndarray], cutoff: int, pnr_max: int = 3
+):
     """
     Computes the heralded state for a single block (1 Signal, up to 2 Controls).
+
+    Args:
+        params: Dict containing leaf parameters
+        cutoff: Fock cutoff dimension
+        pnr_max: Maximum PNR value for amplitude tensor (static, must be known at trace time)
     """
     # Extract params
     n_ctrl_eff = params["n_ctrl"]  # (1,) int
@@ -236,7 +243,8 @@ def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
     # Mask PNR: Use provided PNR for active controls, 0 for inactive
     pnr_effective = jnp.where(ctrl_indices_local < n_ctrl_eff, pnr, 0)
 
-    MAX_PNR_LOCAL = 3  # Local constant fallback
+    # Use pnr_max parameter (passed as static argument)
+    MAX_PNR_LOCAL = pnr_max
 
     from src.simulation.jax.herald import jax_get_full_amplitudes
 
@@ -280,7 +288,7 @@ def jax_get_heralded_state(params: Dict[str, jnp.ndarray], cutoff: int):
         1.0,
         jnp.max(pnr_effective).astype(jnp.float_),
         jnp.sum(pnr_effective).astype(jnp.float_),  # Total PNR sum
-        1.0 + n_ctrl_eff.astype(jnp.float_),  # 1 Signal + N_Ctrl active
+        1.0,  # Count as 1 leaf (not modes per leaf) - summed to get active leaf count
     )
 
 
@@ -306,11 +314,21 @@ def _score_batch_shard(
     else:
         config_dict = genotype_config
 
-    decoder = get_genotype_decoder(genotype_name, config=config_dict)
+    # Extract depth from config for tree structure (needed by decoder)
+    depth = 3
+    if config_dict is not None:
+        depth = int(config_dict.get("depth", 3))
+
+    decoder = get_genotype_decoder(genotype_name, depth=depth, config=config_dict)
 
     # Determine Simulation Cutoff
     use_correction = (correction_cutoff is not None) and (correction_cutoff > cutoff)
     sim_cutoff = correction_cutoff if use_correction else cutoff
+
+    # Extract pnr_max from config for herald function (static, known at trace time)
+    pnr_max = 3
+    if config_dict is not None:
+        pnr_max = int(config_dict.get("pnr_max", 3))
 
     def score_one(g):
         # Decode using simulation cutoff (scales applied here if any)
@@ -319,7 +337,7 @@ def _score_batch_shard(
 
         # 1. Get Leaf States (in sim_cutoff)
         leaf_vecs, leaf_probs, _, leaf_max_pnrs, leaf_total_pnrs, leaf_modes = jax.vmap(
-            partial(jax_get_heralded_state, cutoff=sim_cutoff)
+            partial(jax_get_heralded_state, cutoff=sim_cutoff, pnr_max=pnr_max)
         )(params["leaf_params"])
 
         # 2. Superblock (in sim_cutoff)
@@ -408,14 +426,15 @@ def _score_batch_shard(
         op_psi = operator @ state_eval
         raw_exp_val = jnp.real(jnp.vdot(state_eval, op_psi))
 
-        # Penalize zero-probability states
-        exp_val = jnp.where(joint_prob > 1e-12, raw_exp_val, 1000.0)
+        # Penalize very low probability states (hard cutoff at 10^-40)
+        # This allows exploration down to 10^-40 while preserving exp_val interpretation
+        exp_val = jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf)
 
         # Add Leakage Penalty
         exp_val += leakage_penalty
 
         # 5. Fitness & Descriptors
-        prob_clipped = jnp.maximum(joint_prob, 1e-30)
+        prob_clipped = jnp.maximum(joint_prob, 1e-45)
         log_prob = -jnp.log10(prob_clipped)
         total_photons = total_sum_pnr
 

@@ -779,144 +779,122 @@ def _recurrence_3d(shape, B, gamma, dtype):
 
 
 def _recurrence_4d(shape, B, gamma, dtype):
-    # Normalized recurrence
+    """
+    Optimized 4D recurrence using jnp.where instead of jax.lax.cond.
+    This eliminates control flow overhead and is much faster on GPU.
+    """
     N0, N1, N2, N3 = shape
     A = jnp.zeros(shape, dtype=dtype)
     A = A.at[0, 0, 0, 0].set(1.0)
+
+    # Precompute zero for branchless ops
+    zero = jnp.array(0.0, dtype=dtype)
 
     def body_n0(n0, h0):
         def body_n1(n1, h1):
             def body_n2(n2, h2):
                 def body_n3(n3, h):
+                    # Skip origin (already set)
                     is_start = (n0 == 0) & (n1 == 0) & (n2 == 0) & (n3 == 0)
 
-                    def compute(_):
-                        # Try i=0
-                        def use_0(_):
-                            sqrt_n0 = jnp.sqrt(n0)
-                            val = (gamma[0] * h[n0 - 1, n1, n2, n3]) / sqrt_n0
+                    # Precompute safe sqrt values (avoid division by zero)
+                    sqrt_n0 = jnp.sqrt(jnp.maximum(n0, 1.0))
+                    sqrt_n1 = jnp.sqrt(jnp.maximum(n1, 1.0))
+                    sqrt_n2 = jnp.sqrt(jnp.maximum(n2, 1.0))
+                    sqrt_n3 = jnp.sqrt(jnp.maximum(n3, 1.0))
 
-                            val += jax.lax.cond(
-                                n0 >= 2,
-                                lambda _: B[0, 0]
-                                * h[n0 - 2, n1, n2, n3]
-                                * jnp.sqrt((n0 - 1) / n0),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            val += jax.lax.cond(
-                                n1 >= 1,
-                                lambda _: B[0, 1]
-                                * h[n0 - 1, n1 - 1, n2, n3]
-                                * jnp.sqrt(n1 / n0),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            val += jax.lax.cond(
-                                n2 >= 1,
-                                lambda _: B[0, 2]
-                                * h[n0 - 1, n1, n2 - 1, n3]
-                                * jnp.sqrt(n2 / n0),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            val += jax.lax.cond(
-                                n3 >= 1,
-                                lambda _: B[0, 3]
-                                * h[n0 - 1, n1, n2, n3 - 1]
-                                * jnp.sqrt(n3 / n0),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            return val
-
-                        # Try i=1
-                        def use_1(_):
-                            sqrt_n1 = jnp.sqrt(n1)
-                            val = (gamma[1] * h[0, n1 - 1, n2, n3]) / sqrt_n1
-
-                            val += jax.lax.cond(
-                                n1 >= 2,
-                                lambda _: B[1, 1]
-                                * h[0, n1 - 2, n2, n3]
-                                * jnp.sqrt((n1 - 1) / n1),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            val += jax.lax.cond(
-                                n2 >= 1,
-                                lambda _: B[1, 2]
-                                * h[0, n1 - 1, n2 - 1, n3]
-                                * jnp.sqrt(n2 / n1),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            val += jax.lax.cond(
-                                n3 >= 1,
-                                lambda _: B[1, 3]
-                                * h[0, n1 - 1, n2, n3 - 1]
-                                * jnp.sqrt(n3 / n1),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            return val
-
-                        # Try i=2
-                        def use_2(_):
-                            sqrt_n2 = jnp.sqrt(n2)
-                            val = (gamma[2] * h[0, 0, n2 - 1, n3]) / sqrt_n2
-
-                            val += jax.lax.cond(
-                                n2 >= 2,
-                                lambda _: B[2, 2]
-                                * h[0, 0, n2 - 2, n3]
-                                * jnp.sqrt((n2 - 1) / n2),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            val += jax.lax.cond(
-                                n3 >= 1,
-                                lambda _: B[2, 3]
-                                * h[0, 0, n2 - 1, n3 - 1]
-                                * jnp.sqrt(n3 / n2),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            return val
-
-                        # Try i=3
-                        def use_3(_):
-                            sqrt_n3 = jnp.sqrt(n3)
-                            val = (gamma[3] * h[0, 0, 0, n3 - 1]) / sqrt_n3
-
-                            val += jax.lax.cond(
-                                n3 >= 2,
-                                lambda _: B[3, 3]
-                                * h[0, 0, 0, n3 - 2]
-                                * jnp.sqrt((n3 - 1) / n3),
-                                lambda _: jnp.array(0, dtype=dtype),
-                                None,
-                            )
-                            return val
-
-                        return jax.lax.cond(
-                            n0 > 0,
-                            use_0,
-                            lambda _: jax.lax.cond(
-                                n1 > 0,
-                                use_1,
-                                lambda _: jax.lax.cond(n2 > 0, use_2, use_3, None),
-                                None,
-                            ),
-                            None,
-                        )
-
-                    val = jax.lax.cond(
-                        is_start,
-                        lambda _: h[0, 0, 0, 0].astype(dtype),
-                        compute,
-                        None,
+                    # use_0: when n0 > 0
+                    val_0 = (gamma[0] * h[jnp.maximum(n0 - 1, 0), n1, n2, n3]) / sqrt_n0
+                    val_0 += jnp.where(
+                        n0 >= 2,
+                        B[0, 0]
+                        * h[jnp.maximum(n0 - 2, 0), n1, n2, n3]
+                        * jnp.sqrt(jnp.maximum(n0 - 1, 0.0) / jnp.maximum(n0, 1.0)),
+                        zero,
                     )
+                    val_0 += jnp.where(
+                        n1 >= 1,
+                        B[0, 1]
+                        * h[jnp.maximum(n0 - 1, 0), jnp.maximum(n1 - 1, 0), n2, n3]
+                        * jnp.sqrt(n1 / jnp.maximum(n0, 1.0)),
+                        zero,
+                    )
+                    val_0 += jnp.where(
+                        n2 >= 1,
+                        B[0, 2]
+                        * h[jnp.maximum(n0 - 1, 0), n1, jnp.maximum(n2 - 1, 0), n3]
+                        * jnp.sqrt(n2 / jnp.maximum(n0, 1.0)),
+                        zero,
+                    )
+                    val_0 += jnp.where(
+                        n3 >= 1,
+                        B[0, 3]
+                        * h[jnp.maximum(n0 - 1, 0), n1, n2, jnp.maximum(n3 - 1, 0)]
+                        * jnp.sqrt(n3 / jnp.maximum(n0, 1.0)),
+                        zero,
+                    )
+
+                    # use_1: when n0 == 0 and n1 > 0
+                    val_1 = (gamma[1] * h[0, jnp.maximum(n1 - 1, 0), n2, n3]) / sqrt_n1
+                    val_1 += jnp.where(
+                        n1 >= 2,
+                        B[1, 1]
+                        * h[0, jnp.maximum(n1 - 2, 0), n2, n3]
+                        * jnp.sqrt(jnp.maximum(n1 - 1, 0.0) / jnp.maximum(n1, 1.0)),
+                        zero,
+                    )
+                    val_1 += jnp.where(
+                        n2 >= 1,
+                        B[1, 2]
+                        * h[0, jnp.maximum(n1 - 1, 0), jnp.maximum(n2 - 1, 0), n3]
+                        * jnp.sqrt(n2 / jnp.maximum(n1, 1.0)),
+                        zero,
+                    )
+                    val_1 += jnp.where(
+                        n3 >= 1,
+                        B[1, 3]
+                        * h[0, jnp.maximum(n1 - 1, 0), n2, jnp.maximum(n3 - 1, 0)]
+                        * jnp.sqrt(n3 / jnp.maximum(n1, 1.0)),
+                        zero,
+                    )
+
+                    # use_2: when n0 == 0 and n1 == 0 and n2 > 0
+                    val_2 = (gamma[2] * h[0, 0, jnp.maximum(n2 - 1, 0), n3]) / sqrt_n2
+                    val_2 += jnp.where(
+                        n2 >= 2,
+                        B[2, 2]
+                        * h[0, 0, jnp.maximum(n2 - 2, 0), n3]
+                        * jnp.sqrt(jnp.maximum(n2 - 1, 0.0) / jnp.maximum(n2, 1.0)),
+                        zero,
+                    )
+                    val_2 += jnp.where(
+                        n3 >= 1,
+                        B[2, 3]
+                        * h[0, 0, jnp.maximum(n2 - 1, 0), jnp.maximum(n3 - 1, 0)]
+                        * jnp.sqrt(n3 / jnp.maximum(n2, 1.0)),
+                        zero,
+                    )
+
+                    # use_3: when n0 == 0 and n1 == 0 and n2 == 0 and n3 > 0
+                    val_3 = (gamma[3] * h[0, 0, 0, jnp.maximum(n3 - 1, 0)]) / sqrt_n3
+                    val_3 += jnp.where(
+                        n3 >= 2,
+                        B[3, 3]
+                        * h[0, 0, 0, jnp.maximum(n3 - 2, 0)]
+                        * jnp.sqrt(jnp.maximum(n3 - 1, 0.0) / jnp.maximum(n3, 1.0)),
+                        zero,
+                    )
+
+                    # Select based on which index is first > 0
+                    val = jnp.where(
+                        n0 > 0,
+                        val_0,
+                        jnp.where(n1 > 0, val_1, jnp.where(n2 > 0, val_2, val_3)),
+                    )
+
+                    # Handle origin
+                    val = jnp.where(is_start, h[0, 0, 0, 0], val)
+
                     return h.at[n0, n1, n2, n3].set(val)
 
                 return jax.lax.fori_loop(0, N3, body_n3, h2)

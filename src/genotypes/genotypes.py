@@ -177,6 +177,7 @@ class LegacyGenotype(BaseGenotype):
             "disp_s": disp_s,
             "disp_c": disp_c,
             "pnr": pnr,
+            "pnr_max": jnp.full((n_leaves,), self.pnr_max, dtype=jnp.int32),
         }
 
         # Final Gaussian: Identity (all zeros)
@@ -348,6 +349,7 @@ class DesignAGenotype(BaseGenotype):
             "disp_s": disp_s,
             "disp_c": disp_c,
             "pnr": pnr,
+            "pnr_max": jnp.full((n_leaves,), self.pnr_max, dtype=jnp.int32),
         }
 
         # 3. Mix Nodes
@@ -518,6 +520,7 @@ class DesignB1Genotype(BaseGenotype):
             "disp_s": jnp.broadcast_to(disp_s_val, (n_leaves, 1)),
             "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, N_C)),
             "pnr": jnp.broadcast_to(pnr_val, (n_leaves, N_C)),
+            "pnr_max": jnp.full((n_leaves,), self.pnr_max, dtype=jnp.int32),
         }
         leaf_active = jnp.ones(n_leaves, dtype=bool)
 
@@ -688,6 +691,7 @@ class DesignB3Genotype(BaseGenotype):
             "disp_s": jnp.broadcast_to(disp_s, (L, 1)),
             "disp_c": jnp.broadcast_to(disp_c, (L, N_C)),
             "pnr": leaf_pnr,  # (L, N_C)
+            "pnr_max": jnp.full((L,), self.pnr_max, dtype=jnp.int32),
         }
 
         # 4. Mix Nodes and Final
@@ -867,6 +871,7 @@ class DesignC1Genotype(BaseGenotype):
             "disp_s": jnp.broadcast_to(disp_s_val, (n_leaves, 1)),
             "disp_c": jnp.broadcast_to(disp_c_val, (n_leaves, N_C)),
             "pnr": jnp.broadcast_to(pnr_val, (n_leaves, N_C)),
+            "pnr_max": jnp.full((n_leaves,), self.pnr_max, dtype=jnp.int32),
         }
         leaf_active = jnp.ones(n_leaves, dtype=bool)
 
