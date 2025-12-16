@@ -1285,6 +1285,10 @@ def run(
         modes_val = int(genotype_config["modes"])
     config["modes"] = modes_val
 
+    # Merge genotype_config into main config for persistence
+    if genotype_config:
+        config.update(genotype_config)
+
     # Create Result object
     # Pass history_fronts if available (only in qdax mode)
     h_fronts = locals().get("history_fronts", None)

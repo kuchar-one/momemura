@@ -10,10 +10,24 @@ from run_mome import run
 
 @pytest.fixture
 def clean_output():
-    # Cleanup output dir before/after test
+    # Cleanup output dir before/after test by backing it up
     if os.path.exists("output"):
-        shutil.rmtree("output")
+        # Create a backup directory name with timestamp
+        import time
+
+        timestamp = int(time.time())
+        backup_dir = f"output_backup_{timestamp}"
+
+        # Rename current output to backup
+        print(f"Backing up 'output' to '{backup_dir}'")
+        shutil.move("output", backup_dir)
+
+    # Create fresh output directory
+    os.makedirs("output", exist_ok=True)
+
     yield
+
+    # Optional: cleanup the fresh output after test
     # if os.path.exists("output"):
     #     shutil.rmtree("output")
 

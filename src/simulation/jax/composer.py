@@ -486,7 +486,6 @@ def jax_superblock(
     leaf_total_pnr: jnp.ndarray,  # (8,) sum PNR for each leaf (NEW)
     leaf_modes: jnp.ndarray,  # (8,) mode count for each leaf (usually 1 or 2)
     mix_params: jnp.ndarray,  # (7, 3) theta, phi, varphi
-    mix_source: jnp.ndarray,  # (7,) int: 0=Mix, 1=PassLeft, 2=PassRight
     homodyne_x: float,
     homodyne_window: float,
     homodyne_resolution: float,
@@ -518,9 +517,13 @@ def jax_superblock(
         modesA,
         modesB,
         params,
-        source,
+        # source removed
     ):
-        # source: 0=Mix, 1=PassLeft, 2=PassRight
+        # Implicit Source Logic:
+        # Both Active -> Mix (0)
+        # Only A Active -> Pass Left (1)
+        # Only B Active -> Pass Right (2)
+        # Neither Active -> Pass Left (1) [Inactive]
 
         def do_mix(_):
             theta, phi, varphi = params
@@ -585,7 +588,25 @@ def jax_superblock(
         def do_right(_):
             return stateB, 1.0, probB, activeB, pnrB, sumPnrB, modesB
 
-        return jax.lax.switch(source, [do_mix, do_left, do_right], None)
+        # Determine effective source
+        # Default 0 (Mix)
+        effective_source = jnp.zeros((), dtype=jnp.int32)
+
+        # Override based on active flags
+        # If A active and B inactive -> 1
+        effective_source = jax.lax.select(
+            activeA & (~activeB), jnp.array(1, dtype=jnp.int32), effective_source
+        )
+        # If B active and A inactive -> 2
+        effective_source = jax.lax.select(
+            activeB & (~activeA), jnp.array(2, dtype=jnp.int32), effective_source
+        )
+        # If Neither active -> 1
+        effective_source = jax.lax.select(
+            (~activeA) & (~activeB), jnp.array(1, dtype=jnp.int32), effective_source
+        )
+
+        return jax.lax.switch(effective_source, [do_mix, do_left, do_right], None)
 
     # Tree Construction
     current_states = leaf_states
@@ -600,7 +621,6 @@ def jax_superblock(
     # Layer 0 (8 -> 4)
     n_pairs = 4
     params_0 = mix_params[mix_idx : mix_idx + n_pairs]
-    source_0 = mix_source[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
     sA = current_states[0::2]
@@ -625,13 +645,12 @@ def jax_superblock(
         current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_0, source_0
+        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_0
     )
 
     # Layer 1 (4 -> 2)
     n_pairs = 2
     params_1 = mix_params[mix_idx : mix_idx + n_pairs]
-    source_1 = mix_source[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
     sA = current_states[0::2]
@@ -656,13 +675,12 @@ def jax_superblock(
         current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_1, source_1
+        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_1
     )
 
     # Layer 2 (2 -> 1)
     n_pairs = 1
     params_2 = mix_params[mix_idx : mix_idx + n_pairs]
-    source_2 = mix_source[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
     sA = current_states[0::2]
@@ -687,7 +705,7 @@ def jax_superblock(
         current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_2, source_2
+        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_2
     )
 
     # Final result

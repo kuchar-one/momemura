@@ -113,10 +113,8 @@ class LegacyGenotype(BaseGenotype):
         mix_params_reshaped = mix_params_flat.reshape((n_mix, 4))
 
         mix_angles = jnp.tanh(mix_params_reshaped[:, :3]) * (jnp.pi / 2)
-        source_raw = mix_params_reshaped[:, 3]
+        # Source removed
         mix_source = jnp.zeros(n_mix, dtype=jnp.int32)
-        mix_source = jnp.where(source_raw < -0.33, 1, mix_source)
-        mix_source = jnp.where(source_raw > 0.33, 2, mix_source)
 
         # 3. Leaves (8)
         n_leaves = 8
@@ -209,9 +207,8 @@ class DesignAGenotype(BaseGenotype):
         # P_leaf_full = 16 (active included), PN = 4, G = 1, Final = 5
         # Note: P_leaf_full is 16 now (was 17)
         self.P_leaf_full = 16
-        self.PN = 4
-        self.P_leaf_full = 16  # This will be dynamically calculated by get_length
-        self.PN = 4
+        self.P_leaf_full = 16
+        self.PN = 3  # 4->3
         self.G = 1
         self.F = 5
 
@@ -359,10 +356,8 @@ class DesignAGenotype(BaseGenotype):
         mix_reshaped = mix_params_flat.reshape((n_mix, self.PN))
 
         mix_angles = jnp.tanh(mix_reshaped[:, :3]) * (jnp.pi / 2)
-        src_raw = mix_reshaped[:, 3]
+        # Source removed
         mix_source = jnp.zeros(n_mix, dtype=jnp.int32)
-        mix_source = jnp.where(src_raw < -0.33, 1, mix_source)
-        mix_source = jnp.where(src_raw > 0.33, 2, mix_source)
 
         # 4. Final Gaussian (5)
         final_raw = g[idx : idx + self.F]
@@ -403,9 +398,9 @@ class DesignB1Genotype(BaseGenotype):
         super().__init__(depth, config)
         self.leaves = 2**depth
         self.nodes = self.leaves - 1
-        # BP = 15, PN = 4, G = 1, F = 5
+        # BP = 15, PN = 3, G = 1, F = 5
         self.BP = 15
-        self.PN = 4
+        self.PN = 3
         self.G = 1
         self.F = 5
 
@@ -530,11 +525,8 @@ class DesignB1Genotype(BaseGenotype):
         idx += n_mix * self.PN
         mix_reshaped = mix_params_flat.reshape((n_mix, self.PN))
         mix_angles = jnp.tanh(mix_reshaped[:, :3]) * (jnp.pi / 2)
-
-        src_raw = mix_reshaped[:, 3]
+        # Source removed
         mix_source = jnp.zeros(n_mix, dtype=jnp.int32)
-        mix_source = jnp.where(src_raw < -0.33, 1, mix_source)
-        mix_source = jnp.where(src_raw > 0.33, 2, mix_source)
 
         # Final Gaussian
         final_raw = g[idx : idx + self.F]
@@ -594,8 +586,8 @@ class DesignB3Genotype(BaseGenotype):
 
     def get_length(self, depth: int = 3) -> int:
         L = 2**depth
-        # Total = Hom(1) + Shared + L*Unique + Mix(4*(L-1)) + Final(5)
-        return 1 + self.Sharedv + L * self.Unique + 4 * (L - 1) + 5
+        # Total = Hom(1) + Shared + L*Unique + Mix(3*(L-1)) + Final(5)
+        return 1 + self.Sharedv + L * self.Unique + 3 * (L - 1) + 5
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
         idx = 0
@@ -695,16 +687,15 @@ class DesignB3Genotype(BaseGenotype):
         }
 
         # 4. Mix Nodes and Final
-        mix_len = 4 * (self.nodes)
+        # Mix params reduced from 4 to 3
+        mix_len = 3 * (self.nodes)
         if mix_len > 0:
             mix_raw = g[idx : idx + mix_len]
             idx += mix_len
-            mix_reshaped = mix_raw.reshape((self.nodes, 4))
-            mix_angles = jnp.tanh(mix_reshaped[:, :3]) * (jnp.pi / 2)
-            src_raw = mix_reshaped[:, 3]
+            mix_reshaped = mix_raw.reshape((self.nodes, 3))
+            mix_angles = jnp.tanh(mix_reshaped) * (jnp.pi / 2)
+            # Source removed
             mix_source = jnp.zeros(self.nodes, dtype=jnp.int32)
-            mix_source = jnp.where(src_raw < -0.33, 1, mix_source)
-            mix_source = jnp.where(src_raw > 0.33, 2, mix_source)
         else:
             mix_angles = jnp.zeros((0, 3))
             mix_source = jnp.zeros((0,), dtype=jnp.int32)
@@ -774,7 +765,7 @@ class DesignC1Genotype(BaseGenotype):
         self.leaves = 2**depth
         self.nodes = self.leaves - 1
         self.BP = 15
-        self.PN = 4
+        self.PN = 3
         self.G = 1
         self.F = 5
 
@@ -881,10 +872,8 @@ class DesignC1Genotype(BaseGenotype):
         mix_params_reshaped = mix_params_slice.reshape((1, self.PN))
         mix_angles_one = jnp.tanh(mix_params_reshaped[:, :3]) * (jnp.pi / 2)
 
-        src_raw = mix_params_reshaped[:, 3]
+        # Source removed
         mix_src_one = jnp.zeros(1, dtype=jnp.int32)
-        mix_src_one = jnp.where(src_raw < -0.33, 1, mix_src_one)
-        mix_src_one = jnp.where(src_raw > 0.33, 2, mix_src_one)
 
         # Broadcast Mix
         n_mix = self.nodes
@@ -908,6 +897,7 @@ class DesignC1Genotype(BaseGenotype):
             "disp": disp_final,
         }
 
+        print(f"DEBUG DesignA Active: {leaf_active}")
         return {
             "homodyne_x": homodyne_x,
             "homodyne_window": homodyne_window,

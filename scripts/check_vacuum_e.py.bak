@@ -1,0 +1,47 @@
+import os
+import sys
+import jax.numpy as jnp
+from thewalrus.quantum import state_vector, density_matrix
+import numpy as np
+from scipy.linalg import expm
+
+# Add src to path
+sys.path.append(os.getcwd())
+
+# Import operator construction from correct source
+# It's likely in run_mome.py or a dedicated module.
+# I'll check run_mome.py imports.
+# Ideally I'd re-use construct_gkp_operator
+
+
+# Mock GKP Operator construction (similar to run_mome.py)
+def get_gkp_op(cutoff):
+    # From run_mome.py logic (usually imports from src.simulation.gkp_operator?)
+    # Or constructs it inline.
+    # Previous logs showed run_mome.py imports construct_gkp_operator from src.simulation.gkp
+    pass
+
+
+from src.simulation.gkp import construct_gkp_operator
+
+
+def main():
+    cutoff = 50
+    op = construct_gkp_operator(cutoff, "square", 1.0)
+    # Check what run_mome.py does... it usually passes target_alpha?
+    # run_mome defaults: target_alpha=1.0 (Square?), target_beta=0.0
+
+    # Vacuum state
+    vac = np.zeros(cutoff, dtype=np.complex128)
+    vac[0] = 1.0
+
+    # Calculate Expectation
+    exp_val = np.real(vac.conj().T @ op @ vac)
+    print(f"Vacuum Expectation (Cutoff {cutoff}): {exp_val}")
+
+    # Check if 1.0 makes sense.
+    # If op is ~ Number operator?
+    # construct_gkp_operator?
+
+
+main()

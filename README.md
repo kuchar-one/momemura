@@ -26,18 +26,6 @@ momemura is a high-performance framework for optimizing GKP (Gottesman-Kitaev-Pr
 ## Usage
 
 ### Running Optimization
-
-The main entry point is `run_mome.py`.
-
-**Basic Run (QDax + JAX):**
-```bash
-python run_mome.py --mode qdax --backend jax --pop 100 --iters 500 --cutoff 10
-```
-
-**Low-Memory Mode (for limited VRAM):**
-```bash
-python run_mome.py --mode qdax --backend jax --pop 50 --iters 200 --cutoff 10 --low-mem
-```
 *Note: Both modes use `float32` precision by default.*
 
 **Arguments:**

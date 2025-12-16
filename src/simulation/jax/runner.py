@@ -369,7 +369,6 @@ def _score_batch_shard(
             leaf_total_pnrs,
             leaf_modes,
             params["mix_params"],
-            params["mix_source"],
             hom_x,
             hom_win,
             0.0,
@@ -415,7 +414,7 @@ def _score_batch_shard(
             # If leakage > 0.05 (5%), apply heavy penalty?
             # Or continuous penalty?
             # Continuous: penalty = leakage * 100.0
-            leakage_penalty = leakage * 1.0
+            leakage_penalty = leakage * 2.0
 
         else:
             state_eval = final_state_transformed

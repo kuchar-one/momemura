@@ -209,8 +209,13 @@ class GaussianHeraldCircuit:
         if self.backend == "jax" and not JAX_AVAILABLE:
             raise ImportError("JAX backend requested but JAX is not available.")
 
+        # Final Gaussian operations (S(r, phi) then D(alpha)) applied to Signal mode
+        self.final_squeezing_params = None  # (r, phi)
+        self.final_displacement = None  # complex
+
         self.mu = None
         self.cov = None
+
         self._built = False
 
         # add small caches
@@ -397,6 +402,66 @@ class GaussianHeraldCircuit:
             )
         mu = mu + displ_qp
 
+        # Apply final Gaussian operations if configured (usually on signal mode 0)
+        # S(r, phi) then D(alpha)
+        if self.final_squeezing_params is not None:
+            r_fin, phi_fin = self.final_squeezing_params
+            # For now, apply to ALL signal modes or just the first one?
+            # Typically canonical form has 1 signal mode.
+            # If multiple, apply to index 0?
+            # Let's assume index 0 for now as canonical n_signal=1.
+            # Or loop if we wanted to support more.
+            target_mode = 0
+            if target_mode < n_sig:
+                # from src.utils.params import single_mode_squeezer_symplectic
+                # Need to import or implement single mode squeezer
+                # Assuming simple one: S = [[cosh r + sinh r cos phi, sinh r sin phi], [sinh r sin phi, cosh r - sinh r cos phi]]?
+                # Actually usually [[exp(-r), 0], [0, exp(r)]] if phi=0/pi?
+                # We should use existing helpers if possible.
+                # There is `sq_r` and `sq_phi` usually.
+                # Let's use `expand_mode_symplectic` with a manual single mode S.
+
+                ch = np.cosh(r_fin)
+                sh = np.sinh(r_fin)
+                cos_p = np.cos(phi_fin)
+                sin_p = np.sin(phi_fin)
+
+                # x, p basis
+                # S_1mode = [[cosh r - sinh r cos phi, -sinh r sin phi], [-sinh r sin phi, cosh r + sinh r cos phi]]
+                # Wait, conventions vary.
+                # Using standard: x -> x exp(-r), p -> p exp(r) for r>0, phi=0 (squeezed x)
+                # Let's trust local helpers or construct manually.
+
+                # Consistent with `two_mode_squeezer_symplectic` style but for single mode.
+                # [[cosh r + sinh r cos phi, sinh r sin phi], [sinh r sin phi, cosh r - sinh r cos phi]]?
+                # Actually let's just define it inline for stability.
+
+                # Check TheWalrus convention or consistency with `two_mode_squeezer_symplectic` (which uses r).
+                # Let's assumes same phase convention.
+
+                # Construct single mode symplectic
+                sms = np.zeros((2, 2))
+                sms[0, 0] = ch - sh * cos_p
+                sms[0, 1] = -sh * sin_p
+                sms[1, 0] = -sh * sin_p
+                sms[1, 1] = ch + sh * cos_p
+
+                S_fin = expand_mode_symplectic(
+                    sms, np.array([target_mode], dtype=np.int64), N
+                )
+                S_total = S_fin @ S_total
+                mu = S_fin @ mu
+
+        if self.final_displacement is not None:
+            # Apply D(alpha) on signal mode 0
+            target_mode = 0
+            if target_mode < n_sig:
+                d_qp = np.zeros(2 * N)
+                d_qp[2 * target_mode : 2 * target_mode + 2] += complex_alpha_to_qp(
+                    [self.final_displacement]
+                )
+                mu = mu + d_qp
+
         cov = S_total @ cov_vac @ S_total.T
 
         self.mu = mu
@@ -551,12 +616,23 @@ class GaussianHeraldCircuit:
         lines.append(f"  U_c provided? {'yes' if self.U_c is not None else 'no'}")
         print("\n".join(lines))
 
-    def plot_circuit(self):
-        """Draw a quick matplotlib wire+blocks sketch of the circuit."""
+    def plot_circuit(self, ax=None):
+        """
+        Draw a quick matplotlib wire+blocks sketch of the circuit.
+        If ax is provided, draws on it. Otherwise creates new figure.
+        Returns (fig, ax).
+        """
         n_sig = self.n_signal
         k = self.n_control
         total = n_sig + k
-        fig, ax = plt.subplots(figsize=(6, 0.5 * total + 1))
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 0.5 * total + 1))
+            show_plot = True
+        else:
+            fig = ax.figure
+            show_plot = False
+
         ax.set_xlim(0, 10)
         ax.set_ylim(-1, total)
         ax.axis("off")
@@ -590,4 +666,8 @@ class GaussianHeraldCircuit:
         ax.text(6.8, total - n_sig / 2 - 0.4, "U_s", ha="center", va="center")
         ax.add_patch(plt.Rectangle((5.5, -0.4), 2.5, k, fill=False, linewidth=1.5))
         ax.text(6.8, k / 2 - 0.4, "U_c", ha="center", va="center")
-        plt.show()
+
+        if show_plot:
+            plt.show()
+
+        return fig, ax

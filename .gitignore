@@ -10,3 +10,4 @@ profiles/
 *.log
 *.png
 .DS_Store
+output_backup_*

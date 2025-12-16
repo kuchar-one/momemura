@@ -1,0 +1,403 @@
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+import pandas as pd
+
+
+def plot_global_pareto(df: pd.DataFrame) -> go.Figure:
+    """
+    Plots the global Pareto front: Expectation (y) vs Probability (x).
+    Color varies by Complexity.
+    Expectation is minimized. LogProb is -log10(P), minimized.
+    So x-axis = LogProb, y-axis = Expectation.
+    """
+    if df.empty:
+        return go.Figure()
+
+    fig = px.scatter(
+        df,
+        x="LogProb",
+        y="Expectation",
+        color="Complexity",
+        hover_data=[
+            "Desc_TotalPhotons",
+            "Desc_MaxPNR",
+            "Desc_Complexity",
+            "genotype_idx",
+            "Expectation",
+            "LogProb",
+        ],
+        title="Global Pareto Front: Expectation vs Probability",
+        labels={
+            "LogProb": "Negative Log10 Probability (Minimize)",
+            "Expectation": "Expectation Value (Minimize)",
+            "Complexity": "Complexity",
+        },
+        color_continuous_scale="Viridis",
+    )
+    fig.update_layout(clickmode="event+select")
+    return fig
+
+
+def plot_best_expectation_heatmap(df: pd.DataFrame) -> go.Figure:
+    """
+    Heatmap of Best Expectation Value per (Total Photons, Complexity) cell.
+    """
+    if df.empty:
+        return go.Figure()
+
+    # Aggregate best (minimum) Expectation for each cell
+    # Cell is defined by (Desc_Complexity, Desc_TotalPhotons)
+    # Convert descriptors to int for binning
+
+    # We want a dense grid.
+    max_complex = int(df["Desc_Complexity"].max()) if not df.empty else 10
+    max_photons = int(df["Desc_TotalPhotons"].max()) if not df.empty else 25
+
+    # Create grid
+    grid_data = (
+        df.groupby(["Desc_Complexity", "Desc_TotalPhotons"])["Expectation"]
+        .min()
+        .reset_index()
+    )
+
+    # Pivot for heatmap
+    pivot_table = grid_data.pivot(
+        index="Desc_Complexity", columns="Desc_TotalPhotons", values="Expectation"
+    )
+
+    # Fill missing with None (for transparent) or NaN
+    # Reindex to ensure full grid range
+    all_complex = np.arange(max_complex + 1)
+    all_photons = np.arange(max_photons + 1)
+
+    pivot_table = pivot_table.reindex(index=all_complex, columns=all_photons)
+
+    fig = px.imshow(
+        pivot_table,
+        labels=dict(x="Total Photons", y="Complexity", color="Expectation"),
+        x=all_photons,
+        y=all_complex,
+        color_continuous_scale="Viridis_r",  # Reversed so lower (better) is brighter/yellow
+        title="Best Expectation Value per Cell",
+    )
+    fig.update_xaxes(side="bottom")
+    fig.update_layout(clickmode="event+select")
+
+    return fig
+
+
+def plot_wigner_function(
+    wigner_grid: np.ndarray,
+    xvec: np.ndarray,
+    pvec: np.ndarray,
+    title: str = "Wigner Function",
+) -> go.Figure:
+    """
+    Plots the Wigner function contour using Plotly.
+    """
+    fig = go.Figure(
+        data=go.Contour(
+            z=wigner_grid,
+            x=xvec,
+            y=pvec,
+            colorscale="RdBu",
+            zmid=0.0,
+            contours=dict(
+                coloring="heatmap",
+                showlabels=True,  # show labels on contours
+                labelfont=dict(size=12, color="white"),
+            ),
+            colorbar=dict(title="W(x, p)"),
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="x",
+        yaxis_title="p",
+        autosize=True,
+    )
+    return fig
+
+
+def plot_tree_circuit(params: dict, genotype_name: str = "A") -> go.Figure:
+    """
+    Visualizes the binary tree preparation circuit for Genotype A.
+    Colors active paths and annotates nodes with parameters.
+    Implements implicit mixing logic:
+    - Active + Active -> Mix
+    - Active + Inactive -> Pass Active
+    - Inactive + Inactive -> Inactive
+    """
+    import networkx as nx
+    from frontend import utils
+
+    # Tree Layout Constants
+    leaves = 8
+
+    # Graphs
+    G = nx.DiGraph()
+    pos = {}
+
+    # Layers: 0 (Leaves) -> 1 (4 Mixers) -> 2 (2 Mixers) -> 3 (Root)
+
+    # Add Nodes
+    # Layer 0: Leaves 0..7
+    for i in range(leaves):
+        node_id = f"L{i}"
+        G.add_node(node_id, layer=0, label=f"Leaf {i}")
+        pos[node_id] = (i, 0)
+
+    # Layer 1: Mixers 0..3
+    for i in range(4):
+        node_id = f"M1_{i}"
+        G.add_node(node_id, layer=1, label=f"Mix {i}")
+        pos[node_id] = (2 * i + 0.5, 1)
+
+    # Layer 2: Mixers 0..1
+    for i in range(2):
+        node_id = f"M2_{i}"
+        G.add_node(node_id, layer=2, label=f"Mix {i}")
+        pos[node_id] = (4 * i + 1.5, 2)
+
+    # Layer 3: Root
+    node_id = "Root"
+    G.add_node(node_id, layer=3, label="Output")
+    pos[node_id] = (3.5, 3)
+
+    # Parameters
+    mix_params = params.get("mix_params", np.zeros((7, 3)))
+    # mix_source removed/ignored
+    leaf_active = params.get("leaf_active", np.zeros(8, dtype=bool))
+    leaf_p = params.get("leaf_params", {})
+
+    # --- Step 1: Determine Activity of Leaves (Bottom-Up) ---
+    # A leaf is 'Active' if it is NON-TRIVIAL.
+    # We use a helper to check triviality (Vac noise)
+
+    node_active_status = {}  # Map node_id -> bool (Is physically active?)
+
+    def get_leaf_val(idx, key, default):
+        arr = leaf_p.get(key, default)
+        if hasattr(arr, "tolist"):
+            arr = arr.tolist()
+        if isinstance(arr, list) and len(arr) > idx:
+            return utils.to_scalar(arr[idx])
+        return default
+
+    def is_leaf_active(idx):
+        # 1. Genome Active Flag
+        flag = leaf_active[idx] if idx < len(leaf_active) else False
+        if not flag:
+            return False  # Explicitly turned off
+
+        # 2. Check content (Vacuum detection)
+        r_val = get_leaf_val(idx, "tmss_r", 0.0)
+
+        # Simplified: If r active is True but state is vacuum, treat as Inactive for mixing?
+        # Yes, "Vacuum Exclusion" logic implies ignoring vacuum.
+        if abs(r_val) < 0.01:
+            return False
+
+        return True
+
+    # 1. Leaves
+    for i in range(leaves):
+        node_active_status[f"L{i}"] = is_leaf_active(i)
+
+    # 2. Mixers (Bottom-Up)
+    # Generic Helper
+    def calc_mixer_activity(mid, inp1, inp2):
+        act1 = node_active_status[inp1]
+        act2 = node_active_status[inp2]
+        # Active if EITHER is active
+        return act1 or act2
+
+    # Layer 1
+    for i in range(4):
+        node_active_status[f"M1_{i}"] = calc_mixer_activity(
+            f"M1_{i}", f"L{2 * i}", f"L{2 * i + 1}"
+        )
+
+    # Layer 2
+    for i in range(2):
+        node_active_status[f"M2_{i}"] = calc_mixer_activity(
+            f"M2_{i}", f"M1_{2 * i}", f"M1_{2 * i + 1}"
+        )
+
+    # Layer 3 (Root)
+    node_active_status["Root"] = calc_mixer_activity("Root", "M2_0", "M2_1")
+
+    # --- Step 2: Trace Active Edges (Top-Down) ---
+    # Which edges are CARRYING signal?
+    # Start at Root. If Root is Active, check inputs.
+
+    edge_status = {}  # (u, v) -> bool (Is Edge Active?)
+
+    def trace_down(node_id, inp1, inp2):
+        if not node_active_status[node_id]:
+            # I am inactive. My inputs didn't contribute active signal (or were blocked).
+            edge_status[(inp1, node_id)] = False
+            edge_status[(inp2, node_id)] = False
+            return
+
+        # I am Active. Who contributed?
+        act1 = node_active_status[inp1]
+        act2 = node_active_status[inp2]
+
+        if act1 and act2:
+            # Both Active -> MIX -> Both Edges Active
+            edge_status[(inp1, node_id)] = True
+            edge_status[(inp2, node_id)] = True
+        elif act1 and not act2:
+            # Only 1 Active -> PASS 1 -> Edge 1 Active, Edge 2 Inactive
+            edge_status[(inp1, node_id)] = True
+            edge_status[(inp2, node_id)] = False
+        elif not act1 and act2:
+            # Only 2 Active -> PASS 2 -> Edge 1 Inactive, Edge 2 Active
+            edge_status[(inp1, node_id)] = False
+            edge_status[(inp2, node_id)] = True
+        else:
+            # Neither Active (Impossible if I am active?)
+            # Valid if I passed vacuum? But effectively Inactive.
+            edge_status[(inp1, node_id)] = False
+            edge_status[(inp2, node_id)] = False
+
+    # Trace
+    trace_down("Root", "M2_0", "M2_1")
+    trace_down("M2_0", "M1_0", "M1_1")
+    trace_down("M2_1", "M1_2", "M1_3")
+    for i in range(4):
+        trace_down(f"M1_{i}", f"L{2 * i}", f"L{2 * i + 1}")
+
+    # Also build Graph Edges for plotting
+    for i in range(4):
+        G.add_edge(f"L{2 * i}", f"M1_{i}")
+        G.add_edge(f"L{2 * i + 1}", f"M1_{i}")
+    for i in range(2):
+        G.add_edge(f"M1_{2 * i}", f"M2_{i}")
+        G.add_edge(f"M1_{2 * i + 1}", f"M2_{i}")
+    G.add_edge("M2_0", "Root")
+    G.add_edge("M2_1", "Root")
+
+    # --- Step 3: Plot ---
+
+    COLOR_ACTIVE = "#2ca02c"
+    COLOR_INACTIVE = "#d62728"
+    EDGE_ACTIVE = "#2ca02c"
+    EDGE_INACTIVE = "#ffcccc"  # Light Red
+
+    x_active, y_active = [], []
+    x_inactive, y_inactive = [], []
+
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+
+        isActive = edge_status.get((u, v), False)
+
+        if isActive:
+            x_active.extend([x0, x1, None])
+            y_active.extend([y0, y1, None])
+        else:
+            x_inactive.extend([x0, x1, None])
+            y_inactive.extend([y0, y1, None])
+
+    traces = []
+    traces.append(
+        go.Scatter(
+            x=x_inactive,
+            y=y_inactive,
+            mode="lines",
+            line=dict(color=EDGE_INACTIVE, width=1),
+            hoverinfo="none",
+        )
+    )
+    traces.append(
+        go.Scatter(
+            x=x_active,
+            y=y_active,
+            mode="lines",
+            line=dict(color=EDGE_ACTIVE, width=4),
+            hoverinfo="none",
+        )
+    )
+
+    # Nodes
+    node_x, node_y, node_text, node_hover, node_color, node_line = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+
+        isActive = node_active_status.get(node, False)
+
+        # Details
+        label = node
+        hover = ""
+
+        if node.startswith("L"):
+            idx = int(node[1:])
+            r_val = get_leaf_val(idx, "tmss_r", 0.0)
+            n_val = int(get_leaf_val(idx, "n_ctrl", 1))
+            label = f"<b>L{idx}</b><br>r={r_val:.2f}"
+            hover = f"Leaf {idx}<br>Active: {isActive}<br>r={r_val:.2f}<br>n={n_val}"
+        elif node.startswith("M") or node == "Root":
+            # Need parameter index
+            midx = (
+                6
+                if node == "Root"
+                else (
+                    4 + int(node.split("_")[1])
+                    if node.startswith("M2")
+                    else int(node.split("_")[1])
+                )
+            )
+            # Param
+            if midx < len(mix_params):
+                theta = utils.to_scalar(mix_params[midx][0])
+                phi = utils.to_scalar(mix_params[midx][1])
+                label = f"<b>{node.split('_')[0]}</b><br>θ={theta:.2f}"
+                hover = f"{node}<br>Active: {isActive}<br>Theta={theta:.2f}<br>Phi={phi:.2f}"
+
+        node_text.append(label)
+        node_hover.append(hover)
+        node_color.append(COLOR_ACTIVE if isActive else COLOR_INACTIVE)
+        node_line.append("black")
+
+    traces.append(
+        go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode="markers+text",
+            marker=dict(size=35, color=node_color, line=dict(width=2, color="black")),
+            text=node_text,
+            textfont=dict(
+                size=10,
+                color="white"
+                if any(c == COLOR_ACTIVE for c in node_color)
+                else "black",
+            ),
+            hovertext=node_hover,
+            hoverinfo="text",
+        )
+    )
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=f"Preparation Circuit Tree (Genotype {genotype_name})",
+        showlegend=False,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        plot_bgcolor="white",
+    )
+    return fig

@@ -21,12 +21,12 @@ We support multiple genotype designs offering different trade-offs between expre
 | Design | Name | Description | Length (Depth 3) |
 | :--- | :--- | :--- | :--- |
 | **Legacy** | Original | Per-leaf unique parameters (Original logic mapped to canonical). | 256 |
-| **A** | Original (Canonical) | Per-leaf unique. 1 TMSS/leaf + Final Gauss. | 162 |
-| **B1** | Tied-Leaf (No Active) | Single shared block. 1 TMSS/block + Final Gauss. | 49 |
-| **B2** | Tied-Leaf (Active) | Same as B1 but with per-leaf active flags. | 57 |
-| **B3** | Semi-Tied (Per-Leaf PNR) | Shared continuous parameters, UNIQUE integer parameters (PNR, NCtrl) per leaf. | 37 (N=3) |
-| **C1** | Tied-All (No Active) | Constant structure. | 25 |
-| **C2** | Tied-All (Active) | Same as C1 but with per-leaf active flags. | 33 |
+| **A** | Original (Canonical) | Per-leaf unique. 1 TMSS/leaf + Final Gauss. | 155 |
+| **B1** | Tied-Leaf (No Active) | Single shared block. 1 TMSS/block + Final Gauss. | 42 |
+| **B2** | Tied-Leaf (Active) | Same as B1 but with per-leaf active flags. | 50 |
+| **B3** | Semi-Tied (Per-Leaf PNR) | Shared continuous parameters, UNIQUE integer parameters (PNR, NCtrl) per leaf. | 71 (N=3) |
+| **C1** | Tied-All (No Active) | Constant structure. | 24 |
+| **C2** | Tied-All (Active) | Same as C1 but with per-leaf active flags. | 32 |
 
 ### 1. Global Parameters (All Designs)
 
@@ -39,18 +39,18 @@ This design allows every leaf block and every mix node to have unique parameters
 
 **Formula**: $Length = G + L \cdot P_{leaf} + (L-1) \cdot P_{node} + F$
 where:
-- $P_{node} = 4$ (Mix params)
+- $P_{node} = 3$ (Mix params)
 - $F = 5$ (Final Gaussian)
 - $P_{leaf} = 1 (Active) + 1 (N_{Ctrl}) + 1 (TMSS) + 1 (US) + [N_C^2 + 3N_C + 2] (UC, Disp, PNR)$
   $= N_C^2 + 3N_C + 6$
 
 **For N=3 (N_C=2)**: $P_{leaf} = 4 + 6 + 6 = 16$.
-Total (Depth 3): $1 + 8 \times 16 + 7 \times 4 + 5 = 162$.
+Total (Depth 3): $1 + 8 \times 16 + 7 \times 3 + 5 = 155$.
 
 **Structure**:
 - **Global**: `homodyne_x`.
 - **Leaves (L blocks)**: Each block has $P_{leaf}$ params.
-- **Mix Nodes (L-1 nodes)**: Each node has 4 unique params.
+- **Mix Nodes (L-1 nodes)**: Each node has 3 unique params.
 - **Final Gaussian**: 5 params (R, Phi, Varphi, Disp_Re, Disp_Im).
 
 ---
@@ -64,10 +64,10 @@ where $BP = P_{leaf} - 1$ (No per-block active flag).
 $BP = N_C^2 + 3N_C + 5$.
 
 **For N=3**: $BP = 15$.
-Total (Depth 3): $1 + 15 + 7 \times 4 + 5 = 49$.
+Total (Depth 3): $1 + 15 + 7 \times 3 + 5 = 42$.
 
 **Formula (B2)**: Adds $L$ active flags. $Length = B1 + L$.
-For Depth 3: $49 + 8 = 57$.
+For Depth 3: $42 + 8 = 50$.
 
 **Structure**:
 - **Global**: `homodyne_x`.
@@ -92,12 +92,12 @@ Where:
 **For N=3 Modes (N_C=2)**:
 - $Shared = 12$ ($1 + 1 + 4 + 6$).
 - $Unique = 4$ ($1 + 1 + 2$).
-- Total (Depth 3, 8 leaves): $1 + 12 + 32 + 28 + 5 = 78$.
+- Total (Depth 3, 8 leaves): $1 + 12 + 32 + 21 + 5 = 71$.
 
 **For N=2 Modes (N_C=1)**:
 - $Shared = 7$.
 - $Unique = 3$.
-- Total (Depth 2, 4 leaves): $1 + 7 + 12 + 12 + 5 = 37$.
+- Total (Depth 2, 4 leaves): $1 + 7 + 12 + 9 + 5 = 34$.
 
 ---
 
@@ -106,17 +106,17 @@ Where:
 This design forces maximum symmetry. All blocks are identical, and all mix nodes are identical.
 
 **Formula (C1)**: $Length = G + BP + P_{node} + F$
-Constant Length: $1 + BP + 4 + 5 = BP + 10$.
+Constant Length: $1 + BP + 3 + 5 = BP + 9$.
 
-**For N=3**: $15 + 10 = 25$.
+**For N=3**: $15 + 9 = 24$.
 
 **Formula (C2)**: Adds $L$ active flags. $Length = C1 + L$.
-For Depth 3: $25 + 8 = 33$.
+For Depth 3: $24 + 8 = 32$.
 
 **Structure**:
 - **Global**: `homodyne_x`.
 - **Shared Block**: $BP$ params.
-- **Shared Mix Node**: 4 params applied to ALL mix nodes.
+- **Shared Mix Node**: 3 params applied to ALL mix nodes.
 - **Active Flags** (C2 only): $L$ booleans.
 
 ---
@@ -159,14 +159,13 @@ Shared across all leaves. **No Active flag** (handled separately or implicitly T
 | 9-12 | `disp_c` | $\tanh \times D\_SCALE$ | Control Disp |
 | 13-14 | `pnr` | Integers | {0..`MAX_PNR`} |
 
-### Mix Node Parameters (PN = 4)
+### Mix Node Parameters (PN = 3)
 
 | Index | Name | Map | Description |
 | :--- | :--- | :--- | :--- |
 | 0 | `theta` | $\tanh \times \pi/2$ | Mixing Angle |
 | 1 | `phi` | $\tanh \times \pi/2$ | Mixing Phase |
 | 2 | `varphi` | $\tanh \times \pi/2$ | Output Phase |
-| 3 | `source` | Thresholds $\pm 0.33$ | {0=Mix, 1=Left, 2=Right} |
 
 ---
 
