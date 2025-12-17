@@ -294,7 +294,13 @@ def jax_get_heralded_state(
 
 @partial(
     jax.jit,
-    static_argnames=("cutoff", "genotype_name", "genotype_config", "correction_cutoff"),
+    static_argnames=(
+        "cutoff",
+        "genotype_name",
+        "genotype_config",
+        "correction_cutoff",
+        "pnr_max",
+    ),
 )
 def _score_batch_shard(
     genotypes: jnp.ndarray,
@@ -303,6 +309,7 @@ def _score_batch_shard(
     genotype_name: str,
     genotype_config: Any = None,  # Can be dict or tuple(items)
     correction_cutoff: int = None,
+    pnr_max: int = 3,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     JIT-compiled scoring function for a single batch shard.
@@ -325,10 +332,11 @@ def _score_batch_shard(
     use_correction = (correction_cutoff is not None) and (correction_cutoff > cutoff)
     sim_cutoff = correction_cutoff if use_correction else cutoff
 
-    # Extract pnr_max from config for herald function (static, known at trace time)
-    pnr_max = 3
-    if config_dict is not None:
-        pnr_max = int(config_dict.get("pnr_max", 3))
+    # pnr_max is now passed as argument (static)
+    # This overrides config, or rather assumes config was used to set the arg.
+    # Re-extracting from config is redundant but harmless unless they conflict.
+    # We use the explicit argument.
+    pass
 
     def score_one(g):
         # Decode using simulation cutoff (scales applied here if any)
@@ -371,14 +379,14 @@ def _score_batch_shard(
             params["mix_params"],
             hom_x,
             hom_win,
-            0.0,
+            hom_win,  # homodyne_resolution = window size
             phi_vec,
             V_matrix,
             dx_weights,
             sim_cutoff,
-            True,
+            True,  # homodyne_window_is_none=True (Point Mode)
             False,
-            True,
+            False,  # homodyne_resolution_is_none=False (Apply Scaling)
         )
 
         # 3. Apply Final Global Gaussian (in sim_cutoff)
@@ -453,9 +461,10 @@ def jax_scoring_fn_batch(
     genotypes: jnp.ndarray,
     cutoff: int,
     operator: jnp.ndarray,
-    genotype_name: str = "legacy",
+    genotype_name: str = "A",
     genotype_config: Dict = None,
     correction_cutoff: int = None,
+    pnr_max: int = 3,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Batched scoring function for QDax.
@@ -492,6 +501,7 @@ def jax_scoring_fn_batch(
             genotype_name,
             config_hashable,
             correction_cutoff,
+            pnr_max,  # Pass pnr_max
         )
 
     # Multi-GPU Logic
@@ -534,13 +544,14 @@ def jax_scoring_fn_batch(
 
     pmapped_fn = jax.pmap(
         _score_batch_shard,
-        in_axes=(0, None, None, None, None, None),
+        in_axes=(0, None, None, None, None, None, None),
         static_broadcasted_argnums=(
             1,
             3,
             4,
             5,
-        ),  # cutoff(1), name(3), config(4), correction(5) static
+            6,
+        ),  # cutoff(1), name(3), config(4), correction(5), pnr_max(6) static
     )
 
     # Ensure config is hashable for pmap static arg
@@ -559,6 +570,7 @@ def jax_scoring_fn_batch(
         genotype_name,
         config_hashable,
         correction_cutoff,
+        pnr_max,
     )
 
     # 4. Reshape back

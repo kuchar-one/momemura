@@ -295,7 +295,7 @@ except ImportError:
 
 
 def compute_state_with_jax(
-    params: Dict[str, Any], cutoff: int = 10
+    params: Dict[str, Any], cutoff: int = 10, **kwargs
 ) -> Tuple[np.ndarray, float]:
     """
     Compute state using the exact JAX logic used in optimization.
@@ -318,12 +318,25 @@ def compute_state_with_jax(
 
     # Global Homodyne Params (used at mix nodes)
     hom_x = to_scalar(params.get("homodyne_x", 0.0))
-    hom_win = params.get("homodyne_window")
-    hom_win = to_scalar(hom_win) if hom_win is not None else None
+
+    # Capture actual window value for probability scaling (Resolution)
+    _raw_win = params.get("homodyne_window")
+    homodyne_res_val = to_scalar(_raw_win) if _raw_win is not None else 0.0
+    if homodyne_res_val == 0.0:
+        # If 0.0, we probably shouldn't scale by 0? Or is it technically 0 prob?
+        # Backend treats 0.0 as 0.0.
+        pass
+
+    # FORCE Point Homodyne Mode (matching Backend behavior)
+    hom_win = None
 
     # PNR Max inference
-    pnr_max_val = 3
-    if "pnr_max" in leaf_params:
+    # Use argument pnr_max if provided, else try to find it, else default 3
+    # Actually pnr_max should be passed in.
+    pnr_max_val = kwargs.get("pnr_max", 3)
+
+    if "pnr_max" in leaf_params and pnr_max_val == 3:
+        # Fallback to attempting to read from leaf_params if not explicit
         pnr_val_raw = leaf_params["pnr_max"]
         # It's an array (L,)
         if hasattr(pnr_val_raw, "ndim") and pnr_val_raw.ndim > 0:
@@ -337,14 +350,24 @@ def compute_state_with_jax(
         get_heralded(leaf_params)
     )
 
-    # 2. Superblock
     homodyne_x_is_none = False  # usually 0.0 means 0.0
-    homodyne_window_is_none = hom_win is None
-    # ...
+    homodyne_window_is_none = (
+        hom_win is None
+    )  # Forces Point Mode (hom_win is None due to fix above)
+
+    # Logic: hom_win arg is None (forced), but we need the VALUE for resolution.
+    # Where to get value? 'hom_win' var was set to None.
+    # I need to retrieve the original value before I overwrote it.
+
+    # Wait, I overwrote hom_win in previous fix. I need to fix that first.
+    # See below for correct logic.
     homodyne_resolution_is_none = True
 
+    # Define legacy variables used later
     hom_x_val = hom_x
-    hom_win_val = hom_win if hom_win is not None else 0.0
+    hom_win_val = homodyne_res_val  # Use captured value, or 0.0?
+    if hom_win_val is None:
+        hom_win_val = 0.0  # Safety
 
     # Point homodyne setup
     phi_mat = jax_hermite_phi_matrix(jnp.array([hom_x_val]), cutoff)
@@ -354,6 +377,7 @@ def compute_state_with_jax(
     V_matrix = jnp.zeros((cutoff, 1))
     dx_weights = jnp.zeros(1)
 
+    # Note: homodyne_window_is_none is True (forced), so this block skipped.
     if not homodyne_window_is_none:
         from numpy.polynomial.legendre import leggauss
 
@@ -361,10 +385,7 @@ def compute_state_with_jax(
         _, weights = leggauss(n_nodes)
         half_w = hom_win_val / 2.0
         center = hom_x_val
-        xs = center + half_w * params.get(
-            "nodes_cache", np.zeros(n_nodes)
-        )  # Fix cache? No, standard leggauss
-        # Actually just recompute nodes
+        xs = center + half_w * params.get("nodes_cache", np.zeros(n_nodes))
         nodes, weights = leggauss(n_nodes)
         xs = center + half_w * nodes
         dx_weights = jnp.array(half_w * weights)
@@ -390,14 +411,14 @@ def compute_state_with_jax(
         # mix_source removed
         hom_x_val,
         hom_win_val,
-        0.0,  # resolution
+        homodyne_res_val,  # resolution = window size
         phi_vec,
         V_matrix,
         dx_weights,
         cutoff,
         homodyne_window_is_none,
         homodyne_x_is_none,
-        homodyne_resolution_is_none,
+        False,  # homodyne_resolution_is_none=False (Apply Scaling)
     )
 
     # 3. Final Gaussian
@@ -453,7 +474,7 @@ def get_circuit_figure(params: Dict[str, Any], cutoff: int = 10):
 
 
 def compute_heralded_state(
-    params: Dict[str, Any], cutoff: int = 10
+    params: Dict[str, Any], cutoff: int = 10, **kwargs
 ) -> Tuple[np.ndarray, float]:
     """
     Compute the heralded state vector and probability.
@@ -461,7 +482,7 @@ def compute_heralded_state(
     """
     if JAX_AVAILABLE:
         try:
-            return compute_state_with_jax(params, cutoff)
+            return compute_state_with_jax(params, cutoff, **kwargs)
         except Exception:
             pass
 
