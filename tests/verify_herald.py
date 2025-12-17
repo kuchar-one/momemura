@@ -1,58 +1,46 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import time
-from functools import partial
-from src.simulation.jax.herald import jax_pure_state_amplitude, vacuum_covariance
+from src.simulation.jax.runner import jax_get_heralded_state
+from src.simulation.jax.herald import vacuum_covariance
 
 
-def verify():
-    print("Verifying Herald Recurrence Optimization...")
+def verify_pnr_mismatch():
+    print("Verifying PNR Max Mismatch...")
 
-    # Setup N=3 case (1 Signal + 2 Control)
-    cutoff = 25
-    mu = jnp.zeros(6)  # 3 modes * 2 (x,p)
-    cov = vacuum_covariance(3)
-    pnr = (1, 1)  # 2 controls
+    # Parameters approximating User's Leaf 0
+    # Leaf 0 [✅ ACTIVE]: TMSS(r=1.75), n_ctrl=2, PNR=[16, 15], DispS=4.31-4.53j
 
-    # JIT compile
-    print("Compiling...")
-    start = time.time()
-    jit_fn = jax.jit(partial(jax_pure_state_amplitude, pnr_outcome=pnr, cutoff=cutoff))
+    # Param construction for SINGLE instance (not vmapped)
+    # n_ctrl must be scalar int
+    params = {
+        "tmss_r": jnp.array(1.75),  # Scalar
+        "us_phase": jnp.array([0.0]),  # (1,)
+        "uc_theta": jnp.array(
+            [0.0]
+        ),  # (1,) is enough for N_C=2 pairs? N_C=2 -> 1 pair (0,1).
+        "uc_phi": jnp.array([0.0]),
+        "uc_varphi": jnp.array([0.0, 0.0]),  # (2,)
+        "disp_s": jnp.array([4.31 - 4.53j]),  # (1,)
+        "disp_c": jnp.array([0.0, 0.0]),  # (2,)
+        "pnr": jnp.array([16, 15]),  # (2,)
+        "n_ctrl": jnp.array(2),  # Scalar (array(2))
+    }
 
-    # Warmup
-    # We pass pnr_outcome as static?
-    # jax_pure_state_amplitude has static_argnames=("cutoff", "pnr_outcome")
-    # So we call it directly.
+    # Test 1: pnr_max = 20 (Correct)
+    print("\n--- Test 1: pnr_max = 20 (Correct) ---")
+    vec, prob, _, _, _, _ = jax_get_heralded_state(params, cutoff=60, pnr_max=20)
+    print(f"Prob (pnr_max=20): {prob}")
 
-    # Note: pure_state_amplitude is already decorated with @partial(jax.jit, static_argnames=...)
-    # But let's call it.
+    # Test 2: pnr_max = 3 (Buggy Backend Default)
+    print("\n--- Test 2: pnr_max = 3 (Buggy) ---")
+    vec_bug, prob_bug, _, _, _, _ = jax_get_herald_state(params, cutoff=60, pnr_max=3)
+    print(f"Prob (pnr_max=3): {prob_bug}")
 
-    # We need to make sure we trigger _recurrence_3d.
-    # N = 3 (mu size 6).
-
-    res, prob = jax_pure_state_amplitude(mu, cov, pnr, cutoff)
-    res.block_until_ready()
-    print(f"Compilation + 1st run: {time.time() - start:.4f}s")
-
-    # Benchmark
-    print("Benchmarking 100 iterations...")
-    start = time.time()
-    for _ in range(100):
-        res, prob = jax_pure_state_amplitude(mu, cov, pnr, cutoff)
-        res.block_until_ready()
-    avg = (time.time() - start) / 100
-    print(f"Avg time per call: {avg:.6f}s")
-
-    print(f"Result sum: {jnp.sum(jnp.abs(res))}")
-    print(f"Prob: {prob}")
-
-    # Check for NaNs
-    if jnp.isnan(res).any():
-        print("FAIL: NaNs detected!")
-    else:
-        print("SUCCESS: No NaNs.")
+    print(
+        "\nIf pnr_max=20 yields ~1e-4 and pnr_max=3 yields ~1e-30 or garbage, diagnosis is confirmed."
+    )
 
 
 if __name__ == "__main__":
-    verify()
+    verify_pnr_mismatch()

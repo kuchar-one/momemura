@@ -52,11 +52,16 @@ def render_solution_details(row, result_obj, key_suffix=""):
     with st.spinner("Computing Wigner function..."):
         try:
             # Compute state
+            # Compute state
             cutoff = result_obj.config.get("cutoff", 12)  # Use config or default
+            pnr_max = int(result_obj.config.get("pnr_max", 3))  # Use config or default
+
             params["pnr_outcome"] = params.get(
                 "pnr_outcome", [0] * int(params.get("n_control", 1))
             )  # Ensure pnr present
-            psi, prob = utils.compute_heralded_state(params, cutoff=cutoff)
+            psi, prob = utils.compute_heralded_state(
+                params, cutoff=cutoff, pnr_max=pnr_max
+            )
             exp_val = row["Expectation"]  # Get expectation for Wigner title
 
             # --- VISUALIZATION ROW ---
@@ -85,6 +90,26 @@ def render_solution_details(row, result_obj, key_suffix=""):
             exp_val = utils.to_scalar(row["Expectation"])
             prob = utils.to_scalar(prob)
 
+            # Calculate Simulated LogProb for comparison
+            if prob > 0:
+                sim_log_prob = -np.log10(prob)
+            else:
+                sim_log_prob = np.inf
+
+            stored_log_prob = utils.to_scalar(row["LogProb"])
+
+            st.text(
+                f"Herald Probability (Simulated): {prob:.4e}  => LogProb: {sim_log_prob:.4f}"
+            )
+            st.text(f"Stored LogProb (Backend):       {stored_log_prob:.4f}")
+
+            if abs(sim_log_prob - stored_log_prob) > 1.0:
+                st.warning(
+                    "⚠️ Mismatch between stored metadata and re-simulated state. "
+                    "This likely due to dynamic limits or different cutoff settings. "
+                    "The Wigner function shown is correct for the re-simulated parameters."
+                )
+
             with col_viz2:
                 st.subheader("Output Wigner Function")
                 grid_size = 100
@@ -92,19 +117,18 @@ def render_solution_details(row, result_obj, key_suffix=""):
                 pvec = np.linspace(-5, 5, grid_size)
                 W = utils.compute_wigner(psi, xvec, pvec)
 
+                # Title with Simulated values
                 fig_wig = viz.plot_wigner_function(
                     W,
                     xvec,
                     pvec,
-                    title=f"Expectation: {exp_val:.4f} | Prob: {prob:.2e}",
+                    title=f"Exp: {exp_val:.4f} | Prob: {prob:.2e}",
                 )
                 st.plotly_chart(
                     fig_wig,
                     use_container_width=True,
                     key=f"wigner_{genotype_idx}_{key_suffix}",
                 )
-
-            st.text(f"Herald Probability: {prob:.4e}")
 
         except Exception as e:
             st.error(f"Error computing Wigner: {e}")
@@ -131,7 +155,7 @@ with col1:
     # Enable selection
     # on_select="rerun" ensures app reruns when user selects points
     pareto_selection = st.plotly_chart(
-        fig_pareto, width="stretch", on_select="rerun", key="pareto_plot"
+        fig_pareto, use_container_width=True, on_select="rerun", key="pareto_plot"
     )
 
 with col2:
@@ -139,7 +163,7 @@ with col2:
     # Interactive heatmap
     fig_heat = viz.plot_best_expectation_heatmap(df)
     heat_selection = st.plotly_chart(
-        fig_heat, width="stretch", on_select="rerun", key="heat_plot"
+        fig_heat, use_container_width=True, on_select="rerun", key="heat_plot"
     )
 
 st.divider()
@@ -246,7 +270,7 @@ elif selected_cells:
             title="Local Pareto Front (In Cell)",
             labels={"LogProb": "Neg Log10 Prob", "Expectation": "Expectation"},
         )
-        st.plotly_chart(fig_local, width="stretch", key="local_pareto_plot")
+        st.plotly_chart(fig_local, use_container_width=True, key="local_pareto_plot")
 
         # Show table
         st.dataframe(cell_df[["Expectation", "LogProb", "Complexity", "TotalPhotons"]])

@@ -22,7 +22,7 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
     # Helper to describe a leaf
     def describe_leaf(idx):
         active = params["leaf_active"][idx]
-        status = "✅ ACTIVE" if active else "⚫ VACUUM (Inactive)"
+        status = "✅ ACTIVE" if active else "🔴 INACTIVE"
 
         # Leaf Params
         # Access arrays directly assuming shape (L, ...)
@@ -36,12 +36,28 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
 
         r = utils.to_scalar(get_val("tmss_r", idx))
         n_ctrl = int(utils.to_scalar(get_val("n_ctrl", idx)))
-        pnr = get_val("pnr", idx)  # array, leave asstr
+
+        # PNR: Slice by n_ctrl
+        raw_pnr = get_val("pnr", idx)  # array
+        # Convert to list of ints
+        if hasattr(raw_pnr, "tolist"):
+            pnr_list = raw_pnr.tolist()
+        elif isinstance(raw_pnr, list):
+            pnr_list = raw_pnr
+        else:
+            pnr_list = [raw_pnr]
+
+        # Take first n_ctrl elements
+        if n_ctrl > 0:
+            final_pnr = pnr_list[:n_ctrl]
+            pnr_str = str(final_pnr)
+        else:
+            pnr_str = "[]"
 
         # Displacements
         disp_s = utils.to_scalar(get_val("disp_s", idx))
 
-        desc = f"**Leaf {idx}** [{status}]: TMSS(r={r:.2f}), n_ctrl={n_ctrl}, PNR={pnr}, DispS={disp_s:.2f}"
+        desc = f"**Leaf {idx}** [{status}]: TMSS(r={r:.2f}), n_ctrl={n_ctrl}, PNR={pnr_str}, DispS={disp_s:.2f}"
         return desc
 
     lines.append("\n#### 1. Leaf States (Layer 0)")

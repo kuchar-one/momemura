@@ -930,6 +930,10 @@ def run(
             with jax.profiler.TraceAnnotation("jax_scoring_fn_batch_qdax"):
                 # Ensure operator is a JAX array
                 op_jax = jnp.array(operator)
+
+                # Extract pnr_max from config (ensure int)
+                pnr_max_val = int(genotype_config.get("pnr_max", 3))
+
                 fitnesses, descriptors = jax_scoring_fn_batch(
                     genotypes,
                     cutoff,
@@ -937,6 +941,7 @@ def run(
                     genotype_name=genotype,
                     genotype_config=genotype_config,
                     correction_cutoff=correction_cutoff,
+                    pnr_max=pnr_max_val,
                 )
 
             # QDax expects extra scores (gradients/etc) but we don't have them.

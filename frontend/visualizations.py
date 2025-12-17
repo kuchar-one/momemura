@@ -80,6 +80,8 @@ def plot_best_expectation_heatmap(df: pd.DataFrame) -> go.Figure:
         y=all_complex,
         color_continuous_scale="Viridis_r",  # Reversed so lower (better) is brighter/yellow
         title="Best Expectation Value per Cell",
+        aspect="auto",  # Ensure it fills the container and isn't squashed
+        origin="lower",  # 0 at bottom
     )
     fig.update_xaxes(side="bottom")
     fig.update_layout(clickmode="event+select")
@@ -349,8 +351,41 @@ def plot_tree_circuit(params: dict, genotype_name: str = "A") -> go.Figure:
             idx = int(node[1:])
             r_val = get_leaf_val(idx, "tmss_r", 0.0)
             n_val = int(get_leaf_val(idx, "n_ctrl", 1))
-            label = f"<b>L{idx}</b><br>r={r_val:.2f}"
-            hover = f"Leaf {idx}<br>Active: {isActive}<br>r={r_val:.2f}<br>n={n_val}"
+
+            # --- Detailed Params for Visualization ---
+            # US Phase
+            us_ph = get_leaf_val(idx, "us_phase", 0.0)
+            us_ph_scalar = utils.to_scalar(us_ph)
+
+            # PNR - Detected Photons
+            # PNR is usually a list of length n_ctrl.
+            # get_leaf_val might return the whole list for this leaf if it's (L, N_ctrl)
+            # We want the specific list for this leaf.
+            raw_pnr = get_leaf_val(idx, "pnr", [0])
+            # If it's a list (N_ctrl), join it.
+            if isinstance(raw_pnr, (list, np.ndarray)):
+                pnr_str = ",".join([str(int(utils.to_scalar(x))) for x in raw_pnr])
+            else:
+                pnr_str = str(int(utils.to_scalar(raw_pnr)))
+
+            # UC Params (Control Unitary) - Just show first theta/phi for brevity in label
+            # But full details in hover
+            uc_th_raw = get_leaf_val(idx, "uc_theta", [])
+            # uc_theta is usually (L, N_pairs). get_leaf_val returns (N_pairs,) list/array
+            if hasattr(uc_th_raw, "__len__") and len(uc_th_raw) > 0:
+                uc_th_val = utils.to_scalar(uc_th_raw[0])
+            else:
+                uc_th_val = 0.0
+
+            label = f"<b>L{idx}</b><br>r={r_val:.2f}<br>PNR=[{pnr_str}]"
+
+            hover = (
+                f"Leaf {idx}<br>Active: {isActive}<br>"
+                f"<b>Squeezing:</b> r={r_val:.2f}<br>"
+                f"<b>Signal:</b> Phase={us_ph_scalar:.2f}<br>"
+                f"<b>Control:</b> n={n_val}, PNR=[{pnr_str}]<br>"
+                f"<b>Unitary (1st):</b> Th={uc_th_val:.2f}"
+            )
         elif node.startswith("M") or node == "Root":
             # Need parameter index
             midx = (
