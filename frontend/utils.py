@@ -185,7 +185,15 @@ def _extract_active_leaf_params(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # 1. TMSS
     tmss_r = to_scalar(get_val(leaf_params.get("tmss_r"), active_idx))
-    tmss_squeezing = [tmss_r]
+    # TMSS requires at least 1 Control + 1 Signal
+    # If n_control < 1, we can't have TMSS
+    n_raw = get_val(leaf_params.get("n_ctrl", [1]), active_idx)
+    n_control = int(to_scalar(n_raw))
+
+    if n_control >= 1:
+        tmss_squeezing = [tmss_r]
+    else:
+        tmss_squeezing = []
 
     # 2. US (Signal)
     us_phase = to_scalar(get_val(leaf_params.get("us_phase"), active_idx))

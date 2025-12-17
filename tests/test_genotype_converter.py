@@ -29,7 +29,7 @@ def test_upgrade_c1_to_b1():
     # C1: [Hom(1) | Block(15) | Mix(4) | Final(5)]
     hom_x = c1_g[0]
     block = c1_g[1:16]
-    mix = c1_g[16:20]
+    mix = c1_g[16:19]
 
     # Convert to B1
     b1_g = upgrade_genotype(c1_g, "C1", "B1", depth=depth, config=config)
@@ -45,7 +45,7 @@ def test_upgrade_c1_to_b1():
     # Check Mix: B1 has 7 nodes. C1 has 1 mix set.
     # B1 mix should be 7 copies of C1 mix.
     nodes = 2**depth - 1
-    mix_section = b1_g[16 : 16 + nodes * 4].reshape(nodes, 4)
+    mix_section = b1_g[16 : 16 + nodes * 3].reshape(nodes, 3)
     for i in range(nodes):
         assert np.allclose(mix_section[i], mix)
 

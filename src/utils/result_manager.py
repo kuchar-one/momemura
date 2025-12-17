@@ -216,11 +216,26 @@ class OptimizationResult:
         lps = -all_fits_cat[:, 1]
 
         # Bounds with some padding
-        x_min, x_max = np.min(lps), np.max(lps)
-        y_min, y_max = np.min(exps), np.max(exps)
+        # Filter finite values for bounds calculation
+        valid_mask_fin = np.isfinite(exps) & np.isfinite(lps)
+        if not np.any(valid_mask_fin):
+            print("No finite values for animation bounds. Using defaults.")
+            x_min, x_max = 0.0, 10.0
+            y_min, y_max = 0.0, 5.0
+        else:
+            x_min, x_max = np.min(lps[valid_mask_fin]), np.max(lps[valid_mask_fin])
+            y_min, y_max = np.min(exps[valid_mask_fin]), np.max(exps[valid_mask_fin])
 
-        pad_x = (x_max - x_min) * 0.05 if x_max != x_min else 1.0
-        pad_y = (y_max - y_min) * 0.05 if y_max != y_min else 1.0
+        # Handle singular bounds
+        if x_min == x_max:
+            x_min -= 1.0
+            x_max += 1.0
+        if y_min == y_max:
+            y_min -= 0.5
+            y_max += 0.5
+
+        pad_x = (x_max - x_min) * 0.05
+        pad_y = (y_max - y_min) * 0.05
 
         xlim = (x_min - pad_x, x_max + pad_x)
         ylim = (y_min - pad_y, y_max + pad_y)

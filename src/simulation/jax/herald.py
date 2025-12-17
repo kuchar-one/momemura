@@ -605,59 +605,67 @@ def _recurrence_1d(shape, B, gamma, dtype):
 
 
 def _recurrence_2d(shape, B, gamma, dtype):
-    # Normalized recurrence
+    # Normalized recurrence optimized (branchless)
     N0, N1 = shape
     A = jnp.zeros(shape, dtype=dtype)
     A = A.at[0, 0].set(1.0)
 
+    # Precompute constants
+    b00, b01, b11 = B[0, 0], B[0, 1], B[1, 1]
+    g0, g1 = gamma[0], gamma[1]
+    zero = jnp.array(0.0, dtype=dtype)
+
     def body_n0(n0, h_arr):
+        # Safe reciprocal for n0 (avoid div by zero when n0=0)
+        inv_sqrt_n0 = jax.lax.rsqrt(jnp.maximum(n0, 1.0).astype(dtype))
+        sqrt_n0_minus_1_div_n0 = jnp.sqrt(
+            (jnp.maximum(n0 - 1, 0.0)) * inv_sqrt_n0 * inv_sqrt_n0
+        )
+
+        # Masks
+        n0_pos = (n0 > 0).astype(dtype)
+        n0_ge_2 = (n0 >= 2).astype(dtype)
+
         def body_n1(n1, h):
-            # Compute A[n0, n1]
+            # n1 loop interaction
+            inv_sqrt_n1 = jax.lax.rsqrt(jnp.maximum(n1, 1.0).astype(dtype))
+            sqrt_n1_minus_1_div_n1 = jnp.sqrt(
+                (jnp.maximum(n1 - 1, 0.0)) * inv_sqrt_n1 * inv_sqrt_n1
+            )
+            sqrt_n1_div_n0 = jnp.sqrt(n1) * inv_sqrt_n0
 
-            def calc_n0_pos(dummy):
-                # i=0
-                # A = gamma_0/sqrt(n0) A[n0-1] + B_00 sqrt((n0-1)/n0) A[n0-2] + B_01 sqrt(n1/n0) A[n0-1, n1-1]
-                sqrt_n0 = jnp.sqrt(n0)
-                val = (gamma[0] * h[n0 - 1, n1]) / sqrt_n0
+            n1_pos = (n1 > 0).astype(dtype)
+            n1_ge_2 = (n1 >= 2).astype(dtype)
 
-                val += jax.lax.cond(
-                    n0 >= 2,
-                    lambda _: B[0, 0] * h[n0 - 2, n1] * jnp.sqrt((n0 - 1) / n0),
-                    lambda _: jnp.array(0, dtype=dtype),
-                    None,
-                )
-                val += jax.lax.cond(
-                    n1 >= 1,
-                    lambda _: B[0, 1] * h[n0 - 1, n1 - 1] * jnp.sqrt(n1 / n0),
-                    lambda _: jnp.array(0, dtype=dtype),
-                    None,
-                )
-                return val
+            # Case i=0 (n0 > 0)
+            # T1: gamma0 * A[n0-1, n1] / sqrt(n0)
+            val0 = (g0 * h[n0 - 1, n1]) * inv_sqrt_n0
+            # T2: B00 * A[n0-2, n1] * sqrt((n0-1)/n0)
+            val0 += (b00 * h[n0 - 2, n1] * sqrt_n0_minus_1_div_n0) * n0_ge_2
+            # T3: B01 * A[n0-1, n1-1] * sqrt(n1/n0)
+            val0 += (b01 * h[n0 - 1, n1 - 1] * sqrt_n1_div_n0) * n1_pos
 
-            def calc_n0_zero(dummy):
-                # i=1 (since n0=0)
-                # A = gamma_1/sqrt(n1) A[0, n1-1] + B_11 sqrt((n1-1)/n1) A[0, n1-2]
-                sqrt_n1 = jnp.sqrt(n1)
-                val = (gamma[1] * h[0, n1 - 1]) / sqrt_n1
+            # Case i=1 (Fallback if n0=0, implies n1 > 0)
+            # T1: gamma1 * A[0, n1-1] / sqrt(n1)
+            val1 = (g1 * h[0, n1 - 1]) * inv_sqrt_n1
+            # T2: B11 * A[0, n1-2] * sqrt((n1-1)/n1)
+            val1 += (b11 * h[0, n1 - 2] * sqrt_n1_minus_1_div_n1) * n1_ge_2
 
-                val += jax.lax.cond(
-                    n1 >= 2,
-                    lambda _: B[1, 1] * h[0, n1 - 2] * jnp.sqrt((n1 - 1) / n1),
-                    lambda _: jnp.array(0, dtype=dtype),
-                    None,
-                )
-                return val
+            # Select based on n0 > 0
+            # If n0=0, we use val1. If n0>0, we use val0.
+            # (0,0) is skipped by (n0_pos + n1_pos) check? No, (0,0) is set.
+            # We must not overwrite (0,0).
 
-            # Skip (0,0) which is already set
             is_start = (n0 == 0) & (n1 == 0)
 
-            val = jax.lax.cond(
-                is_start,
-                lambda _: h[0, 0].astype(dtype),
-                lambda _: jax.lax.cond(n0 > 0, calc_n0_pos, calc_n0_zero, None),
-                None,
-            )
-            return h.at[n0, n1].set(val)
+            val = val0 * n0_pos + val1 * (1.0 - n0_pos)
+
+            # Update only if not start
+            # But functional update requires explicit branch or writing same value
+            current = h[n0, n1]
+            new_val = jax.lax.select(is_start, current, val)
+
+            return h.at[n0, n1].set(new_val)
 
         return jax.lax.fori_loop(0, N1, body_n1, h_arr)
 
@@ -674,101 +682,87 @@ def _recurrence_2d(shape, B, gamma, dtype):
 
 
 def _recurrence_3d(shape, B, gamma, dtype):
-    # Normalized recurrence
+    # Normalized recurrence optimized (branchless)
     N0, N1, N2 = shape
     A = jnp.zeros(shape, dtype=dtype)
     A = A.at[0, 0, 0].set(1.0)
 
+    # Constants
+    b00, b01, b02 = B[0, 0], B[0, 1], B[0, 2]
+    b11, b12 = B[1, 1], B[1, 2]
+    b22 = B[2, 2]
+    g0, g1, g2 = gamma[0], gamma[1], gamma[2]
+
     def body_n0(n0, h0):
+        # n0 precalcs
+        inv_sqrt_n0 = jax.lax.rsqrt(jnp.maximum(n0, 1.0).astype(dtype))
+        sqrt_n0_minus_1_div_n0 = jnp.sqrt(
+            (jnp.maximum(n0 - 1, 0.0)) * inv_sqrt_n0 * inv_sqrt_n0
+        )
+        n0_pos = (n0 > 0).astype(dtype)
+        n0_ge_2 = (n0 >= 2).astype(dtype)
+
         def body_n1(n1, h1):
+            # n1 precalcs
+            inv_sqrt_n1 = jax.lax.rsqrt(jnp.maximum(n1, 1.0).astype(dtype))
+            sqrt_n1_minus_1_div_n1 = jnp.sqrt(
+                (jnp.maximum(n1 - 1, 0.0)) * inv_sqrt_n1 * inv_sqrt_n1
+            )
+            # Cross terms
+            sqrt_n1_div_n0 = jnp.sqrt(n1) * inv_sqrt_n0
+
+            n1_pos = (n1 > 0).astype(dtype)
+            n1_ge_2 = (n1 >= 2).astype(dtype)
+
+            # Logic: If n0 > 0, we use index i=0. Else if n1 > 0, use i=1.
+
             def body_n2(n2, h):
-                # Logic: pick first dimension > 0
-                is_start = (n0 == 0) & (n1 == 0) & (n2 == 0)
-
-                def compute(_):
-                    # Try i=0
-                    def use_0(_):
-                        sqrt_n0 = jnp.sqrt(n0)
-                        val = (gamma[0] * h[n0 - 1, n1, n2]) / sqrt_n0
-
-                        val += jax.lax.cond(
-                            n0 >= 2,
-                            lambda _: B[0, 0]
-                            * h[n0 - 2, n1, n2]
-                            * jnp.sqrt((n0 - 1) / n0),
-                            lambda _: jnp.array(0, dtype=dtype),
-                            None,
-                        )
-                        val += jax.lax.cond(
-                            n1 >= 1,
-                            lambda _: B[0, 1]
-                            * h[n0 - 1, n1 - 1, n2]
-                            * jnp.sqrt(n1 / n0),
-                            lambda _: jnp.array(0, dtype=dtype),
-                            None,
-                        )
-                        val += jax.lax.cond(
-                            n2 >= 1,
-                            lambda _: B[0, 2]
-                            * h[n0 - 1, n1, n2 - 1]
-                            * jnp.sqrt(n2 / n0),
-                            lambda _: jnp.array(0, dtype=dtype),
-                            None,
-                        )
-                        return val
-
-                    # Try i=1
-                    def use_1(_):
-                        sqrt_n1 = jnp.sqrt(n1)
-                        val = (gamma[1] * h[0, n1 - 1, n2]) / sqrt_n1
-
-                        val += jax.lax.cond(
-                            n1 >= 2,
-                            lambda _: B[1, 1]
-                            * h[0, n1 - 2, n2]
-                            * jnp.sqrt((n1 - 1) / n1),
-                            lambda _: jnp.array(0, dtype=dtype),
-                            None,
-                        )
-                        val += jax.lax.cond(
-                            n2 >= 1,
-                            lambda _: B[1, 2]
-                            * h[0, n1 - 1, n2 - 1]
-                            * jnp.sqrt(n2 / n1),
-                            lambda _: jnp.array(0, dtype=dtype),
-                            None,
-                        )
-                        return val
-
-                    # Try i=2
-                    def use_2(_):
-                        sqrt_n2 = jnp.sqrt(n2)
-                        val = (gamma[2] * h[0, 0, n2 - 1]) / sqrt_n2
-
-                        val += jax.lax.cond(
-                            n2 >= 2,
-                            lambda _: B[2, 2]
-                            * h[0, 0, n2 - 2]
-                            * jnp.sqrt((n2 - 1) / n2),
-                            lambda _: jnp.array(0, dtype=dtype),
-                            None,
-                        )
-                        return val
-
-                    return jax.lax.cond(
-                        n0 > 0,
-                        use_0,
-                        lambda _: jax.lax.cond(n1 > 0, use_1, use_2, None),
-                        None,
-                    )
-
-                val = jax.lax.cond(
-                    is_start,
-                    lambda _: h[0, 0, 0].astype(dtype),
-                    compute,
-                    None,
+                # n2 precalcs
+                inv_sqrt_n2 = jax.lax.rsqrt(jnp.maximum(n2, 1.0).astype(dtype))
+                sqrt_n2_minus_1_div_n2 = jnp.sqrt(
+                    (jnp.maximum(n2 - 1, 0.0)) * inv_sqrt_n2 * inv_sqrt_n2
                 )
-                return h.at[n0, n1, n2].set(val)
+                # Cross
+                sqrt_n2_div_n0 = jnp.sqrt(n2) * inv_sqrt_n0
+                sqrt_n2_div_n1 = jnp.sqrt(n2) * inv_sqrt_n1
+
+                n2_pos = (n2 > 0).astype(dtype)
+                n2_ge_2 = (n2 >= 2).astype(dtype)
+
+                # --- VAL 0 (i=0) ---
+                # gamma0 * A[n0-1, n1, n2] / sqrt(n0)
+                v0 = (g0 * h[n0 - 1, n1, n2]) * inv_sqrt_n0
+                v0 += (b00 * h[n0 - 2, n1, n2] * sqrt_n0_minus_1_div_n0) * n0_ge_2
+                v0 += (b01 * h[n0 - 1, n1 - 1, n2] * sqrt_n1_div_n0) * n1_pos
+                v0 += (b02 * h[n0 - 1, n1, n2 - 1] * sqrt_n2_div_n0) * n2_pos
+
+                # --- VAL 1 (i=1) ---
+                # gamma1 * A[0, n1-1, n2] / sqrt(n1)
+                v1 = (g1 * h[0, n1 - 1, n2]) * inv_sqrt_n1
+                v1 += (b11 * h[0, n1 - 2, n2] * sqrt_n1_minus_1_div_n1) * n1_ge_2
+                v1 += (b12 * h[0, n1 - 1, n2 - 1] * sqrt_n2_div_n1) * n2_pos
+
+                # --- VAL 2 (i=2) ---
+                v2 = (g2 * h[0, 0, n2 - 1]) * inv_sqrt_n2
+                v2 += (b22 * h[0, 0, n2 - 2] * sqrt_n2_minus_1_div_n2) * n2_ge_2
+
+                # Selection
+                # if n0 > 0: use v0
+                # else if n1 > 0: use v1
+                # else: use v2
+
+                final_val = (
+                    v0 * n0_pos
+                    + v1 * (1.0 - n0_pos) * n1_pos
+                    + v2 * (1.0 - n0_pos) * (1.0 - n1_pos)
+                )
+
+                # Handle Start
+                is_start = (n0 == 0) & (n1 == 0) & (n2 == 0)
+                current = h[n0, n1, n2]
+                new_val = jax.lax.select(is_start, current, final_val)
+
+                return h.at[n0, n1, n2].set(new_val)
 
             return jax.lax.fori_loop(0, N2, body_n2, h1)
 

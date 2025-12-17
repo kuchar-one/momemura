@@ -24,6 +24,9 @@ from functools import partial
 from typing import Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib
+import pickle
+import shutil
+from pathlib import Path
 
 # === Project imports ===
 from src.genotypes.genotypes import get_genotype_decoder
@@ -722,9 +725,22 @@ def run(
     seed_scan: bool = False,
     correction_cutoff: int = None,
     max_chunk_size: int = 100,
+    resume_path: str = None,
+    debug: bool = False,
 ) -> Any:
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
+
+    # Resume Check
+    if resume_path:
+        # We need to verify resume path before heavy initialization
+        chk_path = Path(resume_path) / "checkpoint_latest.pkl"
+        if not chk_path.exists():
+            print(f"ERROR: Resume path {chk_path} does not exist.")
+            # Depending on policy, we might fail or start fresh.
+            # Stricter is better to avoid accidental overwrites.
+            sys.exit(1)
+        print(f"Resuming from checkpoint: {chk_path}")
 
     # Setup
     from src.utils.gkp_operator import construct_gkp_operator
@@ -782,6 +798,18 @@ def run(
     emitter_state = None
     final_metrics = {}
     centroids = None
+
+    # --- Output Directory Setup ---
+    # Create structured output directory early for checkpoints and results
+    if resume_path:
+        output_dir = resume_path
+        print(f"Using existing output directory: {output_dir}")
+    else:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        params_str = f"c{cutoff}_p{pop_size}_i{n_iters}"
+        output_dir = f"output/{timestamp}_{params_str}"
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Created output directory: {output_dir}")
 
     if mode == "random":
         # Random search baseline
@@ -1141,22 +1169,90 @@ def run(
         target_chunk = min(max_chunk_size, 50 if LOW_MEM else max_chunk_size)
 
         chunk_size = min(n_iters, target_chunk)
-        n_chunks = n_iters // chunk_size
-        remainder = n_iters % chunk_size
 
-        # If there's a remainder, we'll handle it (or just ignore for now and run n_chunks)
-        # Actually, scan requires fixed length.
-        # If remainder > 0, we might need a final smaller chunk.
-        # For simplicity, let's just run n_chunks and warn if n_iters is not divisible?
-        # Or better, adjust chunk_size to be a divisor if possible?
-        # No, just run n_chunks and then a final chunk.
+        # Resume Logic (MOME State Loading)
+        if resume_path:
+            chk_path = Path(resume_path) / "checkpoint_latest.pkl"
+            print(f"Loading MOME state from {chk_path}...")
+            try:
+                with open(chk_path, "rb") as f:
+                    checkpoint = pickle.load(f)
 
-        chunks = [chunk_size] * n_chunks
-        if remainder > 0:
-            chunks.append(remainder)
-            n_chunks += 1
+                repertoire = checkpoint["repertoire"]
+                emitter_state = checkpoint["emitter_state"]
+                loaded_key = checkpoint["key"]
+                completed_iters = checkpoint["completed_iters"]
 
-        all_metrics = {k: [] for k in init_metrics.keys()}
+                # Check for config mismatch (warn only)
+                if checkpoint.get("pop_size", pop_size) != pop_size:
+                    print(
+                        "WARNING: Resume pop_size mismatch. Proceeding might fail if arrays don't match."
+                    )
+
+                print(f"Resumed from Iter {completed_iters}.")
+
+                # Skip init
+                # We need a new key? loaded_key is the one saved after update.
+                key = loaded_key
+
+                # Adjust remaining iterations
+                # n_iters is total target.
+                current_n_iters = n_iters
+                if completed_iters >= n_iters:
+                    print(f"Run already completed ({completed_iters}/{n_iters}).")
+                    # Should we extend?
+                    # For now just exit or allow extension if n_iters passed is higher?
+                    pass
+                else:
+                    # We continue loop from completed_iters
+                    # The chunk logic needs to know how many left.
+                    pass
+
+            except Exception as e:
+                print(f"Resume Failed: {e}")
+                sys.exit(1)
+        else:
+            completed_iters = 0
+            # Warmup JAX compilation
+            print("Warming up JAX compilation...")
+            # Run a single dummy call to scoring_fn with a representative batch
+            # We use the initial genotypes for warmup
+            scoring_fn(genotypes, subkey)
+            print("Warmup complete.")
+
+            repertoire, emitter_state, init_metrics = mome.init(
+                genotypes, centroids, subkey
+            )
+
+        # Run loop with progress reporting
+        # We run in chunks to print metrics
+        # Adjust chunk size for low memory
+        # User requested to limit CPU calls -> larger chunks.
+
+        # Calculate remaining chunks
+        remaining_iters = n_iters - completed_iters
+        if remaining_iters <= 0:
+            print("Target iterations reached.")
+            remaining_iters = 0
+            n_chunks = 0
+            chunks = []
+        else:
+            # We chunk the *remaining* iters
+            chunk_size = min(remaining_iters, target_chunk)
+            n_chunks = remaining_iters // chunk_size
+            remainder = remaining_iters % chunk_size
+
+            chunks = [chunk_size] * n_chunks
+            if remainder > 0:
+                chunks.append(remainder)
+                n_chunks += 1
+
+        all_metrics = {k: [] for k in init_metrics.keys()} if not resume_path else {}
+        # If resume, we might want to load old history?
+        # The checkpoint saves 'history' optionally?
+        # For simple resume, we append new history.
+        # Merging full history is complex if we don't save it in checkpoint.
+        # Let's save history in checkpoint too.
 
         # -------------------------
         # Progress Bar Setup
@@ -1177,31 +1273,163 @@ def run(
         # Target ~50-100 frames for animation to keep overhead low
         snapshot_interval = max(1, n_iters // 50)
 
-        completed = 0
+        completed = completed_iters
 
         chunk_start_time = time.time()
 
-        for chunk_len in chunks:
-            # Re-compile scan for each unique chunk length?
-            # JAX compiles for specific static arguments (length is static).
-            # So [100, 100, 100, 50] triggers 2 compilations (100 and 50).
-            # This is acceptable overhead for the last chunk.
+        # Resume History?
+        if resume_path and "history" in checkpoint:
+            # We can prepopulate all_metrics if we want valid full plots?
+            # Or just assume plotting handles it.
+            # Ideally we accumulate.
+            # For now, let's init empty and only plot new stuff, OR rely on final merge?
+            # result_manager merges history?
+            # Let's try to restore `all_metrics` if present.
+            if "history" in checkpoint:
+                # Checkpoint history might be numpy or list
+                all_metrics = checkpoint["history"]
+                print(
+                    f"Restored metrics history ({len(list(all_metrics.values())[0])} items)."
+                )
+            else:
+                # If init_metrics needed for keys
+                all_metrics = {
+                    k: [] for k in init_metrics.keys()
+                }  # init_metrics scope issue?
+                # init_metrics defined in else block.
+                # Need keys.
+                # Usually ['coverage', 'min_expectation', ...]
+                # We can infer from first chunk if needed.
+                pass
 
-            (repertoire, emitter_state, key), metrics = jax.lax.scan(
-                mome.scan_update,
-                (repertoire, emitter_state, key),
-                (),
-                length=chunk_len,
-            )
+        chunk_start_time = time.time()
 
-            # Accumulate metrics (taking the last value from the chunk)
-            for k, v in metrics.items():
-                # v is array of shape (chunk_len, ...)
-                all_metrics[k].extend(v)
+        # Python Loop for Optimization
+        # We process 'chunks' just to maintain the reporting structure,
+        # but the inner logic is now just a loop calling mome.update.
+        # Actually, since we need to save checkpoints every chunk, keeping the chunk structure is good.
+        # But we iterate step-by-step inside the chunk logic (or block of steps).
+
+        # We JIT `mome.update`?
+        # CAUTION: If `mome.update` calls `scoring_fn` which has `pmap`, `jit(mome.update)` is `jit(pmap)`.
+        # This is exactly what caused the single-GPU issue.
+        # We must NOT JIT `mome.update` as a whole.
+        # `mome.update` typically calls:
+        # 1. selection (can be jitted)
+        # 2. mutation (can be jitted)
+        # 3. scoring (pmap)
+        # 4. addition (can be jitted)
+
+        # QDax `MOME.update` implementation usually composes these.
+        # If we call `mome.update` eagerly (no jit), it will dispatch kernels.
+        # This allows `pmap` in step 3 to work correctly.
+
+        # Ensure we don't compile `mome.update` via `jax.jit`.
+
+        for chunk_idx, chunk_len in enumerate(chunks):
+            # Run `chunk_len` steps in Python
+            chunk_metrics = {k: [] for k in init_metrics.keys()}
+
+            # Unwrap MOME.update to avoid jit(pmap)
+            # mome.update is a bound method. __wrapped__ is the unbound function.
+            # We need to bind it or pass self.
+            if hasattr(mome.update, "__wrapped__"):
+                update_fn = partial(mome.update.__wrapped__, mome)
+            else:
+                update_fn = mome.update
+
+            for _ in range(chunk_len):
+                # Update Step
+                # QDax MOME.update signature: (repertoire, emitter_state, key) -> (repertoire, emitter_state, metrics)
+                # It does NOT return the new key. We must manage the key splitting manually (like scan_update does).
+
+                key, subkey = jax.random.split(key)
+
+                repertoire, emitter_state, step_metrics = update_fn(
+                    repertoire, emitter_state, subkey
+                )
+
+                # Accumulate metrics
+                # step_metrics is a dict of scalars (or 0-d arrays)
+                for k, v in step_metrics.items():
+                    chunk_metrics[k].append(v)
+
+            # Process Chunk Metrics
+            # Convert list of scalars to array for `all_metrics` extend
+            for k, v_list in chunk_metrics.items():
+                # stack to get shape (chunk_len, ...) if needed, or just extend list
+                # all_metrics stores flat lists usually or arrays?
+                # Initialize: all_metrics = {k: []}
+                # extend expects iterables. v_list is list of scalars.
+                # But wait, `metrics` from scan was stacked (chunk_len, ...).
+                # `all_metrics[k].extend(v)` worked because v was array.
+                # Here v_list is list of JAX scalars.
+                # We should convert to numpy/float to save memory?
+                # Or keep as JAX arrays?
+                # Let's convert to simple list of values to avoid device memory accumulation.
+                if jax is not None:
+                    # Pull to host
+                    v_list_np = [jax.device_get(x) for x in v_list]
+                    if k not in all_metrics:
+                        all_metrics[k] = []
+                    all_metrics[k].extend(v_list_np)
+                else:
+                    if k not in all_metrics:
+                        all_metrics[k] = []
+                    all_metrics[k].extend(v_list)
+
+            # --- Checkpointing at end of chunk ---
+            # Create checkpoint dict
+            # Move accumulated metrics update BEFORE checkpoint so we save it?
+            # Yes.
+
+            completed += chunk_len
+
+            # Save Checkpoint
+            try:
+                # We use a temporary file to ensure atomic write
+                chk_data = {
+                    "repertoire": repertoire,
+                    "emitter_state": emitter_state,
+                    "key": key,
+                    "completed_iters": completed,
+                    "pop_size": pop_size,
+                    "history": all_metrics,
+                }
+
+                # We need a directory to save checkpoint.
+                # If resume_path is set, save THERE (overwrite).
+                # If new run, save in NEW output_dir.
+                # BUT output_dir is defined at end of script!
+                # We must define output_dir EARLIER or use a dedicated checkpoint dir?
+                # User wants to resume from "output/..."
+                # So we should save to the current run's output directory.
+
+                # Define output dir early?
+                # We moved it up!
+                current_output_dir = output_dir  # already defined local var
+
+                # Ensure directory exists (paranoia check)
+                if not os.path.exists(current_output_dir):
+                    print(
+                        f"WARNING: Output directory {current_output_dir} missing. Recreating."
+                    )
+                    os.makedirs(current_output_dir, exist_ok=True)
+
+                # Temp file
+                tmp_chk = Path(current_output_dir) / "checkpoint_tmp.pkl"
+                final_chk = Path(current_output_dir) / "checkpoint_latest.pkl"
+
+                with open(tmp_chk, "wb") as f:
+                    pickle.dump(chk_data, f)
+
+                # Atomic rename
+                shutil.move(tmp_chk, final_chk)
+
+            except Exception as e:
+                print(f"Checkpoint prep failed: {e}")
 
             # ETR Calculation
-            elapsed = time.time() - start_time
-            completed += chunk_len
 
             # Capture Pareto Front Snapshot
             if completed % snapshot_interval == 0 or completed == n_iters:
@@ -1218,10 +1446,12 @@ def run(
                 history_fronts.append((valid_fits, valid_descs))
 
             # Print progress with ETR
-            cov = float(metrics["coverage"][-1]) * 100
-            best_exp = float(metrics["min_expectation"][-1])
-            best_lp = float(metrics["min_log_prob"][-1])
-            best_prob = float(metrics["max_probability"][-1])
+            # Print progress with ETR
+            # Use last val from chunk_metrics (dictionary of lists)
+            cov = float(chunk_metrics["coverage"][-1]) * 100
+            best_exp = float(chunk_metrics["min_expectation"][-1])
+            best_lp = float(chunk_metrics["min_log_prob"][-1])
+            best_prob = float(chunk_metrics["max_probability"][-1])
 
             # Best fitness is -best_exp (since we minimize exp)
             best_fit = -best_exp
@@ -1260,11 +1490,8 @@ def run(
     # --- Result Management ---
     from src.utils.result_manager import OptimizationResult
 
-    # Create structured output directory
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    params_str = f"c{cutoff}_p{pop_size}_i{n_iters}"
-    output_dir = f"output/{timestamp}_{params_str}"
-    os.makedirs(output_dir, exist_ok=True)
+    # Output dir logic moved up.
+    # Just reiterate config save?
 
     # Config dict
     config = {
@@ -1402,8 +1629,20 @@ def main():
         default=100,
         help="Maximum iterations per chunk for progress reporting (default: 100)",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to output directory to resume from.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable verbose debug logging."
+    )
 
     args = parser.parse_args()
+    print(
+        f"DEBUG: Parsed Args: resume={args.resume}, debug={args.debug}, chunk_size={args.chunk_size}"
+    )
 
     # Dynamic Limits Override
     r_scale_val = args.r_scale
@@ -1489,6 +1728,8 @@ def main():
                 seed_scan=args.seed_scan,
                 correction_cutoff=corr_cutoff_val,
                 max_chunk_size=args.chunk_size,
+                resume_path=args.resume,
+                debug=args.debug,
             )
         finally:
             jax.profiler.stop_trace()
@@ -1510,6 +1751,8 @@ def main():
             seed_scan=args.seed_scan,
             correction_cutoff=corr_cutoff_val,
             max_chunk_size=args.chunk_size,
+            resume_path=args.resume,
+            debug=args.debug,
         )
 
 

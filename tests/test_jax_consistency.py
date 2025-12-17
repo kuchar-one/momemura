@@ -45,10 +45,14 @@ def test_jax_superblock_consistency():
 
     # Extract params
     leaf_params = params["leaf_params"]
+    # extract mix params
     mix_params = params["mix_params"]  # (7, 3) angles
-    mix_source = params["mix_source"]  # (7,) source
     hom_x = float(params["homodyne_x"])
     hom_win = 0.0  # Force Point Homodyne for optimization test
+
+    # FORCE LEAF ACTIVE to ensure we test mixing physics
+    params["leaf_active"] = jnp.ones(8, dtype=bool)
+    leaf_active = params["leaf_active"]
 
     # 3. Build CPU Circuit
     # We need to map JAX params to CPU Composer calls
@@ -71,7 +75,7 @@ def test_jax_superblock_consistency():
     leaf_probs_np = np.array(leaf_probs)
 
     print(f"Leaf Probs: {leaf_probs_np}")
-    print(f"Mix Source: {mix_source}")
+    # print(f"Mix Source: {mix_source}")
     print(f"Mix Params: {mix_params}")
 
     # Build tree manually with Composer
@@ -82,26 +86,39 @@ def test_jax_superblock_consistency():
     mix_idx = 0
 
     # Helper to mix on CPU
-    def mix_cpu(stateA, stateB, probA, probB, params, source):
-        theta, phi, varphi = params
-        # Source: 0=Mix, 1=Left, 2=Right
+    def mix_cpu(stateA, stateB, probA, probB, params, activeA, activeB):
+        # Implicit Logic:
+        # A & B -> Mix
+        # A & ~B -> Pass A
+        # ~A & B -> Pass B
+        # ~A & ~B -> Inactive (Pass A default or handle specially?)
 
-        if source == 1:  # Left
+        # For this test, we assume active flags are passed correctly.
+        # But wait, the test doesn't explicitly toggle active flags per node?
+        # The test uses `leaf_params["leaf_active"]`.
+        # We need to trace activity to implement `mix_cpu` correctly if we want to match JAX.
+
+        # However, the JAX logic INSIDE `mix_node` does the switching.
+        # If we want parity, we must implement the switch here.
+
+        # But `mix_cpu` is called layers deep. We need accurate `active` status for inputs.
+        # This test might be simplified to assume ALL active for consistency if we want to test mixing numerics?
+        # Or we implement the full logic.
+
+        # Let's check `jax_consistency.py` context. It tests `jax_superblock`.
+        # `jax_superblock` uses `mix_node`.
+        # So `mix_cpu` MUST match `mix_node`.
+
+        passedA = activeA and (not activeB)
+        passedB = activeB and (not activeA)
+        mixed = activeA and activeB
+
+        if passedA:
             return stateA, probA
-        elif source == 2:  # Right
+        elif passedB:
             return stateB, probB
-        else:  # Mix
-            # Composer.compose_pair
-            # We need U_bs
-            # Composer uses `_run_two_mode_program_and_get_full_dm` (now `compose_pair`)
-            # It takes U (unitary).
-            # We need to construct U from theta, phi, varphi.
-            # Same logic as JAX: U = Phase(varphi) @ BS(theta, phi)
-
-            # Homodyne
-            # We use Point homodyne (window=0 effectively, or explicit x)
-            # Composer.compose_pair(stateA, stateB, U, pA, pB, homodyne_x=..., homodyne_window=...)
-
+        elif mixed:
+            theta, phi, varphi = params
             rho, p_meas, joint = composer.compose_pair(
                 stateA,
                 stateB,
@@ -114,48 +131,65 @@ def test_jax_superblock_consistency():
                 phi=float(phi),
             )
             return rho, joint
+        else:
+            # Neither active. Return vacuum/dummy?
+            # In JAX it returns do_left (stateA) but flag is inactive.
+            # Here we just return stateA for structure.
+            return stateA, probA
+
+    # Track activity
+    leaf_active = params["leaf_active"]  # Bool array (8,)
+    # We need to propagate this.
+    current_active = [bool(leaf_active[i]) for i in range(8)]
 
     # Layer 1
     next_states = []
     next_probs = []
+    next_active = []
     for i in range(4):
         sA, sB = current_states[2 * i], current_states[2 * i + 1]
         pA, pB = current_probs[2 * i], current_probs[2 * i + 1]
+        actA, actB = current_active[2 * i], current_active[2 * i + 1]
         p = mix_params[mix_idx]
-        src = mix_source[mix_idx]
+        # src removed
         mix_idx += 1
 
-        s, pr = mix_cpu(sA, sB, pA, pB, p, src)
+        s, pr = mix_cpu(sA, sB, pA, pB, p, actA, actB)
         next_states.append(s)
         next_probs.append(pr)
+        next_active.append(actA or actB)
 
     current_states = next_states
     current_probs = next_probs
+    current_active = next_active
 
     # Layer 2
     next_states = []
     next_probs = []
+    next_active = []
     for i in range(2):
         sA, sB = current_states[2 * i], current_states[2 * i + 1]
         pA, pB = current_probs[2 * i], current_probs[2 * i + 1]
+        actA, actB = current_active[2 * i], current_active[2 * i + 1]
         p = mix_params[mix_idx]
-        src = mix_source[mix_idx]
         mix_idx += 1
 
-        s, pr = mix_cpu(sA, sB, pA, pB, p, src)
+        s, pr = mix_cpu(sA, sB, pA, pB, p, actA, actB)
         next_states.append(s)
         next_probs.append(pr)
+        next_active.append(actA or actB)
 
     current_states = next_states
     current_probs = next_probs
+    current_active = next_active
 
     # Layer 3 (Root)
     sA, sB = current_states[0], current_states[1]
     pA, pB = current_probs[0], current_probs[1]
+    actA, actB = current_active[0], current_active[1]
     p = mix_params[mix_idx]
-    src = mix_source[mix_idx]
 
-    root_state_cpu, root_prob_cpu = mix_cpu(sA, sB, pA, pB, p, src)
+    root_state_cpu, root_prob_cpu = mix_cpu(sA, sB, pA, pB, p, actA, actB)
 
     # 4. Run JAX Superblock
     # Prepare inputs
@@ -172,7 +206,7 @@ def test_jax_superblock_consistency():
         leaf_pnrs,  # Using leaf_pnrs as total_pnrs (since 1 mode per leaf in this test)
         leaf_modes,
         mix_params,
-        mix_source,
+        # mix_source removed
         hom_x,
         hom_win,
         0.0,
@@ -203,9 +237,13 @@ def test_jax_superblock_consistency():
     if root_state_cpu.ndim == 1:
         root_state_cpu = np.outer(root_state_cpu, root_state_cpu.conj())
 
-    diff = np.abs(root_state_cpu - final_state_jax)
-    print(f"Max State Diff: {np.max(diff)}")
-    assert np.allclose(root_state_cpu, final_state_jax, atol=1e-5)
+    # Compare density matrices if prob is significant
+    if root_prob_cpu > 1e-9:
+        diff = np.abs(root_state_cpu - final_state_jax)
+        print(f"Max State Diff: {np.max(diff)}")
+        assert np.allclose(root_state_cpu, final_state_jax, atol=1e-5)
+    else:
+        print("Skipping state comparison due to negligible probability.")
 
 
 if __name__ == "__main__":

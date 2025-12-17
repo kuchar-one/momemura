@@ -50,6 +50,17 @@ momemura is a high-performance framework for optimizing GKP (Gottesman-Kitaev-Pr
 - `--pnr-max`: Max PNR outcome (default 3).
 - `--modes`: Total number of modes (1 Signal + N-1 Controls) to simulate (default 3). Genotypes automatically scale to fit.
 - `--seed-scan`: Scan `output/` directory for high-fitness seeds from previous runs and inject them into the initial population (converting genotype designs if needed).
+- `--resume`: Path to a previous run directory (e.g., `output/2025...`) to resume optimization from the latest checkpoint.
+
+### Robust Optimization (Watchdog)
+For long-running optimizations, especially on multi-GPU setups where hangs can occur, use the **Watchdog** script. This script monitors the main process and restarts it if it hangs or crashes, ensuring the job completes.
+
+```bash
+python watchdog_mome.py --mode qdax --backend jax --pop 500 --iters 2000 --cutoff 25 --genotype A --debug
+# Add any other MOME arguments as needed.
+```
+The watchdog automatically handles resuming from the last checkpoint.
+
 
 **Dynamic Limits (Advanced):**
 - `--dynamic-limits`: Enable dynamic parameter limits. allows the optimizer to explore larger parameter ranges (e.g., r_scale=20, d_scale=20) by stimulating in a larger Hilbert space and penalizing leakage.

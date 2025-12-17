@@ -463,6 +463,20 @@ def jax_scoring_fn_batch(
     """
     n_devices = jax.local_device_count()
 
+    # Debug Log (only printed during tracing/exec)
+    # Ideally should be controlled by a debug flag, but simple print here is fine for now
+    # as this function is called once per chunk usually.
+    # Actually it's called every iteration if we put it inside loop, but here it's inside `score_batch`.
+    # `jax_scoring_fn_batch` is called by `scoring_fn` in `run_mome.py`.
+    # It constructs the graph.
+    # We want runtime logging.
+    # Using jax.debug.print is better for runtime.
+
+    def log_debug(msg, *args):
+        # Fallback if host_callback/debug.print is tricky?
+        # Standard print happens at trace time.
+        pass
+
     if n_devices <= 1:
         # Fallback to single-device JIT
         # Ensure config is hashable (dict -> tuple of items)
@@ -482,6 +496,7 @@ def jax_scoring_fn_batch(
 
     # Multi-GPU Logic
     # 1. Pad genotypes to be divisible by n_devices
+    # print(f"DEBUG: Using {n_devices} JAX devices.")
     batch_size = genotypes.shape[0]
     remainder = batch_size % n_devices
     padding = (n_devices - remainder) if remainder > 0 else 0
@@ -533,6 +548,9 @@ def jax_scoring_fn_batch(
         config_hashable = tuple(sorted(genotype_config.items()))
     else:
         config_hashable = genotype_config
+
+    # Explicitly log start of pmap execution
+    # jax.debug.print("DEBUG: Starting pmap on {n} devices, batch={b}", n=n_devices, b=batch_size)
 
     fitnesses_sharded, descriptors_sharded = pmapped_fn(
         g_sharded,

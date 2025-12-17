@@ -13,11 +13,11 @@ CUTOFF = 10
     "design_name, expected_length_fn",
     [
         ("legacy", lambda L: 256),
-        ("A", lambda L: 20 * L + 2),
-        ("B1", lambda L: 17 + 4 * L),
-        ("B2", lambda L: 17 + 5 * L),
-        ("C1", lambda L: 25),
-        ("C2", lambda L: 25 + L),
+        ("A", lambda L: 19 * L + 3),
+        ("B1", lambda L: 3 * L + 18),
+        ("B2", lambda L: 4 * L + 18),
+        ("C1", lambda L: 24),
+        ("C2", lambda L: 24 + L),
     ],
 )
 def test_genotype_lengths(design_name, expected_length_fn):

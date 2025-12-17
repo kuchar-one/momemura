@@ -234,8 +234,8 @@ class DesignAGenotype(BaseGenotype):
 
         # Global
         # Hom(1)
-        # Mix(Nodes * 4)
-        len_mix = (L - 1) * 4
+        # Mix(Nodes * 3)
+        len_mix = (L - 1) * 3
         # Final Gauss (5)
         len_final = 5
 
@@ -429,9 +429,9 @@ class DesignB1Genotype(BaseGenotype):
         # BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
         self.BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
 
-        # Mix = 4 * (L-1)
+        # Mix = 3 * (L-1)
 
-        return 1 + self.BP + 4 * (L - 1) + 5
+        return 1 + self.BP + 3 * (L - 1) + 5
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
         idx = 0
@@ -780,7 +780,7 @@ class DesignC1Genotype(BaseGenotype):
 
         params_shared = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
 
-        return 1 + params_shared + 4 + 5
+        return 1 + params_shared + 3 + 5
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
         idx = 0

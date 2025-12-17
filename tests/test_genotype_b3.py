@@ -32,7 +32,7 @@ def test_design_b3_structure():
     # Unique = 1 + 1 + 1 = 3
     # Length = 1 + 7 + 4*3 + 12 + 5 = 1 + 7 + 12 + 12 + 5 = 37
 
-    assert length == 37, f"Expected 37, got {length}"
+    assert length == 34, f"Expected 34, got {length}"
 
 
 def test_design_b3_independence():
