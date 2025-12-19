@@ -353,8 +353,17 @@ def _score_batch_shard(
         hom_win = params["homodyne_window"]
 
         # Point homodyne
-        phi_mat = jax_hermite_phi_matrix(jnp.array([hom_x]), sim_cutoff)
-        phi_vec = phi_mat[:, 0]
+        # Handle scalar or vector hom_x
+        hom_xs = jnp.atleast_1d(hom_x)
+        # jax_hermite_phi_matrix returns (cutoff, N) for input (N,)
+        phi_mat = jax_hermite_phi_matrix(hom_xs, sim_cutoff)
+
+        # If scalar original, we want (cutoff,)
+        if jnp.ndim(hom_x) == 0:
+            phi_vec = phi_mat[:, 0]
+        else:
+            # If vector, we want (N, cutoff) for compatibility with jax_superblock broadcasting
+            phi_vec = phi_mat.T
 
         V_matrix = jnp.zeros((sim_cutoff, 1))
         dx_weights = jnp.zeros(1)

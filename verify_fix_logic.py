@@ -1,5 +1,5 @@
-import jax
 import jax.numpy as jnp
+import qutip as qt
 from src.simulation.jax.composer import jax_superblock, jax_hermite_phi_matrix
 
 # Configuration
@@ -22,7 +22,7 @@ n_leaves = 8
 # No, easier to run jax_superblock with dummy inputs.
 
 # 1. Create Squeezed State (r=0.5)
-import qutip as qt
+
 
 state_sq = qt.squeeze(cutoff, 0.5) * qt.basis(cutoff, 0)
 vec_sq = jnp.array(state_sq.full().flatten())

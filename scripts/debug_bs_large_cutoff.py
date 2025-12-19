@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import numpy as np
 from src.simulation.jax.composer import jax_u_bs
 from src.utils.gkp_operator import construct_gkp_operator
 

@@ -2,16 +2,11 @@ import unittest
 import numpy as np
 import sys
 import os
-from scipy.special import eval_hermite
-import math
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from src.simulation.cpu.ops import (
-    annihilation_operator,
-    creation_operator,
-    build_beamsplitter_unitary,
     quadrature_vector,
     get_phi_matrix_cached,
 )

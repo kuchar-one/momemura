@@ -85,9 +85,34 @@ def _extract_to_expanded(g, name, depth, config):
 
         return hom_x, params_raw, mix_raw, final_raw, active_raw
 
+    elif name in ["0", "design0"]:
+        # 0: Hom(N_mix) + L*P_leaf_full + Mix + Final
+        hom_start = 0
+        hom_len = nodes
+        hom_x = g[hom_start : hom_start + hom_len]
+
+        block_size = decoder.P_leaf_full
+        blocks_start = hom_start + hom_len
+        blocks_len = L * block_size
+        blocks_raw = g[blocks_start : blocks_start + blocks_len].reshape(L, block_size)
+
+        active_raw = blocks_raw[:, 0]
+        params_raw = blocks_raw[:, 1:]
+
+        mix_start = blocks_start + blocks_len
+        mix_len = nodes * decoder.PN
+        mix_raw = g[mix_start : mix_start + mix_len].reshape(nodes, decoder.PN)
+
+        final_start = mix_start + mix_len
+        final_len = decoder.F
+        final_raw = g[final_start : final_start + final_len]
+
+        return hom_x, params_raw, mix_raw, final_raw, active_raw
+
     elif name in ["B1", "B2"]:
-        # B1: Hom(1) + Shared(BP) + Mix + Final
+        # ... existing B1/B2 logic ... (unchanged)
         shared_start = 1
+
         shared_len = decoder.BP
         shared_block = g[shared_start : shared_start + shared_len]
 
@@ -205,6 +230,30 @@ def _flatten_from_expanded(expanded, name, depth, config):
         parts.append(mix_raw.flatten())
         parts.append(final_raw)
 
+    elif name in ["0", "design0"]:
+        # 0: Hom(N_mix) + Blocks + Mix + Final
+        # Handle Hom broadcasting
+        nodes = 2**depth - 1
+        if hom_x.size == 1:
+            hom_expanded = np.repeat(hom_x, nodes)
+        elif hom_x.size == nodes:
+            hom_expanded = hom_x
+        else:
+            raise ValueError(
+                f"Mismatch hom_x size {hom_x.size} for target depth {depth}"
+            )
+
+        # Overwrite parts because we need extended hom
+        parts = [hom_expanded]
+
+        # Logic identical to A for rest
+        active_col = active_raw[:, None]
+        full_blocks = np.hstack([active_col, blocks_raw])
+        parts.append(full_blocks.flatten())
+
+        parts.append(mix_raw.flatten())
+        parts.append(final_raw)
+
     elif name in ["B1", "B2"]:
         # B: Shared Block?
         # WAIT. We have L blocks in `expanded`.
@@ -239,7 +288,6 @@ def _flatten_from_expanded(expanded, name, depth, config):
         # decoder = get_genotype_decoder("B3", depth=depth, config=config)
         # But we don't have decoder here easily? We passed depth/config.
         # We can instantiate dummy decoder to get lengths.
-        from src.genotypes.genotypes import get_genotype_decoder
 
         decoder = get_genotype_decoder("B3", depth=depth, config=config)
 

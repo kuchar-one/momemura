@@ -1,9 +1,7 @@
 import os
 import shutil
 import pytest
-import numpy as np
 import jax
-import jax.numpy as jnp
 from src.utils.result_manager import OptimizationResult
 from run_mome import run
 

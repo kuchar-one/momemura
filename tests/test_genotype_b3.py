@@ -1,5 +1,3 @@
-import pytest
-import jax
 import jax.numpy as jnp
 import numpy as np
 from src.genotypes.genotypes import DesignB3Genotype
@@ -46,8 +44,6 @@ def test_design_b3_independence():
 
     print(f"DEBUG: Genotype N_Control: {genotype.n_control}")
     print(f"DEBUG: Config: {genotype.config}")
-
-    L = 2
 
     # Calculate indices
     # Sharedv (N=2) = 1(TMSS) + 1(US) + 4(UC: 2*1+2) + 2(DispS) + 4(DispC) = 12

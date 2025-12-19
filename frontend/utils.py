@@ -317,7 +317,7 @@ def compute_state_with_jax(
     leaf_active = to_jax(params["leaf_active"])
 
     # Global Homodyne Params (used at mix nodes)
-    hom_x = to_scalar(params.get("homodyne_x", 0.0))
+    hom_x = to_jax(params.get("homodyne_x", 0.0))
 
     # Capture actual window value for probability scaling (Resolution)
     _raw_win = params.get("homodyne_window")
@@ -359,10 +359,6 @@ def compute_state_with_jax(
     # Where to get value? 'hom_win' var was set to None.
     # I need to retrieve the original value before I overwrote it.
 
-    # Wait, I overwrote hom_win in previous fix. I need to fix that first.
-    # See below for correct logic.
-    homodyne_resolution_is_none = True
-
     # Define legacy variables used later
     hom_x_val = hom_x
     hom_win_val = homodyne_res_val  # Use captured value, or 0.0?
@@ -370,8 +366,13 @@ def compute_state_with_jax(
         hom_win_val = 0.0  # Safety
 
     # Point homodyne setup
-    phi_mat = jax_hermite_phi_matrix(jnp.array([hom_x_val]), cutoff)
-    phi_vec = phi_mat[:, 0]
+    hom_xs = jnp.atleast_1d(hom_x_val)
+    phi_mat = jax_hermite_phi_matrix(hom_xs, cutoff)
+
+    if jnp.ndim(hom_x_val) == 0:
+        phi_vec = phi_mat[:, 0]
+    else:
+        phi_vec = phi_mat.T
 
     # Window setup
     V_matrix = jnp.zeros((cutoff, 1))

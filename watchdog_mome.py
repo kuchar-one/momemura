@@ -6,7 +6,6 @@ import os
 import signal
 import fcntl
 import select
-from pathlib import Path
 
 # Configuration
 TIMEOUT_SECONDS = (
@@ -51,7 +50,6 @@ def main():
         set_non_blocking(proc.stdout.fileno())
 
         last_output_time = time.time()
-        start_time = time.time()
 
         try:
             while True:

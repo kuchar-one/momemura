@@ -1,8 +1,5 @@
-import jax
 import jax.numpy as jnp
-import numpy as np
 from src.simulation.jax.runner import jax_get_heralded_state
-from src.simulation.jax.herald import vacuum_covariance
 
 
 def verify_pnr_mismatch():
@@ -34,7 +31,7 @@ def verify_pnr_mismatch():
 
     # Test 2: pnr_max = 3 (Buggy Backend Default)
     print("\n--- Test 2: pnr_max = 3 (Buggy) ---")
-    vec_bug, prob_bug, _, _, _, _ = jax_get_herald_state(params, cutoff=60, pnr_max=3)
+    vec_bug, prob_bug, _, _, _, _ = jax_get_heralded_state(params, cutoff=60, pnr_max=3)
     print(f"Prob (pnr_max=3): {prob_bug}")
 
     print(

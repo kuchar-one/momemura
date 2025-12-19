@@ -5,8 +5,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-import pytest
 from src.simulation.jax.composer import jax_u_bs, jax_apply_bs_vec, jax_compose_pair
 
 # Ensure we test in float32 as requested

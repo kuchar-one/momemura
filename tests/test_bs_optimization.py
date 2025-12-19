@@ -1,10 +1,10 @@
 import jax
 
 jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-import time
-from functools import partial
-from jax.scipy.linalg import expm
+import jax.numpy as jnp  # noqa: E402
+import time  # noqa: E402
+from functools import partial  # noqa: E402
+from jax.scipy.linalg import expm  # noqa: E402
 
 # ... (existing imports)
 
@@ -15,9 +15,9 @@ def jax_u_bs_expm(theta: float, phi: float, cutoff: int) -> jnp.ndarray:
     n = jnp.arange(1, cutoff)
     sqrt_n = jnp.sqrt(n)
     a_op = jnp.diag(sqrt_n, 1)
-    I = jnp.eye(cutoff)
-    a_big = jnp.kron(a_op, I)
-    b_big = jnp.kron(I, a_op)
+    Identity = jnp.eye(cutoff)
+    a_big = jnp.kron(a_op, Identity)
+    b_big = jnp.kron(Identity, a_op)
     bdag_big = b_big.conj().T
     term = jnp.exp(-1j * phi) * a_big @ bdag_big
     G = theta * (term - term.conj().T)
@@ -314,7 +314,6 @@ def _compute_d_block(N, n1s, theta, log_facts):
     # n1s is vector of n1 values.
     # We need all pairs (n1, m1) from n1s.
 
-    j = N / 2.0
     beta = -2 * theta
 
     # Grid of n1, m1

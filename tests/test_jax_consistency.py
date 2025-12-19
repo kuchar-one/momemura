@@ -6,11 +6,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from src.simulation.cpu.composer import Composer
 from src.simulation.jax.composer import (
-    jax_u_bs,
-    jax_apply_bs_vec,
     jax_superblock,
     jax_hermite_phi_matrix,
 )
@@ -25,7 +22,6 @@ def test_jax_superblock_consistency():
     """
     jax.config.update("jax_enable_x64", True)
     cutoff = 10
-    hbar = 2.0
 
     # 1. Setup Composer
     composer = Composer(cutoff=cutoff)

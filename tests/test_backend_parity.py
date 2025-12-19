@@ -3,11 +3,9 @@ import numpy as np
 import math
 from src.simulation.cpu.circuit import GaussianHeraldCircuit
 from src.simulation.cpu.composer import Composer, SuperblockTopology
-from src.simulation.jax.runner import jax_get_heralded_state
 
 try:
     import jax
-    import jax.numpy as jnp
 
     JAX_AVAILABLE = True
     jax.config.update("jax_enable_x64", True)

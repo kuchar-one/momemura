@@ -1,5 +1,4 @@
-from typing import Dict, Any, List
-import numpy as np
+from typing import Dict, Any
 
 
 def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> str:
@@ -108,7 +107,7 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
     # Final Gaussian
     if "final_gauss" in params:
         fg = params["final_gauss"]
-        lines.append(f"\n#### 3. Final Gaussian Ops")
+        lines.append("\n#### 3. Final Gaussian Ops")
         lines.append(f"- Squeezing: {fg}")  # Improve formatting if needed
 
     return "\n".join(lines)

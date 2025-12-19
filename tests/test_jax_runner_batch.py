@@ -5,8 +5,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-import pytest
 from src.simulation.jax.runner import jax_scoring_fn_batch
 
 

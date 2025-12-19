@@ -1,6 +1,5 @@
 import jax.numpy as jnp
 from src.utils.gkp_operator import construct_gkp_operator
-from src.simulation.jax.herald import vacuum_covariance, complex_alpha_to_qp
 import numpy as np
 
 

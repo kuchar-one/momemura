@@ -8,11 +8,9 @@ import jax.numpy as jnp
 import numpy as np
 from thewalrus.quantum import pure_state_amplitude as walrus_pure_state_amplitude
 from src.simulation.jax.herald import (
-    jax_get_heralded_state,
     jax_pure_state_amplitude,
     vacuum_covariance,
     two_mode_squeezer_symplectic,
-    expand_mode_symplectic,
     passive_unitary_to_symplectic,
     complex_alpha_to_qp,
 )
@@ -91,11 +89,10 @@ def test_compare():
         cov_np = np.array(cov)
 
         # Compute detQ for correlation check
-        from thewalrus.quantum import Qmat, Amat
+        from thewalrus.quantum import Qmat
 
         Q_walrus = Qmat(cov_np, hbar=hbar)
         sign, logdet = np.linalg.slogdet(Q_walrus)
-        detQ = np.exp(logdet)
 
         psi_walrus = np.zeros(cutoff, dtype=np.complex128)
         for n in range(cutoff):

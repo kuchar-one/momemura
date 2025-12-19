@@ -1,7 +1,7 @@
 import unittest
 import os
 import sys
-import numpy as np
+
 import matplotlib.pyplot as plt
 from unittest.mock import MagicMock
 
@@ -15,10 +15,10 @@ sys.modules["streamlit"] = MagicMock()
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from frontend import utils
-from frontend import visualizations as viz
-from src.utils.result_manager import OptimizationResult
-import jax.numpy as jnp
+from frontend import utils  # noqa: E402
+from frontend import visualizations as viz  # noqa: E402
+from src.utils.result_manager import OptimizationResult  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 
 
 class MockRepertoire:
@@ -45,7 +45,6 @@ class TestFrontend(unittest.TestCase):
     def test_load_and_process_run(self):
         # Create a temporary directory structure for testing
         import tempfile
-        import shutil
         import json
         import pickle
         import jax.numpy as jnp
@@ -69,6 +68,8 @@ class TestFrontend(unittest.TestCase):
             # We can mock it or use a dict if OptimizationResult handles it.
             # OptimizationResult expects: { "repertoire": ..., "history": ... }
             # "repertoire" needs .genotypes, .fitnesses, .descriptors
+
+            from qdax.core.containers.mapelites_repertoire import MapElitesRepertoire  # noqa: F401
 
             repertoire = MockRepertoire()
             # Set one valid
@@ -118,26 +119,6 @@ class TestFrontend(unittest.TestCase):
                     plt.close(fig)
                 except Exception as e:
                     print(f"Skipping circuit params test for dummy genotype: {e}")
-
-                # Test State Calculation
-                # This relies on thewalrus/numpy which are present
-                try:
-                    # Provide dummy params if result.get_circuit_params failed or returned garbage
-                    dummy_params = {
-                        "mix_params": np.zeros((3, 3)),
-                        "leaf_params": {
-                            "n_ctrl": [0],
-                            "tmss_r": [0],
-                            "us_phase": [0],
-                            "disp_s": [0],
-                        },
-                        "homodyne_x": 0,
-                        "homodyne_window": 0,
-                        # Need full structure... easier to skip if not robust
-                    }
-                    # ...
-                except ImportError:
-                    pass
 
             # Visualize (just check it calls the mocks)
             viz.px.scatter.return_value = MagicMock()

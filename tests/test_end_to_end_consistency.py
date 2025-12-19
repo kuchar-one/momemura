@@ -1,22 +1,13 @@
 import os
-import shutil
-import tempfile
 import pytest
 import numpy as np
-import pandas as pd
-from unittest.mock import patch, MagicMock
 
 # Import backend run logic
 from run_mome import run
 from src.utils.result_manager import OptimizationResult
 import frontend.utils as f_utils
-import jax
 
 
-@pytest.mark.skipif(
-    jax.default_backend() == "cpu",
-    reason="Skipping JAX optimization test on pure CPU if desired, but we want it.",
-)
 # Actually we can run JAX on CPU fine for small test.
 def test_end_to_end_consistency():
     """
@@ -113,7 +104,7 @@ def test_end_to_end_consistency():
         # So "LogProb" column IS -log10(P). (Positive value).
 
         stored_log_prob = row["LogProb"]
-        stored_exp = row["Expectation"]
+        # Expectation unused
 
         # Frontend Re-simulation
         # Must use correct pnr_max!

@@ -1,9 +1,5 @@
-import jax
 import jax.numpy as jnp
-import numpy as np
-import pytest
 from src.simulation.jax.runner import _score_batch_shard
-from src.utils.gkp_operator import construct_gkp_operator
 
 
 # Mock genotype decoder output
@@ -72,8 +68,6 @@ def test_dynamic_limits_penalty():
 
     # Create a dummy genotype vector
     # Random genotype
-    key = jax.random.PRNGKey(0)
-    g_dummy = jax.random.normal(key, (1, 60))  # approximate length
 
     # We need to manually construct a genotype vector that we KNOW produces high displacement.
     # Or we can test the logic by mocking the decoder?
@@ -93,7 +87,6 @@ def test_dynamic_limits_penalty():
 
     decoder = DesignB1Genotype(depth=3, config=genotype_config)
     L = decoder.get_length(3)
-    g = jnp.zeros((1, L))
 
     # B1 structure:
     # Hom(1)
@@ -141,8 +134,6 @@ def test_dynamic_limits_penalty():
     # Coherent state |2.5>. n=6.25.
     # Fits in 20. Leaks from 5.
     # Disp 2.5. d_scale=3.0. tanh(x)*3 = 2.5 -> tanh(x)=0.83 -> x approx 1.2.
-
-    g_med = jnp.ones((1, L)) * 1.2
 
     # Score Dynamic
     # Should detect leakage from 5.

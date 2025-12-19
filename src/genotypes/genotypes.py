@@ -204,11 +204,17 @@ class DesignAGenotype(BaseGenotype):
         super().__init__(depth, config)
         self.leaves = 2**depth
         self.nodes = self.leaves - 1
-        # P_leaf_full = 16 (active included), PN = 4, G = 1, Final = 5
-        # Note: P_leaf_full is 16 now (was 17)
-        self.P_leaf_full = 16
-        self.P_leaf_full = 16
-        self.PN = 3  # 4->3
+
+        # Calculate P_leaf_full dynamically
+        n_c = self.n_control
+        n_pairs = (n_c * (n_c - 1)) // 2
+        len_uc = 2 * n_pairs + n_c
+        len_disp_c = 2 * n_c
+        len_pnr = n_c
+        # Layout: Active(1), NCtrl(1), TMSS(1), US(1), UC, DispS(2), DispC, PNR
+        self.P_leaf_full = 1 + 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        self.PN = 3
         self.G = 1
         self.F = 5
 
@@ -947,6 +953,9 @@ GENOTYPE_REGISTRY = {
 def get_genotype_decoder(
     name: str, depth: int = 3, config: Dict[str, Any] = None
 ) -> BaseGenotype:
+    if name in ["0", "design0"]:
+        return Design0Genotype(depth=depth, config=config)
+
     cls = GENOTYPE_REGISTRY.get(name)
     if not cls:
         raise ValueError(f"Unknown genotype type: {name}")
@@ -954,3 +963,177 @@ def get_genotype_decoder(
     if name == "legacy":
         return cls(config=config)
     return cls(depth=depth, config=config)
+
+
+class Design0Genotype(DesignAGenotype):
+    """
+    Design 0: Identical to Design A, but with per-node Homodyne Detection.
+    Homodyne x is optimized for EACH mixing node (L-1 nodes).
+    Range: [-5, 5] (controlled by hx_scale).
+    """
+
+    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
+        super().__init__(depth, config)
+        # Ensure hx_scale defaults to 5.0 if not specified, as requested (-5 to 5)
+        if config is None or "hx_scale" not in config:
+            self.hx_scale = 5.0
+        # If config exists but key missing? Base class sets self.config.
+        # But BaseClass __init__ runs first.
+        # If user passed config without hx_scale, BaseClass used default 4.0.
+        # We want 5.0.
+        if config is None or "hx_scale" not in config:
+            self.hx_scale = 5.0
+
+    def get_length(self, depth: int = 3) -> int:
+        # Base length for A
+        # A has 1 global hom_x.
+        # We need (L-1) hom_x.
+        # So we add (L-1) - 1 = L-2 extra parameters?
+        # A Length = 1 + ...
+        # 0 Length = (L-1) + ...
+        # Difference is L-2.
+
+        base_len = super().get_length(depth)
+        L = 2**depth
+        return base_len + (L - 1) - 1
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        idx = 0
+
+        # 1. Per-Node Homodyne X
+        # Replaces global hom_x
+        n_nodes = self.nodes  # L-1
+
+        hom_x_raw = g[idx : idx + n_nodes]
+        idx += n_nodes
+
+        homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
+        homodyne_window = self.window
+
+        # 2. Leaves (Same as A)
+        # We can reuse A's decode logic for leaves/mix/final, but we need to offset the index?
+        # A's decode starts at idx=0 reading 1 hom_x.
+        # We read n_nodes hom_x.
+        # We can pass the rest of g to a partially modified decode?
+        # Or Just copy paste A's decode logic?
+        # A's decode is monolithic. Copying is safer than super() hacks on slicing.
+
+        # --- COPIED FROM DesignAGenotype (Starting after Homodyne) ---
+        n_leaves = self.leaves
+        n_ctrl_modes = self.n_control
+        n_uc_pairs = (n_ctrl_modes * (n_ctrl_modes - 1)) // 2
+        len_uc = 2 * n_uc_pairs + n_ctrl_modes
+        len_disp_c = 2 * n_ctrl_modes
+        len_pnr = n_ctrl_modes
+        n_leaf_params = 1 + 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        leaves_flat = g[idx : idx + n_leaves * n_leaf_params]
+        idx += n_leaves * n_leaf_params
+        leaves_reshaped = leaves_flat.reshape((n_leaves, n_leaf_params))
+
+        # Decode Leaf Block
+        # 0: Active
+        leaf_active = leaves_reshaped[:, 0] > 0.0
+
+        # 1: Num Controls
+        n_ctrl_raw = leaves_reshaped[:, 1]
+        norm_val = (n_ctrl_raw + 1.0) / 2.0
+        leaf_n_ctrl = jnp.round(norm_val * self.n_control).astype(jnp.int32)
+        leaf_n_ctrl = jnp.clip(leaf_n_ctrl, 0, self.n_control)
+
+        # 2: TMSS
+        tmss_r = jnp.tanh(leaves_reshaped[:, 2]) * self.r_scale
+
+        # 3: US Phase
+        us_phase = jnp.tanh(leaves_reshaped[:, 3:4]) * (jnp.pi / 2)
+
+        # 4...: UC Params
+        len_pairs = 2 * n_uc_pairs
+        len_uc = len_pairs + n_ctrl_modes
+        uc_slice = leaves_reshaped[:, 4 : 4 + len_uc]
+        idx_offset = 4 + len_uc
+
+        if n_uc_pairs > 0:
+            uc_pairs_raw = uc_slice[:, :len_pairs]
+            uc_theta = jnp.tanh(uc_pairs_raw[:, 0::2]) * (jnp.pi / 2)
+            uc_phi = jnp.tanh(uc_pairs_raw[:, 1::2]) * (jnp.pi / 2)
+        else:
+            uc_theta = jnp.zeros((n_leaves, 0))
+            uc_phi = jnp.zeros((n_leaves, 0))
+
+        uc_varphi_raw = uc_slice[:, len_pairs:]
+        uc_varphi = jnp.tanh(uc_varphi_raw) * (jnp.pi / 2)
+
+        # 6. Disp S
+        disp_s_slice = leaves_reshaped[:, idx_offset : idx_offset + 2]
+        idx_offset += 2
+        disp_s = (
+            jnp.tanh(disp_s_slice[:, 0]) * self.d_scale
+            + 1j * jnp.tanh(disp_s_slice[:, 1]) * self.d_scale
+        )
+        disp_s = disp_s[:, None]
+
+        # 7. Disp C
+        len_disp_c = 2 * n_ctrl_modes
+        disp_c_slice = leaves_reshaped[:, idx_offset : idx_offset + len_disp_c]
+        idx_offset += len_disp_c
+        disp_c = (
+            jnp.tanh(disp_c_slice[:, 0::2]) * self.d_scale
+            + 1j * jnp.tanh(disp_c_slice[:, 1::2]) * self.d_scale
+        )
+
+        # 8. PNR
+        len_pnr = n_ctrl_modes
+        pnr_slice = leaves_reshaped[:, idx_offset : idx_offset + len_pnr]
+        pnr_raw = jnp.clip(pnr_slice, 0.0, 1.0)
+        pnr = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
+
+        leaf_params = {
+            "n_ctrl": leaf_n_ctrl,
+            "tmss_r": tmss_r,
+            "us_phase": us_phase,
+            "uc_theta": uc_theta,
+            "uc_phi": uc_phi,
+            "uc_varphi": uc_varphi,
+            "disp_s": disp_s,
+            "disp_c": disp_c,
+            "pnr": pnr,
+            "pnr_max": jnp.full((n_leaves,), self.pnr_max, dtype=jnp.int32),
+        }
+
+        # 3. Mix Nodes
+        n_mix = self.nodes
+        mix_params_flat = g[idx : idx + n_mix * self.PN]
+        idx += n_mix * self.PN
+        mix_reshaped = mix_params_flat.reshape((n_mix, self.PN))
+
+        mix_angles = jnp.tanh(mix_reshaped[:, :3]) * (jnp.pi / 2)
+        mix_source = jnp.zeros(n_mix, dtype=jnp.int32)
+
+        # 4. Final Gaussian
+        final_raw = g[idx : idx + self.F]
+        idx += self.F
+        r_final = jnp.tanh(final_raw[0]) * self.r_scale
+        phi_final = jnp.tanh(final_raw[1]) * (jnp.pi / 2)
+        varphi_final = jnp.tanh(final_raw[2]) * (jnp.pi / 2)
+        disp_final = (
+            jnp.tanh(final_raw[3]) * self.d_scale
+            + 1j * jnp.tanh(final_raw[4]) * self.d_scale
+        )
+
+        final_gauss = {
+            "r": r_final,
+            "phi": phi_final,
+            "varphi": varphi_final,
+            "disp": disp_final,
+        }
+
+        return {
+            "homodyne_x": homodyne_x,  # Array (N,)
+            "homodyne_window": homodyne_window,
+            "mix_params": mix_angles,
+            "mix_source": mix_source,
+            "leaf_active": leaf_active,
+            "leaf_params": leaf_params,
+            "final_gauss": final_gauss,
+        }

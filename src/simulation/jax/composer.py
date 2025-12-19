@@ -486,10 +486,10 @@ def jax_superblock(
     leaf_total_pnr: jnp.ndarray,  # (8,) sum PNR for each leaf (NEW)
     leaf_modes: jnp.ndarray,  # (8,) mode count for each leaf (usually 1 or 2)
     mix_params: jnp.ndarray,  # (7, 3) theta, phi, varphi
-    homodyne_x: float,
+    homodyne_x: jnp.ndarray,  # (7,) or scalar
     homodyne_window: float,
     homodyne_resolution: float,
-    phi_vec: jnp.ndarray,
+    phi_vec: jnp.ndarray,  # (7, cutoff) or (cutoff,)
     V_matrix: jnp.ndarray,
     dx_weights: jnp.ndarray,
     cutoff: int,
@@ -501,6 +501,22 @@ def jax_superblock(
     Implements a fixed-depth binary tree of blocks (Depth 3 = 8 leaves).
     Returns (final_state, final_prob, joint_prob, active_modes_count, max_pnr, total_sum_pnr).
     """
+
+    # Broadcast homodyne args if scalars/single vectors
+    # This supports legacy (scalar hom_x) and new (vector hom_x)
+    n_nodes = mix_params.shape[0]  # Should be 7
+
+    # Ensure hom_x is array (N,)
+    hom_xs = jnp.atleast_1d(homodyne_x)
+    if hom_xs.ndim == 1 and hom_xs.shape[0] == 1:
+        hom_xs = jnp.broadcast_to(hom_xs, (n_nodes,))
+    elif hom_xs.ndim == 0:
+        hom_xs = jnp.broadcast_to(hom_xs, (n_nodes,))
+
+    # Ensure phi_vec is array (N, C)
+    phi_vecs = phi_vec
+    if phi_vecs.ndim == 1:
+        phi_vecs = jnp.broadcast_to(phi_vecs, (n_nodes, cutoff))
 
     # Helper to mix or pass
     def mix_node(
@@ -517,6 +533,8 @@ def jax_superblock(
         modesA,
         modesB,
         params,
+        hx,  # Per-node homodyne x
+        phi_v,  # Per-node phi vector
         # source removed
     ):
         # Implicit Source Logic:
@@ -540,9 +558,9 @@ def jax_superblock(
                 return jax_u_bs(theta, phi, cutoff)
 
             def dummy_U():
-                return jnp.zeros(
-                    (cutoff * cutoff, cutoff * cutoff), dtype=(jnp.zeros(1) + 1j).dtype
-                )
+                # Dynamically match dtype of construct_U (which depends on theta)
+                target_dtype = (theta + 0j).dtype
+                return jnp.zeros((cutoff * cutoff, cutoff * cutoff), dtype=target_dtype)
 
             U = jax.lax.cond(can_skip_U, dummy_U, construct_U)
 
@@ -552,10 +570,10 @@ def jax_superblock(
                 U,
                 probA,
                 probB,
-                homodyne_x,
+                hx,  # Use local hx
                 homodyne_window,
                 homodyne_resolution,
-                phi_vec,
+                phi_v,  # Use local phi_v
                 V_matrix,
                 dx_weights,
                 cutoff,
@@ -621,6 +639,8 @@ def jax_superblock(
     # Layer 0 (8 -> 4)
     n_pairs = 4
     params_0 = mix_params[mix_idx : mix_idx + n_pairs]
+    hx_0 = hom_xs[mix_idx : mix_idx + n_pairs]
+    phi_0 = phi_vecs[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
     sA = current_states[0::2]
@@ -645,12 +665,28 @@ def jax_superblock(
         current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_0
+        sA,
+        sB,
+        pA,
+        pB,
+        actA,
+        actB,
+        pnrA,
+        pnrB,
+        sumA,
+        sumB,
+        mA,
+        mB,
+        params_0,
+        hx_0,
+        phi_0,
     )
 
     # Layer 1 (4 -> 2)
     n_pairs = 2
     params_1 = mix_params[mix_idx : mix_idx + n_pairs]
+    hx_1 = hom_xs[mix_idx : mix_idx + n_pairs]
+    phi_1 = phi_vecs[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
     sA = current_states[0::2]
@@ -675,12 +711,28 @@ def jax_superblock(
         current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_1
+        sA,
+        sB,
+        pA,
+        pB,
+        actA,
+        actB,
+        pnrA,
+        pnrB,
+        sumA,
+        sumB,
+        mA,
+        mB,
+        params_1,
+        hx_1,
+        phi_1,
     )
 
     # Layer 2 (2 -> 1)
     n_pairs = 1
     params_2 = mix_params[mix_idx : mix_idx + n_pairs]
+    hx_2 = hom_xs[mix_idx : mix_idx + n_pairs]
+    phi_2 = phi_vecs[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
     sA = current_states[0::2]
@@ -705,7 +757,21 @@ def jax_superblock(
         current_sum_pnrs,
         current_modes,
     ) = jax.vmap(mix_node)(
-        sA, sB, pA, pB, actA, actB, pnrA, pnrB, sumA, sumB, mA, mB, params_2
+        sA,
+        sB,
+        pA,
+        pB,
+        actA,
+        actB,
+        pnrA,
+        pnrB,
+        sumA,
+        sumB,
+        mA,
+        mB,
+        params_2,
+        hx_2,
+        phi_2,
     )
 
     # Final result

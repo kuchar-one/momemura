@@ -983,16 +983,6 @@ def run(
             proportion_to_mutate=0.8,  # Higher = more genes mutated (was 0.6)
         )
 
-        # Adjust batch size for low memory
-        emitter_batch_size = pop_size if LOW_MEM else pop_size * 2
-
-        mixing_emitter = MixingEmitter(
-            mutation_fn=mutation_function,
-            variation_fn=crossover_function,
-            variation_percentage=1.0,
-            batch_size=emitter_batch_size,
-        )
-
         # --- SEEDING STRATEGY ---
         # 1. Vacuum Seed (Identity) -> Index 0
         from src.genotypes.converter import create_vacuum_genotype, upgrade_genotype
@@ -1114,6 +1104,39 @@ def run(
 
         # Store for metrics (closure will capture this)
         _n_achievable = n_achievable_bins
+
+        # --- EMITTER SETUP (Moved here to access n_achievable_bins) ---
+        # Adjust batch size for low memory
+        emitter_batch_size = pop_size if LOW_MEM else pop_size * 2
+
+        # Use Biased Emitter with Dynamic Aggressiveness
+        # Base Temp (High) -> Aggressive Temp (Low) as Coverage increases
+        try:
+            from src.optimization.emitters import BiasedMixingEmitter
+
+            print(
+                f"Using BiasedMixingEmitter with Dynamic Aggressiveness (Bins={n_achievable_bins})."
+            )
+            mixing_emitter = BiasedMixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=1.0,
+                batch_size=emitter_batch_size,
+                temperature=0.2,  # Fallback static temp
+                total_bins=n_achievable_bins,  # Enables dynamic logic
+                base_temp=5.0,
+                aggressive_temp=0.05,
+                start_pressure_at=0.05,  # Start ramp at 5% coverage
+                full_pressure_at=0.40,  # Max aggression at 40% coverage
+            )
+        except ImportError:
+            print("BiasedMixingEmitter not found, using standard MixingEmitter.")
+            mixing_emitter = MixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=1.0,
+                batch_size=emitter_batch_size,
+            )
 
         # Create local metrics function with correct achievable bins
         def local_metrics(repertoire):

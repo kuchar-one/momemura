@@ -613,7 +613,6 @@ def _recurrence_2d(shape, B, gamma, dtype):
     # Precompute constants
     b00, b01, b11 = B[0, 0], B[0, 1], B[1, 1]
     g0, g1 = gamma[0], gamma[1]
-    zero = jnp.array(0.0, dtype=dtype)
 
     def body_n0(n0, h_arr):
         # Safe reciprocal for n0 (avoid div by zero when n0=0)
