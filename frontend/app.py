@@ -136,6 +136,24 @@ def render_solution_details(row, result_obj, key_suffix=""):
 
 try:
     result = load_data(run_path)
+    # --- Main Analysis ---
+
+    # Calculate Stats
+    try:
+        stats = result.get_experiment_stats()
+        # Display Stats in Sidebar or top of Main? Sidebar is good for summary.
+        # But we are already past sidebar code block (usually sidebar is top).
+        # Let's add it to sidebar now using st.sidebar again.
+
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Experiment Statistics")
+        st.sidebar.markdown(f"**Total Solutions:** {stats['total_solutions']}")
+        st.sidebar.markdown(f"**Global Non-Dominated:** {stats['total_nondominated']}")
+        st.sidebar.markdown(f"**Total Generations:** {stats['total_generations']}")
+        st.sidebar.markdown(f"**Total Evaluations:** {stats['total_evaluations']}")
+    except Exception as e:
+        st.sidebar.error(f"Could not calculate stats: {e}")
+
     df = result.get_pareto_front()
 except Exception as e:
     st.error(f"Failed to load run data: {e}")
@@ -152,8 +170,18 @@ with col1:
     st.subheader("Global Pareto Front")
     # Interactive scatter
     fig_pareto = viz.plot_global_pareto(df)
-    # Enable selection
-    # on_select="rerun" ensures app reruns when user selects points
+
+    # If Aggregated, we have GlobalDominant column.
+    # If so, maybe update plot traces?
+    # Actually, plot_global_pareto is in `visualizations.py`. We should update IT.
+    # But we can pass color/symbol args via `hover_data` or similar if we modify it.
+    # Let's inspect viz.plot_global_pareto first?
+    # Assuming standard scatter.
+
+    # Override logic: IF 'GlobalDominant' in df, specific styling?
+    # Let's trust visualizations.py handles generic DF or we update visualizations.py.
+    # I'll update frontend/visualizations.py in next step.
+
     pareto_selection = st.plotly_chart(
         fig_pareto, use_container_width=True, on_select="rerun", key="pareto_plot"
     )

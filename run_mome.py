@@ -27,6 +27,7 @@ import matplotlib
 import pickle
 import shutil
 from pathlib import Path
+import signal
 
 # === Project imports ===
 from src.genotypes.genotypes import get_genotype_decoder
@@ -727,6 +728,10 @@ def run(
     max_chunk_size: int = 100,
     resume_path: str = None,
     debug: bool = False,
+    emitter_type: str = "hybrid",
+    hybrid_ratio: float = 0.2,
+    emitter_temp: float = 5.0,  # Base temp for Biased/Hybrid
+    output_root: str = "output",
 ) -> Any:
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
@@ -786,6 +791,8 @@ def run(
                 polynomial_crossover,
             )
             from qdax.core.emitters.standard_emitters import MixingEmitter
+            from src.optimization.emitters import BiasedMixingEmitter, HybridEmitter
+
             # import jax # Already imported globally
             # import jax.numpy as jnp # Already imported globally
         except Exception as e:
@@ -798,16 +805,34 @@ def run(
     emitter_state = None
     final_metrics = {}
     centroids = None
+    chunk_size = max_chunk_size
 
     # --- Output Directory Setup ---
     # Create structured output directory early for checkpoints and results
+    # Grouping: output/experiments/{genotype}_c{cutoff}_a{alpha}_b{beta}/{timestamp}_...
+
+    # Format alphas
+    a_str = f"{target_alpha:.2f}".replace(".", "p")
+    try:
+        b_val = float(np.abs(target_beta))
+    except Exception:
+        b_val = 0.0
+    b_str = f"{b_val:.2f}".replace(".", "p")
+
+    group_id = f"{genotype}_c{cutoff}_a{a_str}_b{b_str}"
+
     if resume_path:
         output_dir = resume_path
         print(f"Using existing output directory: {output_dir}")
     else:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        params_str = f"c{cutoff}_p{pop_size}_i{n_iters}"
-        output_dir = f"output/{timestamp}_{params_str}"
+        params_str = f"p{pop_size}_i{n_iters}"
+
+        # Base experiments folder
+        base_exp_dir = os.path.join(output_root, "experiments", group_id)
+        os.makedirs(base_exp_dir, exist_ok=True)
+
+        output_dir = os.path.join(base_exp_dir, f"{timestamp}_{params_str}")
         os.makedirs(output_dir, exist_ok=True)
         print(f"Created output directory: {output_dir}")
 
@@ -977,10 +1002,10 @@ def run(
         crossover_function = partial(polynomial_crossover, proportion_var_to_change=0.5)
         mutation_function = partial(
             polynomial_mutation,
-            eta=0.5,  # Lower = stronger mutations (was 1.0)
+            eta=10.0,  # Higher = smaller perturbations (finer tuning), was 0.2 (random)
             minval=-5.0,
             maxval=5.0,
-            proportion_to_mutate=0.8,  # Higher = more genes mutated (was 0.6)
+            proportion_to_mutate=0.3,  # Mutate 30% of genes (was 0.9)
         )
 
         # --- SEEDING STRATEGY ---
@@ -1005,9 +1030,15 @@ def run(
 
         # 2. Result Scanning
         if seed_scan:
-            # Find best candidates (mix of Exp and Prob?)
-            # Let's get top 20 by expectation
-            seeds = scan_results_for_seeds("output", top_k=20, metric="expectation")
+            # Seed from the specific group folder to ensure relevance
+            seed_source_dir = os.path.join("output", "experiments", group_id)
+
+            # Increase top_k to 50 as requested ("seed more")
+            seeds = scan_results_for_seeds(
+                seed_source_dir, top_k=50, metric="expectation"
+            )
+            # If nothing found in specific group, maybe fallback to global?
+            # User said "seed from the subfolder...". Stick to that for specificity.
 
             injected_count = 0
             # Start injecting at index 1
@@ -1051,8 +1082,8 @@ def run(
         if genotype_config and "pnr_max" in genotype_config:
             pnr_max_val = int(genotype_config["pnr_max"])
 
-        # Target ~10 bins for PNR dimension if range is large
-        n_bins_d2 = min(pnr_max_val + 1, 10)
+        # Target ~5 bins for PNR dimension (Coarse: Low/Med/High/Peak)
+        n_bins_d2 = min(pnr_max_val + 1, 5)
         d2 = jnp.linspace(0, pnr_max_val, n_bins_d2)
 
         # D3: Total Photons
@@ -1065,8 +1096,8 @@ def run(
         n_control = max(1, n_modes_val - 1)
         max_photons = max_active * pnr_max_val * n_control
 
-        # Target ~25 bins for Total dimension
-        n_bins_d3 = min(max_photons + 1, 25)
+        # Target ~10 bins for Total dimension (Coarse buckets)
+        n_bins_d3 = min(max_photons + 1, 10)
         d3 = jnp.linspace(0, max_photons, n_bins_d3)
 
         print(
@@ -1109,34 +1140,66 @@ def run(
         # Adjust batch size for low memory
         emitter_batch_size = pop_size if LOW_MEM else pop_size * 2
 
-        # Use Biased Emitter with Dynamic Aggressiveness
-        # Base Temp (High) -> Aggressive Temp (Low) as Coverage increases
-        try:
-            from src.optimization.emitters import BiasedMixingEmitter
+        # Emitter Selection
+        print(f"Using Emitter Type: {emitter_type}")
 
-            print(
-                f"Using BiasedMixingEmitter with Dynamic Aggressiveness (Bins={n_achievable_bins})."
-            )
-            mixing_emitter = BiasedMixingEmitter(
-                mutation_fn=mutation_function,
-                variation_fn=crossover_function,
-                variation_percentage=1.0,
-                batch_size=emitter_batch_size,
-                temperature=0.2,  # Fallback static temp
-                total_bins=n_achievable_bins,  # Enables dynamic logic
-                base_temp=5.0,
-                aggressive_temp=0.05,
-                start_pressure_at=0.05,  # Start ramp at 5% coverage
-                full_pressure_at=0.40,  # Max aggression at 40% coverage
-            )
-        except ImportError:
-            print("BiasedMixingEmitter not found, using standard MixingEmitter.")
+        if emitter_type == "standard":
+            print("  - Strategy: Uniform Selection")
             mixing_emitter = MixingEmitter(
                 mutation_fn=mutation_function,
                 variation_fn=crossover_function,
-                variation_percentage=1.0,
+                variation_percentage=0.5,
                 batch_size=emitter_batch_size,
             )
+
+        elif emitter_type == "biased":
+            print(f"  - Strategy: Biased (Rank-based) Selection (Temp={emitter_temp})")
+            mixing_emitter = BiasedMixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,
+                temperature=emitter_temp,
+                # Dynamic pressure config could be exposed too, using defaults for now
+                total_bins=n_achievable_bins
+                if genotype_config.get("dynamic_limits")
+                else None,
+            )
+
+        elif emitter_type == "hybrid":
+            print(f"  - Strategy: Hybrid (Uniform + Elite) | Ratio: {hybrid_ratio}")
+            # 1. Exploration (Standard)
+            exploration_emitter = MixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,  # HybridEmitter will resize this
+            )
+
+            # 2. Intensification (Biased/Elite)
+            # Use Low Temp for strict exploitation (~0.05 from previous logic)
+            # Or use dynamic? Let's use a fixed aggressive temp for the elite stream to ensure it works as "Elite"
+            elite_temp = 0.05
+            print(f"    -> Elite Stream Temp: {elite_temp}")
+
+            intensification_emitter = BiasedMixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,  # HybridEmitter will resize this
+                temperature=elite_temp,
+                # No dynamic pressure needed for elite stream, it's always aggressive
+            )
+
+            # 3. Hybrid Wrapper
+            mixing_emitter = HybridEmitter(
+                exploration_emitter=exploration_emitter,
+                intensification_emitter=intensification_emitter,
+                intensification_ratio=hybrid_ratio,
+                batch_size=emitter_batch_size,
+            )
+        else:
+            raise ValueError(f"Unknown emitter_type: {emitter_type}")
 
         # Create local metrics function with correct achievable bins
         def local_metrics(repertoire):
@@ -1354,161 +1417,173 @@ def run(
 
         # Ensure we don't compile `mome.update` via `jax.jit`.
 
-        for chunk_idx, chunk_len in enumerate(chunks):
-            # Run `chunk_len` steps in Python
-            chunk_metrics = {k: [] for k in init_metrics.keys()}
+        # Signal Handling for Graceful Shutdown
+        def signal_handler(signum, frame):
+            raise KeyboardInterrupt
 
-            # Unwrap MOME.update to avoid jit(pmap)
-            # mome.update is a bound method. __wrapped__ is the unbound function.
-            # We need to bind it or pass self.
-            if hasattr(mome.update, "__wrapped__"):
-                update_fn = partial(mome.update.__wrapped__, mome)
-            else:
-                update_fn = mome.update
+        signal.signal(signal.SIGTERM, signal_handler)
 
-            for _ in range(chunk_len):
-                # Update Step
-                # QDax MOME.update signature: (repertoire, emitter_state, key) -> (repertoire, emitter_state, metrics)
-                # It does NOT return the new key. We must manage the key splitting manually (like scan_update does).
+        try:
+            for chunk_idx, chunk_len in enumerate(chunks):
+                # Run `chunk_len` steps in Python
+                chunk_metrics = {k: [] for k in init_metrics.keys()}
 
-                key, subkey = jax.random.split(key)
+                # Unwrap MOME.update to avoid jit(pmap)
+                # mome.update is a bound method. __wrapped__ is the unbound function.
+                # We need to bind it or pass self.
+                if hasattr(mome.update, "__wrapped__"):
+                    update_fn = partial(mome.update.__wrapped__, mome)
+                else:
+                    update_fn = mome.update
 
-                repertoire, emitter_state, step_metrics = update_fn(
-                    repertoire, emitter_state, subkey
+                for _ in range(chunk_len):
+                    # Update Step
+                    # QDax MOME.update signature: (repertoire, emitter_state, key) -> (repertoire, emitter_state, metrics)
+                    # It does NOT return the new key. We must manage the key splitting manually (like scan_update does).
+
+                    key, subkey = jax.random.split(key)
+
+                    repertoire, emitter_state, step_metrics = update_fn(
+                        repertoire, emitter_state, subkey
+                    )
+
+                    # Accumulate metrics
+                    # step_metrics is a dict of scalars (or 0-d arrays)
+                    for k, v in step_metrics.items():
+                        chunk_metrics[k].append(v)
+
+                # Process Chunk Metrics
+                # Convert list of scalars to array for `all_metrics` extend
+                for k, v_list in chunk_metrics.items():
+                    # stack to get shape (chunk_len, ...) if needed, or just extend list
+                    # all_metrics stores flat lists usually or arrays?
+                    # Initialize: all_metrics = {k: []}
+                    # extend expects iterables. v_list is list of scalars.
+                    # But wait, `metrics` from scan was stacked (chunk_len, ...).
+                    # `all_metrics[k].extend(v)` worked because v was array.
+                    # Here v_list is list of JAX scalars.
+                    # We should convert to numpy/float to save memory?
+                    # Or keep as JAX arrays?
+                    # Let's convert to simple list of values to avoid device memory accumulation.
+                    if jax is not None:
+                        # Pull to host
+                        # v_list usually tuple of arrays? No, step_metrics values.
+                        # We use device_get to be safe.
+                        v_list_np = [jax.device_get(x) for x in v_list]
+                        if k not in all_metrics:
+                            all_metrics[k] = []
+                        all_metrics[k].extend(v_list_np)
+                    else:
+                        if k not in all_metrics:
+                            all_metrics[k] = []
+                        all_metrics[k].extend(v_list)
+
+                # --- Checkpointing at end of chunk ---
+                # Create checkpoint dict
+                # Move accumulated metrics update BEFORE checkpoint so we save it?
+                # Yes.
+
+                completed += chunk_len
+
+                # Save Checkpoint
+                try:
+                    # We use a temporary file to ensure atomic write
+                    chk_data = {
+                        "repertoire": repertoire,
+                        "emitter_state": emitter_state,
+                        "key": key,
+                        "completed_iters": completed,
+                        "pop_size": pop_size,
+                        "history": all_metrics,
+                    }
+
+                    # We need a directory to save checkpoint.
+                    # If resume_path is set, save THERE (overwrite).
+                    # If new run, save in NEW output_dir.
+                    # BUT output_dir is defined at end of script!
+                    # We must define output_dir EARLIER or use a dedicated checkpoint dir?
+                    # User wants to resume from "output/..."
+                    # So we should save to the current run's output directory.
+
+                    # Define output dir early?
+                    # We moved it up!
+                    current_output_dir = output_dir  # already defined local var
+
+                    # Ensure directory exists (paranoia check)
+                    if not os.path.exists(current_output_dir):
+                        print(
+                            f"WARNING: Output directory {current_output_dir} missing. Recreating."
+                        )
+                        os.makedirs(current_output_dir, exist_ok=True)
+
+                    # Temp file
+                    tmp_chk = Path(current_output_dir) / "checkpoint_tmp.pkl"
+                    final_chk = Path(current_output_dir) / "checkpoint_latest.pkl"
+
+                    with open(tmp_chk, "wb") as f:
+                        pickle.dump(chk_data, f)
+
+                    # Atomic rename
+                    shutil.move(tmp_chk, final_chk)
+
+                except Exception as e:
+                    print(f"Checkpoint prep failed: {e}")
+
+                # ETR Calculation
+
+                # Capture Pareto Front Snapshot
+                if completed % snapshot_interval == 0 or completed == n_iters:
+                    fits = np.array(repertoire.fitnesses)
+                    descs = np.array(repertoire.descriptors)
+
+                    flat_fits = fits.reshape(-1, fits.shape[-1])
+                    flat_descs = descs.reshape(-1, descs.shape[-1])
+                    valid_mask = flat_fits[:, 0] > -np.inf
+
+                    valid_fits = flat_fits[valid_mask]
+                    valid_descs = flat_descs[valid_mask]
+
+                    history_fronts.append((valid_fits, valid_descs))
+
+                # Print progress with ETR
+                # Print progress with ETR
+                # Use last val from chunk_metrics (dictionary of lists)
+                cov = float(chunk_metrics["coverage"][-1]) * 100
+                best_exp = float(chunk_metrics["min_expectation"][-1])
+                best_lp = float(chunk_metrics["min_log_prob"][-1])
+                best_prob = float(chunk_metrics["max_probability"][-1])
+
+                # Best fitness is -best_exp (since we minimize exp)
+                best_fit = -best_exp
+
+                # ETR Calculation
+                elapsed = time.time() - start_time
+                # completed is already updated
+                rate = completed / elapsed if elapsed > 0 else 0
+                remaining = n_iters - completed
+                etr_seconds = remaining / rate if rate > 0 else 0
+                etr_str = time.strftime("%H:%M:%S", time.gmtime(etr_seconds))
+
+                # Progress Bar
+                bar_len = 20
+                progress = completed / n_iters
+                filled = int(bar_len * progress)
+                bar = "=" * filled + "-" * (bar_len - filled)
+
+                print(
+                    f"[{bar}] Iter {completed}/{n_iters} | "
+                    f"Chunk: {time.time() - chunk_start_time:.1f}s | "
+                    f"ETA: {etr_str} | "
+                    f"Cov: {cov:.1f}% | "
+                    f"Exp: {best_exp:.4f} (vs GS: {best_exp - gs_eig:+.4f}, vs G: {best_exp - gaussian_limit:+.4f})",
+                    end="\r",
+                    flush=True,
                 )
 
-                # Accumulate metrics
-                # step_metrics is a dict of scalars (or 0-d arrays)
-                for k, v in step_metrics.items():
-                    chunk_metrics[k].append(v)
+                chunk_start_time = time.time()
 
-            # Process Chunk Metrics
-            # Convert list of scalars to array for `all_metrics` extend
-            for k, v_list in chunk_metrics.items():
-                # stack to get shape (chunk_len, ...) if needed, or just extend list
-                # all_metrics stores flat lists usually or arrays?
-                # Initialize: all_metrics = {k: []}
-                # extend expects iterables. v_list is list of scalars.
-                # But wait, `metrics` from scan was stacked (chunk_len, ...).
-                # `all_metrics[k].extend(v)` worked because v was array.
-                # Here v_list is list of JAX scalars.
-                # We should convert to numpy/float to save memory?
-                # Or keep as JAX arrays?
-                # Let's convert to simple list of values to avoid device memory accumulation.
-                if jax is not None:
-                    # Pull to host
-                    v_list_np = [jax.device_get(x) for x in v_list]
-                    if k not in all_metrics:
-                        all_metrics[k] = []
-                    all_metrics[k].extend(v_list_np)
-                else:
-                    if k not in all_metrics:
-                        all_metrics[k] = []
-                    all_metrics[k].extend(v_list)
-
-            # --- Checkpointing at end of chunk ---
-            # Create checkpoint dict
-            # Move accumulated metrics update BEFORE checkpoint so we save it?
-            # Yes.
-
-            completed += chunk_len
-
-            # Save Checkpoint
-            try:
-                # We use a temporary file to ensure atomic write
-                chk_data = {
-                    "repertoire": repertoire,
-                    "emitter_state": emitter_state,
-                    "key": key,
-                    "completed_iters": completed,
-                    "pop_size": pop_size,
-                    "history": all_metrics,
-                }
-
-                # We need a directory to save checkpoint.
-                # If resume_path is set, save THERE (overwrite).
-                # If new run, save in NEW output_dir.
-                # BUT output_dir is defined at end of script!
-                # We must define output_dir EARLIER or use a dedicated checkpoint dir?
-                # User wants to resume from "output/..."
-                # So we should save to the current run's output directory.
-
-                # Define output dir early?
-                # We moved it up!
-                current_output_dir = output_dir  # already defined local var
-
-                # Ensure directory exists (paranoia check)
-                if not os.path.exists(current_output_dir):
-                    print(
-                        f"WARNING: Output directory {current_output_dir} missing. Recreating."
-                    )
-                    os.makedirs(current_output_dir, exist_ok=True)
-
-                # Temp file
-                tmp_chk = Path(current_output_dir) / "checkpoint_tmp.pkl"
-                final_chk = Path(current_output_dir) / "checkpoint_latest.pkl"
-
-                with open(tmp_chk, "wb") as f:
-                    pickle.dump(chk_data, f)
-
-                # Atomic rename
-                shutil.move(tmp_chk, final_chk)
-
-            except Exception as e:
-                print(f"Checkpoint prep failed: {e}")
-
-            # ETR Calculation
-
-            # Capture Pareto Front Snapshot
-            if completed % snapshot_interval == 0 or completed == n_iters:
-                fits = np.array(repertoire.fitnesses)
-                descs = np.array(repertoire.descriptors)
-
-                flat_fits = fits.reshape(-1, fits.shape[-1])
-                flat_descs = descs.reshape(-1, descs.shape[-1])
-                valid_mask = flat_fits[:, 0] > -np.inf
-
-                valid_fits = flat_fits[valid_mask]
-                valid_descs = flat_descs[valid_mask]
-
-                history_fronts.append((valid_fits, valid_descs))
-
-            # Print progress with ETR
-            # Print progress with ETR
-            # Use last val from chunk_metrics (dictionary of lists)
-            cov = float(chunk_metrics["coverage"][-1]) * 100
-            best_exp = float(chunk_metrics["min_expectation"][-1])
-            best_lp = float(chunk_metrics["min_log_prob"][-1])
-            best_prob = float(chunk_metrics["max_probability"][-1])
-
-            # Best fitness is -best_exp (since we minimize exp)
-            best_fit = -best_exp
-
-            # ETR Calculation
-            elapsed = time.time() - start_time
-            # completed is already updated
-            rate = completed / elapsed if elapsed > 0 else 0
-            remaining = n_iters - completed
-            etr_seconds = remaining / rate if rate > 0 else 0
-            etr_str = time.strftime("%H:%M:%S", time.gmtime(etr_seconds))
-
-            # Progress Bar
-            bar_len = 20
-            progress = completed / n_iters
-            filled = int(bar_len * progress)
-            bar = "=" * filled + "-" * (bar_len - filled)
-
-            print(
-                f"[{bar}] Iter {completed}/{n_iters} | "
-                f"Chunk: {time.time() - chunk_start_time:.1f}s | "
-                f"ETA: {etr_str} | "
-                f"Cov: {cov:.1f}% | "
-                f"Exp: {best_exp:.4f} (vs GS: {best_exp - gs_eig:+.4f}, vs G: {best_exp - gaussian_limit:+.4f})",
-                end="\r",
-                flush=True,
-            )
-
-            chunk_start_time = time.time()
+        except KeyboardInterrupt:
+            print("\n\nOptimization interrupted (SIGINT/SIGTERM). Saving progress...")
 
         print("QDax MOME finished.")
 
@@ -1532,6 +1607,7 @@ def run(
         "target_alpha": str(target_alpha),
         "target_beta": str(target_beta),
         "genotype": genotype,  # Explicitly store seed config
+        "chunk_size": chunk_size,
     }
 
     # Modes handling for results
@@ -1543,6 +1619,9 @@ def run(
     # Merge genotype_config into main config for persistence
     if genotype_config:
         config.update(genotype_config)
+
+    # Explicitly store genotype name
+    config["genotype"] = genotype
 
     # Create Result object
     # Pass history_fronts if available (only in qdax mode)
@@ -1657,6 +1736,27 @@ def main():
         default=100,
         help="Maximum iterations per chunk for progress reporting (default: 100)",
     )
+    # Emitter Config
+    parser.add_argument(
+        "--emitter",
+        type=str,
+        default="hybrid",
+        choices=["standard", "biased", "hybrid"],
+        help="Emitter strategy to use.",
+    )
+    parser.add_argument(
+        "--hybrid-ratio",
+        type=float,
+        default=0.2,
+        help="Ratio of elite intensification (hybrid mode only).",
+    )
+    parser.add_argument(
+        "--emitter-temp",
+        type=float,
+        default=5.0,
+        help="Base temperature for biased emitter.",
+    )
+
     parser.add_argument(
         "--resume",
         type=str,
@@ -1758,6 +1858,9 @@ def main():
                 max_chunk_size=args.chunk_size,
                 resume_path=args.resume,
                 debug=args.debug,
+                emitter_type=args.emitter,
+                hybrid_ratio=args.hybrid_ratio,
+                emitter_temp=args.emitter_temp,
             )
         finally:
             jax.profiler.stop_trace()
@@ -1781,6 +1884,9 @@ def main():
             max_chunk_size=args.chunk_size,
             resume_path=args.resume,
             debug=args.debug,
+            emitter_type=args.emitter,
+            hybrid_ratio=args.hybrid_ratio,
+            emitter_temp=args.emitter_temp,
         )
 
 

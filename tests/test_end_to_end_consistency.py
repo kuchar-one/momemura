@@ -9,7 +9,7 @@ import frontend.utils as f_utils
 
 
 # Actually we can run JAX on CPU fine for small test.
-def test_end_to_end_consistency():
+def test_end_to_end_consistency(tmp_path):
     """
     Runs a baby optimization and verifies that the backend results (LogProb)
     match the frontend re-simulation results.
@@ -54,26 +54,31 @@ def test_end_to_end_consistency():
             genotype="A",
             genotype_config=genotype_config,
             seed_scan=False,
+            output_root=str(tmp_path),
             # debug=True
         )
     except Exception as e:
         pytest.fail(f"Optimization run failed: {e}")
 
     # 3. Find latest result
-    output_root = "output"
+    output_root = str(tmp_path)
     if not os.path.exists(output_root):
         pytest.fail("Output directory not found.")
 
-    subdirs = [
-        os.path.join(output_root, d)
-        for d in os.listdir(output_root)
-        if os.path.isdir(os.path.join(output_root, d))
-    ]
-    latest_subdir = max(subdirs, key=os.path.getmtime)
-    print(f"Analyzing results in: {latest_subdir}")
+    # Find result_dir with results.pkl
+    result_dir = None
+    for root, dirs, files in os.walk(output_root):
+        if "results.pkl" in files:
+            result_dir = root
+            break
+
+    if result_dir is None:
+        pytest.fail(f"Could not find results.pkl in {output_root}")
+
+    print(f"Analyzing results in: {result_dir}")
 
     # 4. Load Results
-    rm = OptimizationResult.load(latest_subdir)
+    rm = OptimizationResult.load(result_dir)
     try:
         df = rm.get_pareto_front()
     except Exception as e:

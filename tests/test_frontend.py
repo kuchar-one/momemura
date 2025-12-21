@@ -30,17 +30,19 @@ class MockRepertoire:
 
 class TestFrontend(unittest.TestCase):
     def test_list_runs(self):
-        # Ensure output directory exists and has at least one dummy run for this test
-        os.makedirs("output/dummy_test_run", exist_ok=True)
-        try:
-            runs = utils.list_runs("output")
+        # Create a temporary directory structure for testing
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Ensure output directory exists and has at least one dummy run for this test
+            dummy_run_path = os.path.join(tmp_dir, "dummy_test_run")
+            os.makedirs(dummy_run_path, exist_ok=True)
+
+            runs = utils.list_runs(tmp_dir)
             # Filter for our dummy run just in case
             self.assertTrue(len(runs) > 0)
             print(f"Found {len(runs)} runs.")
-        finally:
-            # Clean up dummy run
-            if os.path.exists("output/dummy_test_run"):
-                os.rmdir("output/dummy_test_run")
+            self.assertIn("dummy_test_run", runs)
 
     def test_load_and_process_run(self):
         # Create a temporary directory structure for testing

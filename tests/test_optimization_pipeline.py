@@ -1,36 +1,13 @@
 import os
 import shutil
+from pathlib import Path
 import pytest
 import jax
 from src.utils.result_manager import OptimizationResult
 from run_mome import run
 
 
-@pytest.fixture
-def clean_output():
-    # Cleanup output dir before/after test by backing it up
-    if os.path.exists("output"):
-        # Create a backup directory name with timestamp
-        import time
-
-        timestamp = int(time.time())
-        backup_dir = f"output_backup_{timestamp}"
-
-        # Rename current output to backup
-        print(f"Backing up 'output' to '{backup_dir}'")
-        shutil.move("output", backup_dir)
-
-    # Create fresh output directory
-    os.makedirs("output", exist_ok=True)
-
-    yield
-
-    # Optional: cleanup the fresh output after test
-    # if os.path.exists("output"):
-    #     shutil.rmtree("output")
-
-
-def test_optimization_pipeline_end_to_end(clean_output):
+def test_optimization_pipeline_end_to_end(tmp_path):
     """
     Verifies the full optimization loop:
     1. Run run_mome.py (short run)
@@ -43,6 +20,9 @@ def test_optimization_pipeline_end_to_end(clean_output):
     # Use random mode for speed, but backend=jax to test JAX path if available
     # If JAX not available, it falls back to random anyway.
 
+    # We pass strict output_root to avoid deleting user data
+    output_root = str(tmp_path)
+
     # We use a small population and few iters
     repertoire, _, metrics = run(
         mode="random",  # Use random to avoid QDax overhead/complexity for this smoke test
@@ -52,14 +32,27 @@ def test_optimization_pipeline_end_to_end(clean_output):
         cutoff=4,  # Small cutoff
         backend="jax" if jax is not None else "thewalrus",
         no_plot=False,  # We want to test plotting/saving
+        output_root=output_root,
     )
 
     # 2. Check output directory
     # Find the created directory in output/
-    assert os.path.exists("output")
-    subdirs = os.listdir("output")
-    assert len(subdirs) > 0
-    result_dir = os.path.join("output", subdirs[0])
+    assert os.path.exists(output_root)
+    # The structure is now output_root/experiments/group_id/timestamp
+    # We need to find the timestamp folder deep inside.
+    # scan recursively or check expected path
+
+    found_result = False
+    result_dir = None
+
+    # Walk to find results.pkl
+    for root, dirs, files in os.walk(output_root):
+        if "results.pkl" in files:
+            result_dir = root
+            found_result = True
+            break
+
+    assert found_result, f"Could not find results.pkl in {output_root}"
 
     assert os.path.exists(os.path.join(result_dir, "config.json"))
     assert os.path.exists(os.path.join(result_dir, "results.pkl"))
@@ -93,8 +86,9 @@ def test_optimization_pipeline_end_to_end(clean_output):
 
 
 if __name__ == "__main__":
-    # Manual run
-    if os.path.exists("output"):
-        shutil.rmtree("output")
-    test_optimization_pipeline_end_to_end(None)
+    # Manual run setup
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_optimization_pipeline_end_to_end(Path(tmpdir))
     print("Test passed!")

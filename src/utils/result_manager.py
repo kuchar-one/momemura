@@ -92,6 +92,41 @@ class OptimizationResult:
             history_fronts=data.get("history_fronts"),
         )
 
+    def get_experiment_stats(self) -> Dict[str, Any]:
+        """
+        Calculate summary statistics for this run.
+        """
+        df = self.get_pareto_front()
+        n_solutions = len(df)
+
+        # Determine Generation Count
+        n_gens = 0
+        if "min_expectation" in self.history:
+            n_chunks = len(self.history["min_expectation"])
+            chunk_size = int(self.config.get("chunk_size", 100))  # Default to 100
+            n_gens = n_chunks * chunk_size
+
+        pop_size = int(self.config.get("pop_size", 1))
+        n_evals = n_gens * pop_size
+
+        # Internal dominance check for single run
+        n_nondom = n_solutions
+        if n_solutions > 0:
+            objs = df[["Expectation", "LogProb"]].values
+            is_dominated = np.zeros(len(objs), dtype=bool)
+            A = objs[:, np.newaxis, :]
+            B = objs[np.newaxis, :, :]
+            dominates = np.all(A <= B, axis=2) & np.any(A < B, axis=2)
+            is_dominated = np.any(dominates, axis=0)
+            n_nondom = (~is_dominated).sum()
+
+        return {
+            "total_solutions": n_solutions,
+            "total_nondominated": int(n_nondom),
+            "total_generations": n_gens,
+            "total_evaluations": n_evals,
+        }
+
     def get_pareto_front(self) -> pd.DataFrame:
         """
         Retrieve the global Pareto front across all cells.
@@ -125,9 +160,9 @@ class OptimizationResult:
                 "LogProb": -valid_fit[:, 1],
                 "Complexity": -valid_fit[:, 2],
                 "TotalPhotons": -valid_fit[:, 3],
-                "Desc_TotalPhotons": valid_desc[:, 0],
-                "Desc_MaxPNR": valid_desc[:, 1],
-                "Desc_Complexity": valid_desc[:, 2],
+                "Desc_Complexity": valid_desc[:, 0],  # D1 is Complexity/ActiveModes
+                "Desc_MaxPNR": valid_desc[:, 1],  # D2 is MaxPNR
+                "Desc_TotalPhotons": valid_desc[:, 2],  # D3 is TotalPhotons
             }
         )
 
@@ -296,3 +331,175 @@ class OptimizationResult:
         temp_dir.rmdir()
 
         print(f"Saved animation to {filename}")
+
+
+class AggregatedOptimizationResult(OptimizationResult):
+    """
+    Manages aggregated results from multiple optimization runs (Experiment Group).
+    Merges their repertoires to form a global dataset.
+    """
+
+    def __init__(self, runs: List[OptimizationResult]):
+        if not runs:
+            raise ValueError("No runs provided for aggregation.")
+
+        # Use the most recent config as the base configuration (assuming consistent params)
+        # Sort runs by timestamp if possible, but they might not have it parsed.
+        # We assume the list is passed in order or we just take the last one.
+        base_run = runs[0]
+        super().__init__(
+            repertoire=None,  # We don't hold a single repertoire object
+            history={},  # Merged history is complex, we skip it for now
+            config=base_run.config,
+            centroids=base_run.centroids,  # Assuming same centroids
+            history_fronts=[],  # Aggregated history animation? Maybe later.
+        )
+        self.runs = runs
+        self._cached_valid_genotypes = None  # Will store concatenated genotypes
+
+    @classmethod
+    def load_group(cls, experiment_path: str):
+        """
+        Load all sub-runs from an experiment directory.
+        Expects subdirectories containing results.pkl.
+        """
+        experiment_path = Path(experiment_path)
+        sub_runs = []
+
+        # Walk subdirectories
+        for item in os.listdir(experiment_path):
+            sub_path = experiment_path / item
+            if sub_path.is_dir() and (sub_path / "results.pkl").exists():
+                try:
+                    run = OptimizationResult.load(str(sub_path))
+                    sub_runs.append(run)
+                except Exception as e:
+                    print(f"Skipping corrupt run {sub_path}: {e}")
+
+        if not sub_runs:
+            raise ValueError(f"No valid runs found in {experiment_path}")
+
+        print(f"Aggregated {len(sub_runs)} runs from {experiment_path}")
+        return cls(sub_runs)
+
+    def get_pareto_front(self) -> pd.DataFrame:
+        """
+        Aggregates valid solutions from ALL runs and computes a Global Pareto Front (conceptually).
+        Actually, aligns with user request to "load ALL THE SOLUTIONS".
+        We simply concatenate all valid solutions into one DataFrame.
+        """
+        all_dfs = []
+        all_genotypes = []
+
+        all_genotypes = []
+
+        for run in self.runs:
+            # We use the base class method to extract valid data from THIS run
+            # But we need to be careful about _cached_valid_genotypes
+
+            # Manually extract arrays to avoid side effects on the sub-run objects if needed
+            # But calling get_pareto_front() on sub-run is safe.
+            df = run.get_pareto_front()
+
+            if df.empty:
+                continue
+
+            # We need to map the global index back to (run_index, local_index)
+            # Or just concatenate genotypes and let get_circuit_params handle it by index.
+
+            # Store genotypes for this batch
+            all_genotypes.append(run._cached_valid_genotypes)
+
+            # Adjust index? No, we will rebuild the index after concat.
+            all_dfs.append(df)
+
+        if not all_dfs:
+            return pd.DataFrame()
+
+        # Concatenate DataFrames
+        final_df = pd.concat(all_dfs, ignore_index=True)
+
+        # Re-assign genotype_idx to be continuous 0..N
+        final_df["genotype_idx"] = np.arange(len(final_df))
+
+        # Concatenate Genotypes
+        # Each item in all_genotypes is (N_valid, D)
+        # We assume consistent D across runs (checked via config usually)
+        if jnp is not None:
+            self._cached_valid_genotypes = jnp.concatenate(all_genotypes, axis=0)
+        else:
+            self._cached_valid_genotypes = np.concatenate(all_genotypes, axis=0)
+
+        # Post-Processing: Compute Global Dominance
+        # Objectives: Expectation (min), LogProb (min)
+        # We assume minimizing both.
+        # N_points x 2
+        objs = final_df[["Expectation", "LogProb"]].values
+
+        is_dominated = np.zeros(len(objs), dtype=bool)
+
+        # Simple O(N^2) dominance check (N is usually reasonably small for Pareto fronts ~ 100-1000s)
+        # If N is huge, this might be slow, but for MOME analysis it's usually fine.
+        # A dominates B if A.exp <= B.exp and A.prob <= B.prob and (A.exp < B.exp or A.prob < B.prob)
+        # Here we deal with floats, so use epsilon?
+
+        # Vectorized check is faster
+        # Or use simple loop for clarity/safety against NaNs
+
+        # For now, let's mark it.
+        # "GlobalDominant" = True if not dominated by any other point in the aggregated set.
+
+        # Sort by first objective to speed up?
+        # Let's do a naive pass for robustness.
+
+        N = len(objs)
+        if N > 0:
+            # Broadcast comparison? N=1000 => 1M ops, fine.
+            # A (N, 1, 2) <= B (1, N, 2)
+            # all(<=) and any(<)
+            A = objs[:, np.newaxis, :]
+            B = objs[np.newaxis, :, :]
+
+            dominates = np.all(A <= B, axis=2) & np.any(A < B, axis=2)
+            # dominates[i, j] means i dominates j
+            # is_dominated[j] = any(dominates[:, j])
+            is_dominated = np.any(dominates, axis=0)
+
+        final_df["GlobalDominant"] = ~is_dominated
+
+        return final_df
+
+    def get_experiment_stats(self) -> Dict[str, Any]:
+        """
+        Aggregated statistics across all sub-runs.
+        """
+        df = self.get_pareto_front()
+        n_solutions = len(df)
+
+        # Global Dominant is computed in get_pareto_front
+        if "GlobalDominant" in df.columns:
+            n_nondom = df["GlobalDominant"].sum()
+        else:
+            n_nondom = n_solutions
+
+        total_gens = 0
+        total_evals = 0
+
+        for run in self.runs:
+            stats = run.get_experiment_stats()
+            total_gens += stats["total_generations"]
+            total_evals += stats["total_evaluations"]
+
+        return {
+            "total_solutions": n_solutions,
+            "total_nondominated": int(n_nondom),
+            "total_generations": total_gens,
+            "total_evaluations": total_evals,
+        }
+
+    def get_circuit_params(self, genotype_idx: int) -> Dict[str, Any]:
+        """
+        Retrieve parameters from the aggregated genotype cache.
+        """
+        # Logic matches base class, but uses the aggregated _cached_valid_genotypes
+        return super().get_circuit_params(genotype_idx)
