@@ -8,6 +8,7 @@ def scan_results_for_seeds(
     search_dir: str = "output",
     top_k: int = 10,
     metric: str = "expectation",  # 'expectation' or 'probability'
+    target_genotype: str = None,
 ) -> List[Tuple[np.ndarray, str, float]]:
     """
     Scans output directory for OptimizationResults and extracts best genotypes.
@@ -22,8 +23,8 @@ def scan_results_for_seeds(
     print(f"Scanning {search_dir} for seeds...")
 
     for root, dirs, files in os.walk(search_dir):
-        if "result.pkl" in files:
-            pkl_path = os.path.join(root, "result.pkl")
+        if "results.pkl" in files:
+            pkl_path = os.path.join(root, "results.pkl")
             try:
                 with open(pkl_path, "rb") as f:
                     data = pickle.load(f)
@@ -32,14 +33,32 @@ def scan_results_for_seeds(
                 # 1. Genotype Name (from config)
                 # 2. Repertoire (fitnesses, genotypes)
 
-                # Check structure (OptimizationResult object or dict?)
-                # It's usually an object, but pickle loads it as such.
-                if hasattr(data, "config"):
-                    config = data.config
-                elif isinstance(data, dict) and "config" in data:
-                    config = data["config"]
-                else:
-                    continue  # Unknown format
+                # OptimizationResult saves data as a DICT in results.pkl without config.
+                # Config is in config.json in the same folder.
+                config = {}
+
+                # Try to load config.json
+                config_path = os.path.join(root, "config.json")
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        import json
+
+                        config = json.load(f)
+
+                # Make sure we have config or at least defaults
+                if not config:
+                    # Fallback: check if data has config (legacy?)
+                    if hasattr(data, "config"):
+                        config = data.config
+                    elif isinstance(data, dict) and "config" in data:
+                        config = data["config"]
+
+                # If still no config, we might still proceed if we have repertoire?
+                # But we need config for genotype name. Default to legacy if empty.
+                if not config:
+                    # print(f"Warning: No config found for {pkl_path}")
+                    # Default dict is empty, will get "legacy" below.
+                    pass
 
                 # Extract Genotype Name
                 # run_mome uses "genotype_name" in adapter but config stores "mode"?
@@ -59,6 +78,9 @@ def scan_results_for_seeds(
                 # If genotype is missing, we assumes 'Legacy' or maybe heuristic?
                 # Actually, `run_mome.py` default was "legacy".
                 geno_name = config.get("genotype", "legacy")
+
+                if target_genotype and geno_name != target_genotype:
+                    continue
 
                 # Extract Candidates from Repertoire
                 repertoire = getattr(data, "repertoire", None)

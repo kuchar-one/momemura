@@ -732,6 +732,7 @@ def run(
     hybrid_ratio: float = 0.2,
     emitter_temp: float = 5.0,  # Base temp for Biased/Hybrid
     output_root: str = "output",
+    global_seed_scan: bool = False,
 ) -> Any:
     """Main runner supporting both QDax MOME and random search baseline."""
     np.random.seed(seed)
@@ -1030,15 +1031,26 @@ def run(
 
         # 2. Result Scanning
         if seed_scan:
-            # Seed from the specific group folder to ensure relevance
-            seed_source_dir = os.path.join("output", "experiments", group_id)
+            # Determine source directory
+            if global_seed_scan:
+                # Scan all experiments under the output root
+                seed_source_dir = os.path.join(output_root, "experiments")
+                print(
+                    f"  - GLOBAL SCAN enabled. Scanning matches in: {seed_source_dir}"
+                )
+            else:
+                # Seed from the specific group folder to ensure relevance
+                seed_source_dir = os.path.join(output_root, "experiments", group_id)
+                print(f"  - Scanning seeds in group: {seed_source_dir}")
 
             # Increase top_k to 50 as requested ("seed more")
+            # Filter by matching genotype to ensure relevance
             seeds = scan_results_for_seeds(
-                seed_source_dir, top_k=50, metric="expectation"
+                seed_source_dir,
+                top_k=50,
+                metric="expectation",
+                target_genotype=genotype,
             )
-            # If nothing found in specific group, maybe fallback to global?
-            # User said "seed from the subfolder...". Stick to that for specificity.
 
             injected_count = 0
             # Start injecting at index 1
@@ -1766,6 +1778,11 @@ def main():
     parser.add_argument(
         "--debug", action="store_true", help="Enable verbose debug logging."
     )
+    parser.add_argument(
+        "--global-seed-scan",
+        action="store_true",
+        help="Scan ALL experiment subfolders for seeds matching genotype.",
+    )
 
     args = parser.parse_args()
     print(
@@ -1887,6 +1904,7 @@ def main():
             emitter_type=args.emitter,
             hybrid_ratio=args.hybrid_ratio,
             emitter_temp=args.emitter_temp,
+            global_seed_scan=args.global_seed_scan,
         )
 
 

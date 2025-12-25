@@ -26,17 +26,65 @@ def list_runs(output_dir: str = "output") -> List[str]:
     ]
     # Sort by timestamp (descending)
     runs.sort(reverse=True)
+
+    # Also scan for "experiments" folder and include its subfolders?
+    # Or just `output/experiments/GROUP_ID`.
+    # Let's check `output/experiments` if it exists.
+    exp_dir = os.path.join(output_dir, "experiments")
+    if os.path.exists(exp_dir):
+        exp_groups = [
+            f"experiments/{d}"
+            for d in os.listdir(exp_dir)
+            if os.path.isdir(os.path.join(exp_dir, d)) and not d.startswith(".")
+        ]
+        exp_groups.sort(reverse=True)
+        # Prepend experiment groups to the list
+        runs = exp_groups + runs
+
     return runs
 
 
 def load_run(run_dir: str) -> OptimizationResult:
-    """Load OptimizationResult from a run directory."""
-    return OptimizationResult.load(run_dir)
+    """
+    Load OptimizationResult from a run directory.
+    Detects if it's a single run or an experiment group.
+    """
+    # Check if run_dir contains 'experiments' part or if it has subfolders with results
+    # Better logic: Check if run_dir contains 'results.pkl' DIRECTLY.
+    # If not, check if children have 'results.pkl'.
+
+    path = (
+        os.path.join(project_root, run_dir) if not os.path.isabs(run_dir) else run_dir
+    )
+
+    if os.path.exists(os.path.join(path, "results.pkl")):
+        return OptimizationResult.load(path)
+
+    # Check for subdirs
+    has_subruns = False
+    if os.path.isdir(path):
+        for item in os.listdir(path):
+            sub = os.path.join(path, item)
+            if os.path.isdir(sub) and os.path.exists(os.path.join(sub, "results.pkl")):
+                has_subruns = True
+                break
+
+    if has_subruns:
+        # Import dynamically to avoid circular issues if any (though result_manager is safe)
+        from src.utils.result_manager import AggregatedOptimizationResult
+
+        return AggregatedOptimizationResult.load_group(path)
+
+    raise ValueError(f"No valid run found at {path}")
 
 
 def to_scalar(x: Any) -> Any:  # Union[float, complex]
     """Safely convert x to a scalar float or complex."""
     try:
+        # 0. Handle None
+        if x is None:
+            return 0.0
+
         # 1. Exact Scalar types
         if isinstance(x, (float, complex, int)) and not isinstance(x, bool):
             return x
@@ -164,7 +212,18 @@ def _extract_active_leaf_params(params: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(arr, list) and len(arr) > idx:
             val = arr[idx]
         else:
-            val = arr  # Fallback
+            # Fallback: if it's a scalar, return it.
+            # If it's a container (list/array) and we missed bounds, return None (safe default)
+            is_container = False
+            if isinstance(arr, list):
+                is_container = True
+            elif hasattr(arr, "ndim") and arr.ndim > 0:
+                is_container = True
+
+            if is_container:
+                val = None  # Out of bounds
+            else:
+                val = arr  # Scalar fallback
 
         # Check if we need to unwrap inner dimension (e.g. for us_phase which is (L, 1))
         # If val is a list of len 1, or array of shape (1,)

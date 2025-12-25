@@ -74,6 +74,21 @@ To profile the optimization loop:
 python scripts/profile_mome.py
 ```
 
+## Frontend Visualization
+
+Momemura includes an interactive Streamlit frontend for analyzing optimization results.
+
+```bash
+streamlit run frontend/app.py
+```
+
+Features:
+- **Global Pareto Front**: Explore trade-offs interactively.
+- **Detailed Solution View**: Inspect circuit topology, parameters, and **Wigner functions** (simulated vs. target).
+- **Heatmaps**: Analyze performace across the complexity/photon-count grid.
+
+See `docs/frontend.md` for details.
+
 ## Project Structure
 
 - `src/genotypes`: Genotype definitions (Canonical Designs A, B, C).

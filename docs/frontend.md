@@ -11,7 +11,13 @@ The frontend allows you to:
 - **Inspect Solutions**: Select individual points to view:
     - Detailed metrics (Expectation, LogProb, etc.)
     - Reconstructed **Circuit Diagrams** (using `GaussianHeraldCircuit`).
-    - **Wigner Functions** of the heralded state (calculated on-the-fly via `qutip`).
+    - **Wigner Functions** (High-Definition Heatmaps):
+        - **Simulated State**: The output state of the circuit.
+        - **Target State**: The ground state of the target GKP operator (for side-by-side comparison).
+        - **Visuals**: Uses a custom plateau colormap to cleanly separate positive/negative regions from vacuum noise.
+
+## Automatic Parameter Parsing
+The frontend automatically detects the **Target GKP parameters** (`alpha`, `beta`) from the **folder name** of the selected run (e.g., `run_alpha_2.0_beta_0.0`). This ensures the "Target State" visualization always matches the optimization intent, even if the config file is generic.
 
 ## Installation
 

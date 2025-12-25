@@ -40,7 +40,19 @@ def upgrade_genotype(
     if source_name == target_name:
         return source_g.copy()
 
-    if "legacy" in source_name.lower() or "legacy" in target_name.lower():
+    # Try heuristic for legacy mismatch
+    if "legacy" in source_name.lower():
+        # If lengths match, assume it's actually the same genotype just mislabeled
+        dec = get_genotype_decoder(target_name, depth, config)
+        if len(source_g) == dec.get_length(depth):
+            return source_g.copy()
+
+        # Otherwise real legacy conversion (not supported)
+        raise NotImplementedError(
+            "Conversion involving 'Legacy' structure is not supported."
+        )
+
+    if "legacy" in target_name.lower():
         raise NotImplementedError("Conversion involving 'Legacy' is not supported.")
 
     # Step 1: Extract "Expanded" from Source

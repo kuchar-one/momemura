@@ -13,7 +13,7 @@ def omega_matrix(num_modes: int) -> np.ndarray:
     Omega = block_diag([ [0,1], [-1,0] , ... ]).
     """
     N = int(num_modes)
-    Omega = np.zeros((2 * N, 2 * N), dtype=np.float64)
+    Omega = np.zeros((2 * N, 2 * N), dtype=np.float32)
     for m in range(N):
         i = 2 * m
         j = i + 1
@@ -61,7 +61,7 @@ def expand_mode_symplectic(
     mode_indices are integers in 0..N-1; total_modes = N.
     """
     N = int(total_modes)
-    big = np.eye(2 * N, dtype=np.float64)
+    big = np.eye(2 * N, dtype=np.float32)
     # small_m = len(mode_indices)
     for a_i, ma in enumerate(mode_indices):
         for a_j, mb in enumerate(mode_indices):
@@ -103,8 +103,8 @@ def complex_alpha_to_qp(alpha: Sequence[complex]) -> np.ndarray:
         q = 2 Re(alpha), p = 2 Im(alpha).
     Returns array shaped (2*N,), ordering [q0,p0,q1,p1,...].
     """
-    alpha = np.asarray(alpha, dtype=np.complex128)
-    qp = np.empty(2 * alpha.size, dtype=np.float64)
+    alpha = np.asarray(alpha, dtype=np.complex64)
+    qp = np.empty(2 * alpha.size, dtype=np.float32)
     for i, a in enumerate(alpha):
         qp[2 * i] = 2.0 * np.real(a)
         qp[2 * i + 1] = 2.0 * np.imag(a)
@@ -121,8 +121,8 @@ def interleaved_to_xp(
 
     Returns (mu_xp, cov_xp).
     """
-    mu_ip = np.asarray(mu_ip)
-    cov_ip = np.asarray(cov_ip)
+    mu_ip = np.asarray(mu_ip, dtype=np.float32)
+    cov_ip = np.asarray(cov_ip, dtype=np.float32)
     if mu_ip.ndim != 1:
         raise ValueError("mu must be a 1D array")
     N2 = mu_ip.size
@@ -140,7 +140,7 @@ def interleaved_to_xp(
         mu_xp[N + m] = mu_ip[2 * m + 1]
 
     # For covariance, we need permutation matrix P such that cov_xp = P cov_ip P^T
-    P = np.zeros((2 * N, 2 * N), dtype=np.float64)
+    P = np.zeros((2 * N, 2 * N), dtype=np.float32)
     # q's
     for m in range(N):
         # source index 2*m maps to target index m
@@ -162,7 +162,7 @@ def xp_to_interleaved(S_xp: np.ndarray) -> np.ndarray:
 
     Returns the converted matrix S_ip.
     """
-    S_xp = np.asarray(S_xp)
+    S_xp = np.asarray(S_xp, dtype=np.float32)
     if S_xp.ndim != 2 or S_xp.shape[0] != S_xp.shape[1]:
         raise ValueError("S_xp must be a square 2N x 2N matrix.")
     N2 = S_xp.shape[0]
@@ -176,7 +176,7 @@ def xp_to_interleaved(S_xp: np.ndarray) -> np.ndarray:
     # mu_xp[i] = mu_ip[perm[i]]
     # So P[i, perm[i]] = 1 is correct for mu_xp = P @ mu_ip.
 
-    P = np.zeros((2 * N, 2 * N), dtype=np.float64)
+    P = np.zeros((2 * N, 2 * N), dtype=np.float32)
     # q's: target m (0..N-1) comes from source 2*m
     for m in range(N):
         P[m, 2 * m] = 1.0

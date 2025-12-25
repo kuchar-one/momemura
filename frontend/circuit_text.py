@@ -14,9 +14,23 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
     if "homodyne_x" in params:
         from frontend import utils  # Ensure import if moving scope
 
-        hx = utils.to_scalar(params["homodyne_x"])
-        win = utils.to_scalar(params.get("homodyne_window", 0.0))
-        lines.append(f"- **Homodyne Measurement**: X={hx:.4f}, Window={win:.4f}")
+        hx_val = params["homodyne_x"]
+        if hasattr(hx_val, "__len__") and not isinstance(hx_val, str):
+            # It's a vector (Design 0)
+            try:
+                hx_str = str(list(hx_val))
+            except:
+                hx_str = str(hx_val)
+            # Show abbreviated if too long?
+            if len(hx_str) > 50:
+                hx_str = hx_str[:47] + "..."
+            lines.append(
+                f"- **Homodyne Measurement**: X=[Vector], Window={utils.to_scalar(params.get('homodyne_window', 0.0)):.4f}"
+            )
+        else:
+            hx = utils.to_scalar(hx_val)
+            win = utils.to_scalar(params.get("homodyne_window", 0.0))
+            lines.append(f"- **Homodyne Measurement**: X={hx:.4f}, Window={win:.4f}")
 
     # Helper to describe a leaf
     def describe_leaf(idx):

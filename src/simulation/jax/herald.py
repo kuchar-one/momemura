@@ -256,252 +256,51 @@ def jax_pure_state_amplitude(
     gamma = gamma.astype(dtype)
     common_dtype = dtype
 
-    # 2. Setup recurrence
-    # We need to compute amplitudes for indices (n_sig_1, ..., n_sig_k, pnr_1, ..., pnr_m)
-    # The total number of modes is N.
-    # We assume signal modes are first, then control modes.
-    # This assumption must be enforced by the caller (GaussianHeraldCircuit).
-    # GaussianHeraldCircuit builds state as [signal, control].
-
+    # 2. Setup shape
     N = mu.shape[0] // 2
     n_sig = N - len(pnr_outcome)
-    # n_ctrl = len(pnr_outcome) # Unused variable
-
-    # Define max indices for each mode
-    # Signal modes go up to cutoff-1.
-    # Control modes go up to pnr_outcome[i].
-    # But recurrence requires neighbors.
-    # To get (n, m), we need (n-1, m) and (n, m-1).
-    # So we need to compute the full tensor up to [cutoff-1, ..., pnr_outcome].
 
     shape = [cutoff] * n_sig + [p + 1 for p in pnr_outcome]
 
-    # We can't easily vectorize the recurrence in JAX because of dependencies.
-    # However, we can use `jax.lax.scan` or just a loop if N is small.
-    # Since N is usually 2-4, we can loop over total photon number?
-    # Or use a flat buffer and index logic?
-    # Or just use `thewalrus` loop hafnian logic but in JAX?
-    # No, recurrence is better.
+    # 3. Calculate prefactor
+    scale = jnp.sqrt(2 * hbar)
+    N_modes = mu.shape[0] // 2
+    q = mu[:N_modes]
+    p = mu[N_modes:]
+    alpha = (q + 1j * p) / scale
 
-    # Let's use a simplified approach:
-    # If we have 1 signal, 1 control (common case).
-    # Shape is (cutoff, pnr+1).
-    # H[i, j] depends on H[i-1, j] and H[i, j-1].
-    # We can compute diagonal by diagonal? Or row by row?
-    # Row by row works.
-
-    # But for general N, it's harder.
-    # Let's implement a generic recurrence solver using `jax.lax.scan` over a flattened index?
-    # No, that's slow.
-
-    # Alternative:
-    # Use the fact that H_n(B, gamma) is the coefficient of ...
-    # Maybe we can compute it iteratively.
-    # H_0 = 1 (scaled by prefactor).
-    # H_{n+ei} = gamma_i H_n + sum_j B_ij n_j H_{n-ej}
-
-    # We can iterate over total photon number K = sum(n).
-    # For k = 0 to max_photons:
-    #   Compute all H_n with sum(n) = k.
-    # This allows parallelization within each k-shell.
-
-    # But implementing this in JAX for variable N is tricky.
-    # For now, let's assume N is small and unroll?
-    # Or support only specific cases (1 sig, 1 ctrl)?
-    # The user wants general support.
-
-    # Let's use a tensor update.
-    # Initialize H = zeros(shape).
-    # H[0,0,...] = prefactor.
-    # Then iterate.
-    # But we can't mutate arrays in JAX.
-    # We need to carry the state.
-
-    # Actually, for `cutoff=25`, the tensor is small enough to fit in memory.
-    # We can use `jax.lax.fori_loop`?
-
-    # Let's compute the prefactor first.
-    # prefactor = exp(-0.5 * (|alpha|^2 - alpha* @ B @ alpha*)) / sqrt(det(Q))
-    # Wait, pure_state_amplitude has a prefactor.
-    # pref = exp(...)
-    # And denominator sqrt(prod(n!) * sqrt(det(Q))).
-
-    # Let's compute H_unnorm first (just the Hermite part).
-    # H_0 = 1.
-
-    # We need a way to fill the tensor.
-    # Since we need generic N, maybe we can map the multi-index to linear index?
-    # Or just use nested loops (unrolled by JAX if static)?
-    # `pnr_outcome` is static tuple? No, it varies.
-    # But `len(pnr_outcome)` is static (compiled).
-    # `cutoff` is static.
-
-    # If N is small (e.g. <= 4), we can generate the loops at compile time.
-    # We can use `itertools.product` to generate indices in topological order (e.g. by sum).
-
-    # 3. Compute prefactor
-    # pref = exp(-0.5 * (|alpha|^2 - alpha* @ B @ alpha*)) / sqrt(det(Q))
-    # Note: alpha is complex.
-    alpha = complex_to_real_displacements(mu, hbar)
-    # thewalrus: pref = np.exp(-0.5 * (np.linalg.norm(alpha)**2 - alpha.conj() @ B @ alpha.conj()))
-    # We need Q det too.
     Q = Qmat(cov, hbar)
-    # det(Q) might be large/small, better use slogdet?
-    sign, logdet = jnp.linalg.slogdet(Q)
-    # Prefactor calculation
-    # TheWalrus uses a prefactor scaling of 1/det(Q)^(1/4).
-    # Q is the Q matrix from Qmat (matching thewalrus convention).
-
-    # term1 = |alpha|^2
-    term1 = jnp.sum(jnp.abs(alpha) ** 2)
-    # term2 = alpha* @ B @ alpha*
-    term2 = jnp.dot(alpha.conj(), jnp.dot(B, alpha.conj()))
-
-    sign, logdet = jnp.linalg.slogdet(Q)
-    # detQ_fourth = det(Q)^(1/4)
+    _, logdet = jnp.linalg.slogdet(Q)
     detQ_fourth = jnp.exp(0.25 * logdet)
+    prefactor = (
+        jnp.exp(-0.5 * (jnp.sum(jnp.abs(alpha) ** 2) - alpha.conj() @ B @ alpha.conj()))
+        / detQ_fourth
+    )
 
-    prefactor = jnp.exp(-0.5 * (term1 - term2)) / detQ_fourth
-
-    # 4. Fill tensor using recurrence
-    # H_{n+ei} = gamma_i H_n + sum_j B_ij n_j H_{n-ej}
-    # We use nested loops.
-    # Since N is dynamic (but small), we can't write explicit loops.
-    # We use a recursive helper to build the loops.
-
-    # Initialize tensor with zeros
-    # We need to handle complex numbers
-    H = jnp.zeros(shape, dtype=common_dtype)
-
-    # Set H[0,0,...] = 1 (we multiply by pref later)
-    # Actually, let's set H[0...0] = 1.
-    # But we can't mutate.
-    # We need to use .at[].set() which is functional.
-    # But inside loops, we need to carry H.
-
-    # Recursive loop builder
-    def build_loops(dim, current_idx, H_acc):
-        # dim: current dimension we are looping over (0 to N-1)
-        # current_idx: tuple of indices so far
-        # H_acc: accumulated tensor
-
-        if dim == N:
-            # Inner most loop body
-            # Compute H[current_idx]
-            # But wait, we need to compute H[current_idx] based on previous values.
-            # If we just loop, we can compute it.
-            # But for the *first* element (0,0,...), it is 1.
-            # For others, we use recurrence.
-            # The recurrence is:
-            # H_n = (gamma_i H_{n-ei} + sum_j B_ij n_j H_{n-ei-ej}) / (something?)
-            # No, the recurrence gives H_{n+ei}.
-            # So H_n = gamma_i H_{n-ei} + ...
-            # Wait, if we iterate n_i from 0 to limit, we are computing H_n.
-            # We can pick ANY i such that n_i > 0.
-            # Let's pick the last dimension that is > 0.
-            # Or just the first one.
-            # Let i be the first index where n_i > 0.
-            # Then H_n = gamma_i H_{n-ei} + sum_j B_ij (n_j - delta_ij) H_{n-ei-ej}
-
-            # We need to implement this logic inside the loop.
-            # But JAX scan/loop requires fixed function.
-            # This is getting complicated for generic N.
-
-            # Alternative:
-            # Since N is very small (usually 2, maybe 3-4), we can just unroll for specific N?
-            # Or use a flattened index and decode it?
-            pass
-            return H_acc
-
-    # Let's use a simpler approach for the recurrence.
-    # We can use `jax.lax.scan` over a flattened array? No, dependencies are complex.
-    # But we know N is small.
-    # Let's assume N <= 4 and unroll?
-    # No, generic is better.
-
-    # Let's use the fact that we can compute H one index at a time.
-    # H[n] = ...
-    # We can define a function `compute_element(n, H)` that returns the value.
-    # But H must be populated.
-
-    # Actually, for N=2 (1 sig, 1 ctrl), it's just 2 loops.
-    # For N=3, 3 loops.
-    # We can use `jax.lax.fori_loop` nested.
-
-    # Let's define a recursive function that returns the updated tensor.
-    # (Removed unused placeholder logic)
-
-    # NEW STRATEGY:
-    # Use `thewalrus` approach? No, they use Hafnian.
-    # Use `hafnian_repeated`?
-    # If we implement `hafnian_repeated` in JAX, we are good.
-    # But that's hard.
-
-    # Back to recurrence.
-    # We can implement the recurrence for N=2, N=3, N=4 explicitly.
-    # And dispatch based on N.
-    # This covers 99% of cases.
-
+    # 4. Run recurrence (passing prefactor)
     if N == 1:
-        H = _recurrence_1d(shape, B, gamma, common_dtype)
+        H = _recurrence_1d(shape, B, gamma, common_dtype, prefactor)
     elif N == 2:
-        H = _recurrence_2d(shape, B, gamma, common_dtype)
+        H = _recurrence_2d(shape, B, gamma, common_dtype, prefactor)
     elif N == 3:
-        H = _recurrence_3d(shape, B, gamma, common_dtype)
+        H = _recurrence_3d(shape, B, gamma, common_dtype, prefactor)
     elif N == 4:
-        H = _recurrence_4d(shape, B, gamma, common_dtype)
+        H = _recurrence_4d(shape, B, gamma, common_dtype, prefactor)
     else:
-        # Fallback or error
-        # For >4 modes, it's rare in this context.
-        # But we can implement a generic one using `jax.lax.while_loop` over flat index?
-        # Or just error for now.
         raise NotImplementedError("JAX recurrence only implemented for N<=4")
 
-    # 5. Apply prefactor and normalization
-    # H is now the Hermite polynomial values.
-    # Amplitude = H * pref / sqrt(prod(n!))
+    amplitudes = H
 
-    # Compute factorials
-    # We need sqrt(n!) for each element.
-    # We can compute it using gammaln.
-
-    # Create grid of indices
-    grids = jnp.meshgrid(*[jnp.arange(s) for s in shape], indexing="ij")
-    # grids[i] is the array of index n_i.
-
-    log_fact_sum = jnp.zeros(shape)
-    for g in grids:
-        log_fact_sum += jax.scipy.special.gammaln(g + 1)
-
-    sqrt_fact = jnp.exp(0.5 * log_fact_sum)
-
-    amplitudes = H * prefactor / sqrt_fact
-
-    # 6. Slice at pnr_outcome
-    # The tensor has shape [cutoff, ..., pnr+1, ...]
-    # We want the slice where control modes == pnr_outcome.
-    # Control modes are the last n_ctrl modes.
-
-    # Construct slice object
-    # slice(None) for signal modes
-    # pnr_outcome[i] for control modes
-
+    # 5. Slice at pnr_outcome
     slices = [slice(None)] * n_sig + [p for p in pnr_outcome]
-    # Note: p is scalar, so this reduces dimension.
-
-    # JAX slicing requires static indices or dynamic slice.
-    # pnr_outcome is passed as argument.
-    # If we use `H[tuple(slices)]`, it works in JAX.
-
     res = amplitudes[tuple(slices)]
 
-    # 7. Normalize
-    # The result `res` is the unnormalized amplitude vector (or tensor).
-    # We need to compute probability and normalize.
+    # 6. Normalize
+    # The result `res` is the amplitude vector.
+    # Probability is squared norm.
 
     prob = jnp.sum(jnp.abs(res) ** 2)
 
-    # Avoid division by zero
     norm = jax.lax.cond(
         prob > 0, lambda _: res / jnp.sqrt(prob), lambda _: jnp.zeros_like(res), None
     )
@@ -529,62 +328,51 @@ def jax_get_full_amplitudes(
     gamma = gamma.astype(dtype)
     common_dtype = dtype
 
-    # 2. Setup recurrence
+    # 2. Setup shape
     N = mu.shape[0] // 2
     n_sig = N - len(max_pnr_outcome)
-
     shape = [cutoff] * n_sig + [p + 1 for p in max_pnr_outcome]
 
-    # 3. Run recurrence
-    if N == 1:
-        H = _recurrence_1d(shape, B, gamma, common_dtype)
-    elif N == 2:
-        H = _recurrence_2d(shape, B, gamma, common_dtype)
-    elif N == 3:
-        H = _recurrence_3d(shape, B, gamma, common_dtype)
-    elif N == 4:
-        H = _recurrence_4d(shape, B, gamma, common_dtype)
-    else:
-        raise NotImplementedError("JAX recurrence only implemented for N<=4")
-
-    # 4. Apply prefactor
-    N_modes = mu.shape[0] // 2
+    # 3. Calculate prefactor
     scale = jnp.sqrt(2 * hbar)
+    N_modes = mu.shape[0] // 2
     q = mu[:N_modes]
     p = mu[N_modes:]
     alpha = (q + 1j * p) / scale
 
     Q = Qmat(cov, hbar)
-    sign, logdet = jnp.linalg.slogdet(Q)
+    _, logdet = jnp.linalg.slogdet(Q)
     detQ_fourth = jnp.exp(0.25 * logdet)
     prefactor = (
-        jnp.exp(-0.5 * (jnp.linalg.norm(alpha) ** 2 - alpha.conj() @ B @ alpha.conj()))
+        jnp.exp(-0.5 * (jnp.sum(jnp.abs(alpha) ** 2) - alpha.conj() @ B @ alpha.conj()))
         / detQ_fourth
     )
 
-    # Factorials
-    # Factorials (No longer needed with normalized recurrence)
-    # grids = jnp.meshgrid(*[jnp.arange(s) for s in shape], indexing="ij")
-    # log_fact_sum = jnp.zeros(shape)
-    # for g in grids:
-    #     log_fact_sum += jax.scipy.special.gammaln(g + 1)
-    # sqrt_fact = jnp.exp(0.5 * log_fact_sum)
+    # 4. Run recurrence (passing prefactor)
+    if N == 1:
+        H = _recurrence_1d(shape, B, gamma, common_dtype, prefactor)
+    elif N == 2:
+        H = _recurrence_2d(shape, B, gamma, common_dtype, prefactor)
+    elif N == 3:
+        H = _recurrence_3d(shape, B, gamma, common_dtype, prefactor)
+    elif N == 4:
+        H = _recurrence_4d(shape, B, gamma, common_dtype, prefactor)
+    else:
+        raise NotImplementedError("JAX recurrence only implemented for N<=4")
 
-    # amplitudes = H * prefactor / sqrt_fact
-    # With normalized recurrence, H (now A) is already H/sqrt(n!)
-
-    amplitudes = H * prefactor
+    # Amplitudes are directly from recurrence (prefactor included in initialization)
+    amplitudes = H
 
     return amplitudes
 
 
-def _recurrence_1d(shape, B, gamma, dtype):
+def _recurrence_1d(shape, B, gamma, dtype, prefactor):
     # Normalized recurrence:
     # A[n] = gamma/sqrt(n) A[n-1] + B sqrt((n-1)/n) A[n-2]
-    # A[0] = 1
+    # A[0] = prefactor
     N0 = shape[0]
     A = jnp.zeros(N0, dtype=dtype)
-    A = A.at[0].set(1.0)
+    A = A.at[0].set(prefactor)
 
     def body(n, a):
         # n goes from 1 to N0-1
@@ -604,11 +392,11 @@ def _recurrence_1d(shape, B, gamma, dtype):
     return A
 
 
-def _recurrence_2d(shape, B, gamma, dtype):
+def _recurrence_2d(shape, B, gamma, dtype, prefactor):
     # Normalized recurrence optimized (branchless)
     N0, N1 = shape
     A = jnp.zeros(shape, dtype=dtype)
-    A = A.at[0, 0].set(1.0)
+    A = A.at[0, 0].set(prefactor)
 
     # Precompute constants
     b00, b01, b11 = B[0, 0], B[0, 1], B[1, 1]
@@ -680,11 +468,11 @@ def _recurrence_2d(shape, B, gamma, dtype):
 # I'll add a check.
 
 
-def _recurrence_3d(shape, B, gamma, dtype):
+def _recurrence_3d(shape, B, gamma, dtype, prefactor):
     # Normalized recurrence optimized (branchless)
     N0, N1, N2 = shape
     A = jnp.zeros(shape, dtype=dtype)
-    A = A.at[0, 0, 0].set(1.0)
+    A = A.at[0, 0, 0].set(prefactor)
 
     # Constants
     b00, b01, b02 = B[0, 0], B[0, 1], B[0, 2]
@@ -771,14 +559,14 @@ def _recurrence_3d(shape, B, gamma, dtype):
     return A
 
 
-def _recurrence_4d(shape, B, gamma, dtype):
+def _recurrence_4d(shape, B, gamma, dtype, prefactor):
     """
     Optimized 4D recurrence using jnp.where instead of jax.lax.cond.
     This eliminates control flow overhead and is much faster on GPU.
     """
     N0, N1, N2, N3 = shape
     A = jnp.zeros(shape, dtype=dtype)
-    A = A.at[0, 0, 0, 0].set(1.0)
+    A = A.at[0, 0, 0, 0].set(prefactor)
 
     # Precompute zero for branchless ops
     zero = jnp.array(0.0, dtype=dtype)

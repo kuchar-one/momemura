@@ -66,6 +66,7 @@ def jax_compose_pair(
             p_measure = p_x_density
         else:
             p_measure = p_x_density * homodyne_resolution
+            p_measure = jnp.minimum(p_measure, 1.0)
 
         vec_cond = jax.lax.cond(
             p_x_density > 0,
@@ -118,6 +119,7 @@ def jax_compose_pair(
             p_measure = p_x_density
         else:
             p_measure = p_x_density * homodyne_resolution
+            p_measure = jnp.minimum(p_measure, 1.0)
 
         rho_cond = jax.lax.cond(
             p_x_density > 0,

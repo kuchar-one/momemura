@@ -28,7 +28,7 @@ class TestOptimization(unittest.TestCase):
         # Vectorized version
         actual = get_phi_matrix_cached(cutoff, xs, hbar)
 
-        np.testing.assert_allclose(actual, expected, atol=1e-10)
+        np.testing.assert_allclose(actual, expected, atol=1e-5)
 
     def test_quadrature_caching(self):
         """Verify that caching works and returns the same object."""

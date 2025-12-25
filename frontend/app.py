@@ -65,7 +65,8 @@ def render_solution_details(row, result_obj, key_suffix=""):
             exp_val = row["Expectation"]  # Get expectation for Wigner title
 
             # --- VISUALIZATION ROW ---
-            col_viz1, col_viz2 = st.columns(2)
+            # Use 3 columns: Tree | Output Wigner | Target Wigner
+            col_viz1, col_viz2, col_viz3 = st.columns(3)
 
             with col_viz1:
                 st.subheader("State Preparation (Tree)")
@@ -110,11 +111,15 @@ def render_solution_details(row, result_obj, key_suffix=""):
                     "The Wigner function shown is correct for the re-simulated parameters."
                 )
 
+            # Common Wigner Grid
+            # User requested "high resolution"
+            grid_size = 200
+            limit = 5
+            xvec = np.linspace(-limit, limit, grid_size)
+            pvec = np.linspace(-limit, limit, grid_size)
+
             with col_viz2:
                 st.subheader("Output Wigner Function")
-                grid_size = 100
-                xvec = np.linspace(-5, 5, grid_size)
-                pvec = np.linspace(-5, 5, grid_size)
                 W = utils.compute_wigner(psi, xvec, pvec)
 
                 # Title with Simulated values
@@ -122,13 +127,83 @@ def render_solution_details(row, result_obj, key_suffix=""):
                     W,
                     xvec,
                     pvec,
-                    title=f"Exp: {exp_val:.4f} | Prob: {prob:.2e}",
+                    title=f"Output State<br>Exp: {exp_val:.4f} | Prob: {prob:.2e}",
                 )
                 st.plotly_chart(
                     fig_wig,
                     use_container_width=True,
                     key=f"wigner_{genotype_idx}_{key_suffix}",
                 )
+
+            with col_viz3:
+                st.subheader("Target Ground State")
+
+                # Retrieve Target Params
+                try:
+                    from src.utils.gkp_operator import construct_gkp_operator
+                    import re
+
+                    # Strategy: Try Config first, then Folder Name override?
+                    # User said "should be in folder name yk" implying folder name is authoritative or convenient.
+
+                    # Defaults
+                    t_alpha_str = str(run_config.get("target_alpha", "2.0"))
+                    t_beta_str = str(run_config.get("target_beta", "0.0"))
+
+                    # Parse from Folder Name
+                    # Expected pattern: ..._alpha_2.0_beta_0.0...
+                    # or ..._alpha2.0_beta0.0...
+                    # Regex for alpha
+                    alpha_match = re.search(r"alpha_?([0-9\.]+)", selected_run_dir)
+                    if alpha_match:
+                        t_alpha_str = alpha_match.group(1)
+
+                    # Regex for beta
+                    beta_match = re.search(r"beta_?([0-9\.]+)", selected_run_dir)
+                    if beta_match:
+                        t_beta_str = beta_match.group(1)
+
+                    st.caption(f"Target: α={t_alpha_str}, β={t_beta_str}")
+
+                    # Safe parse complex
+                    t_alpha = (
+                        complex(t_alpha_str)
+                        if "j" in t_alpha_str
+                        else float(t_alpha_str)
+                    )
+                    t_beta = (
+                        complex(t_beta_str) if "j" in t_beta_str else float(t_beta_str)
+                    )
+
+                    # Construct Operator
+                    # Use same cutoff as simulation
+                    target_cutoff = cutoff
+                    op_matrix = construct_gkp_operator(
+                        target_cutoff, t_alpha, t_beta, backend="thewalrus"
+                    )
+
+                    # Find Ground State (Lowest Eigenvalue of GKP Hamiltonian)
+                    # Note: construct_gkp_operator returns the Hamiltonian matrix.
+                    vals, vecs = np.linalg.eigh(op_matrix)
+                    ground_state = vecs[:, 0]  # Lowest energy state
+
+                    # Compute Wigner
+                    W_target = utils.compute_wigner(ground_state, xvec, pvec)
+
+                    fig_target = viz.plot_wigner_function(
+                        W_target,
+                        xvec,
+                        pvec,
+                        title="Target GKP (Ground State)",
+                    )
+                    st.plotly_chart(
+                        fig_target,
+                        use_container_width=True,
+                        key=f"wigner_target_{genotype_idx}_{key_suffix}",
+                    )
+
+                except Exception as e:
+                    st.error(f"Could not compute target state: {e}")
 
         except Exception as e:
             st.error(f"Error computing Wigner: {e}")

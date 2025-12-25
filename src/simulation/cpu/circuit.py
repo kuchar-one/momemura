@@ -91,6 +91,11 @@ def interferometer_params_to_unitary(
     -------
     U : (M x M) complex unitary matrix
     """
+    # Ensure inputs are float32 to avoid mixed-precision in Numba
+    theta = np.asarray(theta, dtype=np.float32)
+    phi = np.asarray(phi, dtype=np.float32)
+    varphi = np.asarray(varphi, dtype=np.float32)
+
     if mesh != "rectangular":
         raise NotImplementedError("Only 'rectangular' mesh implemented in this helper.")
     # theta = list(theta) # Removed list conversion for Numba
@@ -103,7 +108,7 @@ def interferometer_params_to_unitary(
         raise ValueError("varphi must have length M (one phase per mode).")
 
     # Create identity
-    U = np.eye(M, dtype=np.complex128)
+    U = np.eye(M, dtype=np.complex64)
 
     # Build slices left-to-right; there are M slices indexed s=0..M-1
     # In each slice s, beam splitters act on pairs depending on parity of s:
@@ -113,25 +118,40 @@ def interferometer_params_to_unitary(
     param_idx = 0
     for s in range(M):
         # start with identity layer
-        L = np.eye(M, dtype=np.complex128)
+        L = np.eye(M, dtype=np.complex64)
         start = 0 if (s % 2 == 0) else 1
         # pair indices
         for a in range(start, M - 1, 2):
             th = theta[param_idx]
             ph = phi[param_idx]
             param_idx += 1
-            B = beamsplitter_2x2(th, ph)
-            # embed B into L on rows/cols [a, a+1]
-            L_block = L.copy()
-            # Ensure contiguous memory for the slice to avoid Numba performance warning
-            target_slice = np.ascontiguousarray(L_block[a : a + 2, a : a + 2])
-            L_block[a : a + 2, a : a + 2] = B @ target_slice
-            L = L_block
+
+            # Explicitly cast to ensure Numba sees consistent types
+            c = np.cos(th)
+            s_val = np.sin(th)
+
+            # Use complex64 exp
+            e_mip = np.exp(np.complex64(-1j) * ph)
+            e_ip = np.exp(np.complex64(1j) * ph)
+
+            # Manual 2x2 update to avoid helper function if causing issues,
+            # or just be careful with types.
+            # L is complex64.
+            L[a, a] = c
+            L[a, a + 1] = -s_val * e_mip
+            L[a + 1, a] = s_val * e_ip
+            L[a + 1, a + 1] = c
+
+            # Previous helper B = beamsplitter_2x2(th, ph) might return complex128?
+            # Let's check ops.py later. For now, inline is safer for type control.
+
         # left-multiply the layer to current U (operations are applied left-to-right)
         U = L @ U
 
     # Apply final diagonal phases varphi as R = diag(exp(i varphi_j))
-    R = np.diag(np.exp(1j * np.asarray(varphi, dtype=np.float64)))
+    # Ensure complex64
+    phasors = np.exp(np.complex64(1j) * varphi).astype(np.complex64)
+    R = np.diag(phasors)
     U = R @ U
     # At this point U should be unitary (up to numerical error). Optionally enforce unitarity.
     return U
@@ -187,20 +207,16 @@ class GaussianHeraldCircuit:
         self.uc_params = uc_params
         # Store explicit unitaries separately so we know if they were provided
         self._U_s_explicit = (
-            np.asarray(U_s, dtype=np.complex128) if U_s is not None else None
+            np.asarray(U_s, dtype=np.complex64) if U_s is not None else None
         )
         self._U_c_explicit = (
-            np.asarray(U_c, dtype=np.complex128) if U_c is not None else None
+            np.asarray(U_c, dtype=np.complex64) if U_c is not None else None
         )
         # Effective unitaries (will be computed in build/_resolve_unitaries)
         self.U_s = None
         self.U_c = None
-        self.disp_s = (
-            None if disp_s is None else np.asarray(disp_s, dtype=np.complex128)
-        )
-        self.disp_c = (
-            None if disp_c is None else np.asarray(disp_c, dtype=np.complex128)
-        )
+        self.disp_s = None if disp_s is None else np.asarray(disp_s, dtype=np.complex64)
+        self.disp_c = None if disp_c is None else np.asarray(disp_c, dtype=np.complex64)
         self.mesh = mesh
         self.hbar = float(hbar)
         self.cache_enabled = bool(cache_enabled)
@@ -249,9 +265,9 @@ class GaussianHeraldCircuit:
 
         # Cache lookup
         try:
-            t_arr = np.ascontiguousarray(theta, dtype=np.float64)
-            p_arr = np.ascontiguousarray(phi, dtype=np.float64)
-            v_arr = np.ascontiguousarray(varphi, dtype=np.float64)
+            t_arr = np.ascontiguousarray(theta, dtype=np.float32)
+            p_arr = np.ascontiguousarray(phi, dtype=np.float32)
+            v_arr = np.ascontiguousarray(varphi, dtype=np.float32)
 
             # Key: (M, mesh, bytes of params)
             key = (M, mesh, t_arr.tobytes(), p_arr.tobytes(), v_arr.tobytes())
@@ -279,9 +295,9 @@ class GaussianHeraldCircuit:
         except Exception:
             # Fallback
             return interferometer_params_to_unitary(
-                np.asarray(theta, dtype=np.float64),
-                np.asarray(phi, dtype=np.float64),
-                np.asarray(varphi, dtype=np.float64),
+                np.asarray(theta, dtype=np.float32),
+                np.asarray(phi, dtype=np.float32),
+                np.asarray(varphi, dtype=np.float32),
                 M,
                 mesh=mesh,
             )
@@ -291,7 +307,7 @@ class GaussianHeraldCircuit:
         if U is None:
             return None
         # use view of real+imag to make deterministic bytes
-        data = np.ascontiguousarray(U.view(np.float64))
+        data = np.ascontiguousarray(U.view(np.float32))
         return (U.shape, data.tobytes())
 
     def _resolve_unitaries(self):

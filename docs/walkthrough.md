@@ -19,7 +19,7 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
 3.  **JAX Backend (`src/simulation/jax/composer.py`, `runner.py`)**:
     - High-performance, GPU-accelerated simulation.
     - `jax_superblock`: Implements the core mixing logic (Depth-3 tree) using vectorized JAX operations (`vmap`).
-    - `jax_herald`: Computes heralded state amplitudes.
+    - `jax_herald`: Computes heralded state amplitudes using **numerically stable recurrence relations** (normalized to prevent underflow/overflow).
     - `jax_runner`: Batches evaluations for QDax.
 
 ## Optimization Pipeline

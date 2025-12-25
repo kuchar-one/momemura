@@ -81,9 +81,9 @@ def _hermite_phi_matrix(
     JIT-compiled for speed.
     """
     N = xs.shape[0]
-    phi = np.zeros((cutoff, N), dtype=np.float64)
+    phi = np.zeros((cutoff, N), dtype=np.float32)
     # transform argument
-    arg = np.empty(N, dtype=np.float64)
+    arg = np.empty(N, dtype=np.float32)
     sqrt_h = math.sqrt(hbar)
     for i in range(N):
         arg[i] = xs[i] / sqrt_h
@@ -100,8 +100,8 @@ def _hermite_phi_matrix(
     # recurrence for n >= 2
     if cutoff > 2:
         # maintain arrays for H_{n-2} and H_{n-1} at each x
-        H_nm2 = np.empty(N, dtype=np.float64)
-        H_nm1 = np.empty(N, dtype=np.float64)
+        H_nm2 = np.empty(N, dtype=np.float32)
+        H_nm1 = np.empty(N, dtype=np.float32)
         # initialize
         for i in range(N):
             H_nm2[i] = 1.0
@@ -128,7 +128,7 @@ def get_phi_matrix_cached(
     # Ensure xs is float64 and contiguous for consistent bytes
     # Round to 8 decimals to ensure cache hits for slightly varying inputs
     xs_rounded = np.round(xs, decimals=8)
-    xs_f64 = np.ascontiguousarray(xs_rounded, dtype=np.float64)
+    xs_f64 = np.ascontiguousarray(xs_rounded, dtype=np.float32)
     key = (int(cutoff), float(hbar), xs_f64.tobytes())
 
     with _QUAD_CACHE_LOCK:
@@ -229,7 +229,7 @@ def beamsplitter_2x2(theta: float, phi: float) -> np.ndarray:
     t = np.cos(theta)
     r = np.sin(theta)
     return np.array(
-        [[t, -np.exp(-1j * phi) * r], [np.exp(1j * phi) * r, t]], dtype=np.complex128
+        [[t, -np.exp(-1j * phi) * r], [np.exp(1j * phi) * r, t]], dtype=np.complex64
     )
 
 

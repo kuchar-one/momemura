@@ -14,54 +14,26 @@ def plot_global_pareto(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
 
-    hover_data = [
-        "Desc_TotalPhotons",
-        "Desc_MaxPNR",
-        "Desc_Complexity",
-        "genotype_idx",
-        "Expectation",
-        "LogProb",
-    ]
-
-    # Check for Global Dominance column
-    symbol_args = {}
-    if "GlobalDominant" in df.columns:
-        hover_data.append("GlobalDominant")
-        # Use symbol to distinguish dominant vs non-dominant
-        # True -> Circle/Star, False -> X/Cross?
-        # Or Size?
-
-        # We need to map boolean to string for discrete symbolic mapping usually
-        df["IsDominant"] = df["GlobalDominant"].apply(
-            lambda x: "Global Pareto" if x else "Dominated"
-        )
-
-        symbol_args = dict(
-            symbol="IsDominant",
-            symbol_sequence=[
-                "star",
-                "circle-open",
-            ],  # First is usually top of alphabetic? D comes before G?
-            # 'Dominated' (circle-open/x), 'Global Pareto' (star)
-            # Actually map takes strings.
-            symbol_map={"Global Pareto": "star", "Dominated": "circle-open"},
-        )
-
     fig = px.scatter(
         df,
         x="LogProb",
         y="Expectation",
         color="Complexity",
-        hover_data=hover_data,
+        hover_data=[
+            "Desc_TotalPhotons",
+            "Desc_MaxPNR",
+            "Desc_Complexity",
+            "genotype_idx",
+            "Expectation",
+            "LogProb",
+        ],
         title="Global Pareto Front: Expectation vs Probability",
         labels={
             "LogProb": "Negative Log10 Probability (Minimize)",
             "Expectation": "Expectation Value (Minimize)",
             "Complexity": "Complexity",
-            "IsDominant": "Dominance Status",
         },
         color_continuous_scale="Viridis",
-        **symbol_args,
     )
     fig.update_layout(clickmode="event+select")
     return fig
@@ -124,89 +96,21 @@ def plot_wigner_function(
     title: str = "Wigner Function",
 ) -> go.Figure:
     """
-    Plots the Wigner function using a Heatmap with a two-slope plateau colormap.
-    Mimics matplotlib's PlateauTwoSlopeNorm.
+    Plots the Wigner function contour using Plotly.
     """
-    z_min = np.min(wigner_grid)
-    z_max = np.max(wigner_grid)
-    vcenter = 0.0
-
-    # Calculate plateau size.
-    # If not specified by user, we infer a reasonable default.
-    # Wigner usually has range around [-0.3, 0.3].
-    # A plateau of 0.02 seems reasonable to hide vacuum noise around 0.
-    plateau_size = 0.02
-
-    # Ensure vcenter is within range or expand range
-    if z_min > vcenter:
-        z_min = vcenter - 0.1
-    if z_max < vcenter:
-        z_max = vcenter + 0.1
-
-    # Construct Custom Colorscale
-    # We want Red-White-Blue (RdBu) but with a white plateau around vcenter
-    # RdBu in Plotly: 0=Red, 0.5=White, 1=Blue (Actually it's usually Blue=0, Red=1 or vice versa)
-    # Plotly's 'RdBu' is Red (high) to Blue (low)? No, usually Red=Negative, Blue=Positive in Physics?
-    # Actually matplotlib 'RdBu' is Red (low) to Blue (high) or vice versa.
-    # Wigner convention: Positive (Red/Yellow), Negative (Blue).
-    # Let's use Red for positive, Blue for negative.
-
-    # Let's manually define colors:
-    # 0.0 (Min): Blue (#053061)
-    # Plateau Start: White (#ffffff)
-    # Plateau End: White (#ffffff)
-    # 1.0 (Max): Red (#67001f)
-
-    # Normalize points to [0, 1]
-    def norm(v):
-        return (v - z_min) / (z_max - z_min)
-
-    plateau_low = vcenter - plateau_size / 2
-    plateau_high = vcenter + plateau_size / 2
-
-    p_low_norm = norm(plateau_low)
-    p_high_norm = norm(plateau_high)
-
-    # Clamp
-    p_low_norm = max(0.0, min(1.0, p_low_norm))
-    p_high_norm = max(0.0, min(1.0, p_high_norm))
-
-    # Define colors
-    c_min = "rgb(5, 48, 97)"  # Dark Blue
-    c_mid = "rgb(255, 255, 255)"  # White
-    c_max = "rgb(103, 0, 31)"  # Dark Red
-
-    # If range is fully positive or fully negative, we might need adjustment,
-    # but Wigner is usually centered.
-
-    # Scale:
-    # 0.0 -> Min Color
-    # ... -> ...
-    # p_low -> White
-    # p_high -> White
-    # 1.0 -> Max Color
-
-    # BUT, to get a linear gradient from Min to Plateau_Low, and Plateau_High to Max,
-    # we need to be careful if z_min/z_max are asymmetric.
-    # The user's TwoSlopeNorm ensures linearity relative to value, not index.
-    # Plotly interpolates linearly between stops.
-    # So we simply place the stops at the calculated normalized positions.
-
-    colorscale = [[0.0, c_min], [p_low_norm, c_mid], [p_high_norm, c_mid], [1.0, c_max]]
-
-    # Sort just in case (though math guarantees order if z_min < z_max)
-    colorscale.sort(key=lambda x: x[0])
-
     fig = go.Figure(
-        data=go.Heatmap(
+        data=go.Contour(
             z=wigner_grid,
             x=xvec,
             y=pvec,
-            colorscale=colorscale,
-            showscale=True,
+            colorscale="RdBu",
+            zmid=0.0,
+            contours=dict(
+                coloring="heatmap",
+                showlabels=True,  # show labels on contours
+                labelfont=dict(size=12, color="white"),
+            ),
             colorbar=dict(title="W(x, p)"),
-            zmin=z_min,
-            zmax=z_max,
         )
     )
 
