@@ -12,7 +12,7 @@ This replacement:
  - supports homodyne point conditioning (pure-state-preserving) and homodyne-window (produces mixed states)
 """
 
-from typing import Optional, Tuple, List, Any, Union
+from typing import Optional, Tuple, List, Any, Union, Dict, Sequence
 import numpy as np
 import math
 import threading
@@ -564,22 +564,102 @@ class SuperblockTopology:
             items = next_items
         return SuperblockTopology(items[0])
 
-    # count leaves
+    # count leaves (and implicitly nodes)
     def _count_leaves(self, node) -> int:
         if node[0] == "leaf":
             return 1
         return self._count_leaves(node[1]) + self._count_leaves(node[2])
+
+    def _assign_node_indices(self) -> Dict[int, int]:
+        """
+        Assigns standard JAX-style linear indices to mix nodes in the plan.
+        JAX layout for Depth 3:
+          Layer 0 (Leaves pairs): Indices 0, 1, 2, 3 (Left-to-Right)
+          Layer 1 (Pairs of L0): Indices 4, 5 (Left-to-Right)
+          Layer 2 (Root): Index 6
+
+        To match this, we traverse the tree and collect nodes by height.
+        Height 0 = mixing leaves.
+        Height 1 = mixing Height 0.
+        Height 2 = root.
+        """
+        # Node -> (node_obj, height)
+        # We need object identity to key the map.
+        # But `plan` nodes are tuples. Python caches small tuples, but here they are large.
+        # Id should be stable for the duration of this object.
+
+        nodes_by_height = {}  # height -> list of nodes in L-R order
+
+        def traverse(node):
+            typ = node[0]
+            if typ == "leaf":
+                return 0  # leaf height is 0 (input to H0 mix)
+
+            # Pair
+            left = node[1]
+            right = node[2]
+            h_left = traverse(left)
+            h_right = traverse(right)
+
+            # Current Mix Node Height
+            # Mix connects inputs of height H. Result has height H+1?
+            # Standard binary tree:
+            # Leaves = H0 inputs.
+            # Mix(L,L) = H0 mix node. Output is H1 signal?
+            # JAX: Layer 0 indices act on raw leaves.
+            # So Layer 0 = Height 0 mix nodes.
+
+            h_current = max(h_left, h_right)
+
+            if h_current not in nodes_by_height:
+                nodes_by_height[h_current] = []
+
+            nodes_by_height[h_current].append(node)
+
+            return h_current + 1
+
+        traverse(self.plan)
+
+        # Build Map: id(node) -> index
+        node_map = {}
+        current_idx = 0
+
+        # JAX orders by Layer (Height) 0, 1, 2...
+        # So we iterate heights sorted.
+        sorted_heights = sorted(nodes_by_height.keys())
+        for h in sorted_heights:
+            # Nodes within height are already L-R due to DFS traversal order?
+            # DFS Post-Order Visits: LL, LR, Left(Loop), RL, RR, Right(Loop), Root.
+            # Wait, DFS Post-Order visits Left child fully, then Right child fully, then Self.
+            # Visitation of Mix Nodes (Self) happens:
+            # 1. LL (h0)
+            # 2. LR (h0)
+            # 3. Left (h1)
+            # 4. RL (h0)
+            # 5. RR (h0)
+            # 6. Right (h1)
+            # 7. Root (h2)
+
+            # Collected Lists by Height:
+            # H0: [LL, LR, RL, RR] -> Correct L-R order!
+            # H1: [Left, Right]    -> Correct L-R order!
+            # Nodes are appended L-R by traverse (DFS Pre/Post order logic ensures L visited before R)
+            for node in nodes_by_height[h]:
+                node_map[id(node)] = current_idx
+                current_idx += 1
+
+        return node_map
 
     def evaluate_topology(
         self,
         composer: Composer,
         fock_vecs: List[np.ndarray],
         p_heralds: List[float],
-        homodyne_x: float = 0.0,
+        homodyne_x: Union[float, Sequence[float], np.ndarray] = 0.0,
         homodyne_window: Optional[float] = None,
         homodyne_resolution: Optional[float] = None,
-        theta: float = math.pi / 4.0,
-        phi: float = 0.0,
+        theta: Union[float, Sequence[float], np.ndarray] = math.pi / 4.0,
+        phi: Union[float, Sequence[float], np.ndarray] = 0.0,
         exact_mixed: bool = False,
         n_hom_points: int = 201,
         pure_only: bool = False,
@@ -589,11 +669,28 @@ class SuperblockTopology:
 
         - fock_vecs: list of single-mode state vectors (pure) for each leaf (length = leaf_count)
         - p_heralds: matching list of herald probabilities
-        - homodyne_x / homodyne_window: homodyne measurement parameters applied at each pairing
+        - homodyne_x: Scalar or Array (one per mix node)
+        - homodyne_window: homodyne measurement parameters applied at each pairing
+        - homodyne_resolution: Optional resolution for homodyne window
+        - theta, phi: Scalar or Array (one per mix node)
         - exact_mixed: if True, force exact mixed-state propagation for the whole tree
         Returns (final_state, joint_probability)
           - final_state: 1D vector if pure path possible, else density matrix (2D)
         """
+
+        # Check if parameters are arrays
+        def is_array(x):
+            return (
+                hasattr(x, "__len__")
+                and (not isinstance(x, (str, bytes)))
+                and (np.ndim(x) > 0)
+            )
+
+        use_array_params = is_array(homodyne_x) or is_array(theta) or is_array(phi)
+
+        node_map = None
+        if use_array_params:
+            node_map = self._assign_node_indices()
 
         leaf_count = self._count_leaves(self.plan)
         if len(fock_vecs) != leaf_count or len(p_heralds) != leaf_count:
@@ -620,6 +717,25 @@ class SuperblockTopology:
                 left_pure, left_state, p_left = eval_node(left)
                 right_pure, right_state, p_right = eval_node(right)
 
+                # Fetch parameters for this node
+                # Default values
+                h_x_val = homodyne_x
+                theta_val = theta
+                phi_val = phi
+
+                if node_map is not None:
+                    # Use array lookup
+                    # If scalar, use as is. If array, lookup.
+                    # We already checked use_array_params, so if node_map exists, we should check type of each param
+                    node_idx = node_map[id(node)]
+
+                    if is_array(homodyne_x):
+                        h_x_val = homodyne_x[node_idx]
+                    if is_array(theta):
+                        theta_val = theta[node_idx]
+                    if is_array(phi):
+                        phi_val = phi[node_idx]
+
                 # decide whether this node can remain in pure-path
                 # pure path possible if:
                 #  - exact_mixed == False
@@ -641,17 +757,22 @@ class SuperblockTopology:
                         pure_possible = False
                     else:
                         # call composer with point homodyne or no homodyne (if homodyne_x is None)
+                        # Ensure we convert numpy scalars to float
                         state_out, p_hom_or_density, joint = (
                             composer.compose_pair_cached(
                                 vecL,
                                 vecR,
                                 p_left,
                                 p_right,
-                                homodyne_x=homodyne_x,
+                                homodyne_x=float(h_x_val)
+                                if h_x_val is not None
+                                else None,
                                 homodyne_window=None,  # pure_possible only if window None
-                                homodyne_resolution=homodyne_resolution,
-                                theta=theta,
-                                phi=phi,
+                                homodyne_resolution=float(homodyne_resolution)
+                                if homodyne_resolution is not None
+                                else None,
+                                theta=float(theta_val),
+                                phi=float(phi_val),
                                 n_hom_points=n_hom_points,
                             )
                         )
@@ -704,11 +825,15 @@ class SuperblockTopology:
                     rho_right,
                     p_left,
                     p_right,
-                    homodyne_x=homodyne_x,
-                    homodyne_window=homodyne_window,
-                    homodyne_resolution=homodyne_resolution,
-                    theta=theta,
-                    phi=phi,
+                    homodyne_x=float(h_x_val) if h_x_val is not None else None,
+                    homodyne_window=float(homodyne_window)
+                    if homodyne_window is not None
+                    else None,
+                    homodyne_resolution=float(homodyne_resolution)
+                    if homodyne_resolution is not None
+                    else None,
+                    theta=float(theta_val),
+                    phi=float(phi_val),
                     n_hom_points=n_hom_points,
                 )
                 # rho_out is a density

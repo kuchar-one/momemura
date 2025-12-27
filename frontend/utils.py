@@ -629,3 +629,45 @@ def extract_genotype_index(p_data: Dict[str, Any], df_len: int = 0) -> int:
             return None
 
     return genotype_idx
+
+def compute_active_metrics(params: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Compute Total Photons and Max PNR considering ONLY active leaves.
+    
+    Args:
+        params: Decoded circuit parameters dict.
+        
+    Returns:
+        (total_active_photons, max_active_pnr)
+    """
+    # 1. Get PNR array
+    if "leaf_params" not in params:
+        return 0.0, 0.0
+
+    leaf_params = params["leaf_params"]
+    if "pnr" not in leaf_params:
+        return 0.0, 0.0
+
+    pnr = np.array(leaf_params["pnr"]) # Shape (L, N_C)
+    
+    # 2. Get Active Flags
+    if "leaf_active" in params:
+        active = np.array(params["leaf_active"], dtype=bool)
+    else:
+        # Fallback to all active
+        active = np.ones(pnr.shape[0], dtype=bool)
+        
+    # Ensure shapes match
+    if active.shape[0] != pnr.shape[0]:
+        active = np.ones(pnr.shape[0], dtype=bool)
+        
+    # 3. Filter
+    active_pnr = pnr[active] # Shape (N_active, N_C)
+    
+    if active_pnr.size == 0:
+        return 0.0, 0.0
+        
+    total_photons = float(np.sum(active_pnr))
+    max_pnr = float(np.max(active_pnr)) if active_pnr.size > 0 else 0.0
+    
+    return total_photons, max_pnr

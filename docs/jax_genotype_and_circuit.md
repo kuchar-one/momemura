@@ -21,19 +21,37 @@ We support multiple genotype designs offering different trade-offs between expre
 | Design | Name | Description | Length (Depth 3) |
 | :--- | :--- | :--- | :--- |
 | **Legacy** | Original | Per-leaf unique parameters (Original logic mapped to canonical). | 256 |
+| **0** | Per-Node Homodyne | Variant of A with independent homodyne detection at each mixing node. | 161 |
 | **A** | Original (Canonical) | Per-leaf unique. 1 TMSS/leaf + Final Gauss. | 155 |
 | **B1** | Tied-Leaf (No Active) | Single shared block. 1 TMSS/block + Final Gauss. | 42 |
 | **B2** | Tied-Leaf (Active) | Same as B1 but with per-leaf active flags. | 50 |
 | **B3** | Semi-Tied (Per-Leaf PNR) | Shared continuous parameters, UNIQUE integer parameters (PNR, NCtrl) per leaf. | 71 (N=3) |
+| **B30** | B3 + Per-Node Homodyne | Like B3 but with independent homodyne detection at each mixing node. | 77 (N=3) |
 | **C1** | Tied-All (No Active) | Constant structure. | 24 |
 | **C2** | Tied-All (Active) | Same as C1 but with per-leaf active flags. | 32 |
+| **C20** | C2 + Per-Node Homodyne | Like C2 but with independent homodyne detection at each mixing node. | 38 |
 
 ### 1. Global Parameters (All Designs)
 
 All designs include global homodyne settings and a **Final Gaussian** block ($F=5$).
 The structure scales with the number of control modes $N_C = N_{modes} - 1$.
 
-### 2. Design A - Original (Per-Leaf Unique)
+### 2. Design 0 - Per-Node Homodyne
+
+Identical to **Design A**, but replaces the single global `homodyne_x` parameter with **independent homodyne settings for each mixing node**.
+
+**Formula**: $Length = Length(A) + (L-1) - 1$
+(Replaces 1 global param with $L-1$ local params).
+
+**For N=3 (Depth 3)**: $155 + 7 - 1 = 161$.
+
+**Structure**:
+- **Homodyne X**: $L-1$ unique parameters (one per mix node).
+- **Leaves**: Same as A.
+- **Mix Nodes**: Same as A.
+- **Final Gaussian**: Same as A.
+
+### 3. Design A - Original (Per-Leaf Unique)
 
 This design allows every leaf block and every mix node to have unique parameters.
 
@@ -86,6 +104,59 @@ This design addresses the redundancy in B2 by separating parameters into "Shared
 
 **Formula**: $Length = G + Shared + L \cdot Unique + (L-1) \cdot P_{node} + F$
 Where:
+- $Shared = 1(TMSS) + 1(US) + Len(UC) + Len(Disp)$
+- $Unique = 1(Active) + 1(NCtrl) + Len(PNR)$
+
+**For N=3 Modes (N_C=2)**:
+- $Shared = 12$ ($1 + 1 + 4 + 6$).
+- $Unique = 4$ ($1 + 1 + 2$).
+- Total (Depth 3, 8 leaves): $1 + 12 + 32 + 21 + 5 = 71$.
+
+### 3c. Design B30 - B3 + Per-Node Homodyne
+
+Identical to **Design B3**, but replaces the single global `homodyne_x` parameter with **independent homodyne settings for each mixing node**.
+
+**Formula**: $Length = Length(B3) + (L-1) - 1$
+For Depth 3: $71 + 7 - 1 = 77$.
+
+**Structure**:
+- **Homodyne X**: $L-1$ unique parameters.
+- **Shared Block**: Same as B3.
+- **Unique Discrete Block**: Same as B3.
+- **Mix Nodes**: Same as B3.
+
+### 4. Design C - Tied-All (C1 / C2 / C20)
+
+**Design C1**: Constant structure (no Active flag). Broadcasts 1 parameter set to all leaves.
+Length (Depth 3): $1(Hom) + 15(Shared) + 21(Mix) + 5(Final) = 42$. (Formula is same as B1).
+Actually C1 is defined as having length 24 in table? Wait.
+Table says C1 Length 24.
+Let's check code C1.get_length.
+Code: `return 1 + params_shared + 3 + 5`.
+`params_shared` (N=2 modes -> N_C=1):
+`len_uc` (NC=1) = 0 + 1 = 1.
+`len_disp_c` = 2.
+`len_pnr` = 1.
+`P_shared` = 1+1+1+1+2+2+1 = 9.
+Depth 3: L=8. Mix Nodes = 7.
+Wait, C1 uses *Tied* Mix params too?
+Code C1.decode: `mix_params_slice = g[idx : idx + self.PN]`. Then `mix_angles = jnp.broadcast_to...`.
+YES. C1 has TIED Mix Nodes (only 1 set of mix params broadcast to all nodes).
+So C1 Mix Length = 3.
+Length = $1 + Shared + 3 + 5$.
+For N=3 (N_C=2):
+Shared = 15.
+Length = $1 + 15 + 3 + 5 = 24$. CORRECT.
+
+**Design C2**: Same as C1 but adds $L$ active flags.
+Length = $24 + 8 = 32$.
+
+**Design C20**: Same as C2 but with Per-Node Homodyne.
+Replaces 1 global `homodyne_x` with $L-1$ local `homodyne_x`.
+Length = $32 + (L-1) - 1 = 32 + 6 = 38$.
+
+---
+
 - $Shared = 1(TMSS) + 1(US) + Len(UC) + Len(Disp)$
 - $Unique = 1(Active) + 1(NCtrl) + Len(PNR)$
 

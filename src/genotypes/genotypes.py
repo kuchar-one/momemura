@@ -903,7 +903,6 @@ class DesignC1Genotype(BaseGenotype):
             "disp": disp_final,
         }
 
-        print(f"DEBUG DesignA Active: {leaf_active}")
         return {
             "homodyne_x": homodyne_x,
             "homodyne_window": homodyne_window,
@@ -937,32 +936,6 @@ class DesignC2Genotype(DesignC1Genotype):
         decoded["leaf_active"] = leaf_active
 
         return decoded
-
-
-GENOTYPE_REGISTRY = {
-    "legacy": LegacyGenotype,
-    "A": DesignAGenotype,
-    "B1": DesignB1Genotype,
-    "B2": DesignB2Genotype,
-    "B3": DesignB3Genotype,
-    "C1": DesignC1Genotype,
-    "C2": DesignC2Genotype,
-}
-
-
-def get_genotype_decoder(
-    name: str, depth: int = 3, config: Dict[str, Any] = None
-) -> BaseGenotype:
-    if name in ["0", "design0"]:
-        return Design0Genotype(depth=depth, config=config)
-
-    cls = GENOTYPE_REGISTRY.get(name)
-    if not cls:
-        raise ValueError(f"Unknown genotype type: {name}")
-    # Legacy doesn't take depth, others do
-    if name == "legacy":
-        return cls(config=config)
-    return cls(depth=depth, config=config)
 
 
 class Design0Genotype(DesignAGenotype):
@@ -1137,3 +1110,130 @@ class Design0Genotype(DesignAGenotype):
             "leaf_params": leaf_params,
             "final_gauss": final_gauss,
         }
+
+
+class DesignB30Genotype(DesignB3Genotype):
+    """
+    Design B30: B3 + Per-Node Homodyne.
+    Shared Mix Params (Continuous), Unique Homodyne.
+    """
+
+    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
+        super().__init__(depth, config)
+        if config is None or "hx_scale" not in config:
+            self.hx_scale = 5.0
+
+    def get_length(self, depth: int = 3) -> int:
+        base_len = super().get_length(depth)
+        L = 2**depth
+        # Replace 1 global homodyne with (L-1) local ones
+        # Diff = (L-1) - 1 = L - 2
+        return base_len + (L - 2)
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # Need to intercept 'homodyne_x' extraction which happens first in B3?
+        # B3 inherits C1 for shared part? Or B1?
+        # Let's check B3 hierarchy.
+        # B3 does NOT inherit, it's standalone BaseGenotype subclass in valid code?
+        # I need to check B3 implementation.
+        # Assuming B3 decode flow starts with homodyne...
+
+        # Strategy:
+        # 1. Extract hom_x array first (like Design0).
+        # 2. Extract rest of parameters using B3 length logic, but skipping the first scalar hom_x slot.
+        #    BUT B3 decode likely expects g[0] to be hom_x.
+        #    If I pass g[offset:] to super().decode(), B3 will read g[offset] as hom_x.
+        #    I can let it read a dummy, then overwrite.
+        #    BUT the lengths must match.
+        #    B3 Length included 1 hom_x.
+        #    My g starts with (L-1) hom_x.
+        #    I can construct a synthetic genotype for B3 decode:
+        #      g_b3 = [ 0.0 (dummy hom_x) ] + g[(L-1):]
+        #      decoded = super().decode(g_b3)
+        #      decoded['homodyne_x'] = my_parsed_hom_x_array
+
+        n_nodes = self.nodes
+        hom_x_raw = g[:n_nodes]
+        homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
+
+        # Construct synthetic g for B3
+        # B3 expects [hom_x_scalar, hom_win, shared_block...]
+        # Wait, hom_win comes after hom_x in B3?
+        # Let's assume standard order: hom_x, hom_win, ...
+        # I need to preserve hom_win and everything else from g.
+        # g structure for B30: [hom_x_array(L-1), hom_win(1), rest...]
+        # g structure for B3:  [hom_x_scalar(1), hom_win(1), rest...]
+        # So I take g[n_nodes:] -> this is [hom_win, rest...]
+        # I prepend [0.0] -> [0.0, hom_win, rest...]
+        # This matches B3 structure.
+
+        g_rest = g[n_nodes:]
+        g_synthetic = jnp.concatenate([jnp.array([0.0]), g_rest])
+
+        decoded = super().decode(g_synthetic, cutoff)
+        decoded["homodyne_x"] = homodyne_x
+
+        return decoded
+
+
+class DesignC20Genotype(DesignC2Genotype):
+    """
+    Design C20: C2 + Per-Node Homodyne.
+    Tied Mix Params, Unique Homodyne.
+    """
+
+    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
+        super().__init__(depth, config)
+        if config is None or "hx_scale" not in config:
+            self.hx_scale = 5.0
+
+    def get_length(self, depth: int = 3) -> int:
+        base_len = super().get_length(depth)
+        L = 2**depth
+        # Replace 1 global homodyne with (L-1) local ones
+        return base_len + (L - 2)
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # C2 inherits C1.
+        # C1 decode: hom_x, hom_win, ...
+        # Same strategy as B30.
+
+        n_nodes = self.nodes
+        hom_x_raw = g[:n_nodes]
+        homodyne_x = jnp.tanh(hom_x_raw) * self.hx_scale
+
+        g_rest = g[n_nodes:]
+        g_synthetic = jnp.concatenate([jnp.array([0.0]), g_rest])
+
+        decoded = super().decode(g_synthetic, cutoff)
+        decoded["homodyne_x"] = homodyne_x
+
+        return decoded
+
+
+GENOTYPE_REGISTRY = {
+    "legacy": LegacyGenotype,
+    "A": DesignAGenotype,
+    "B1": DesignB1Genotype,
+    "B2": DesignB2Genotype,
+    "B3": DesignB3Genotype,
+    "B30": DesignB30Genotype,
+    "C1": DesignC1Genotype,
+    "C2": DesignC2Genotype,
+    "C20": DesignC20Genotype,
+}
+
+
+def get_genotype_decoder(
+    name: str, depth: int = 3, config: Dict[str, Any] = None
+) -> BaseGenotype:
+    if name in ["0", "design0"]:
+        return Design0Genotype(depth=depth, config=config)
+
+    cls = GENOTYPE_REGISTRY.get(name)
+    if not cls:
+        raise ValueError(f"Unknown genotype type: {name}")
+    # Legacy doesn't take depth, others do
+    if name == "legacy":
+        return cls(config=config)
+    return cls(depth=depth, config=config)

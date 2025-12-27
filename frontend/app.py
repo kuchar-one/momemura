@@ -30,15 +30,20 @@ def render_solution_details(row, result_obj, key_suffix=""):
     genotype_idx = int(row["genotype_idx"])
 
     # Metrics
+    # Reconstruct Circuit first to access params
+    params = result_obj.get_circuit_params(genotype_idx)
+
+    # Recalculate metrics for display (Active Leaves Only)
+    # The stored 'row' metrics might count inactive leaves depending on optimizing code.
+    # We enforce frontend correctness here.
+    active_total_photons, active_max_pnr = utils.compute_active_metrics(params)
+
     # Metrics (Safe Formatting)
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
     m_col1.metric("Expectation", f"{utils.to_scalar(row['Expectation']):.4f}")
     m_col2.metric("LogProb", f"{utils.to_scalar(row['LogProb']):.4f}")
     m_col3.metric("Complexity", f"{utils.to_scalar(row['Complexity']):.2f}")
-    m_col4.metric("Total Photons", f"{utils.to_scalar(row['TotalPhotons']):.2f}")
-
-    # Reconstruct Circuit
-    params = result_obj.get_circuit_params(genotype_idx)
+    m_col4.metric("Total Photons (Active)", f"{active_total_photons:.2f}")
 
     # Circuit Plot
     st.subheader("Active Leaf Schematic (Topology)")
