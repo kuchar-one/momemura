@@ -386,14 +386,8 @@ def compute_state_with_jax(
         # Backend treats 0.0 as 0.0.
         pass
 
-    # FORCE Point Homodyne Mode (matching Backend behavior)
-    hom_win = None
-
     # PNR Max inference
-    # Use argument pnr_max if provided, else try to find it, else default 3
-    # Actually pnr_max should be passed in.
     pnr_max_val = kwargs.get("pnr_max", 3)
-
     if "pnr_max" in leaf_params and pnr_max_val == 3:
         # Fallback to attempting to read from leaf_params if not explicit
         pnr_val_raw = leaf_params["pnr_max"]
@@ -409,20 +403,18 @@ def compute_state_with_jax(
         get_heralded(leaf_params)
     )
 
-    homodyne_x_is_none = False  # usually 0.0 means 0.0
-    homodyne_window_is_none = (
-        hom_win is None
-    )  # Forces Point Mode (hom_win is None due to fix above)
+    # Logic for Window vs Point
+    # User Requirement: ALWAYS use Point Homodyne.
+    # We approximate window probability by multiplying density by resolution.
+    # This corresponds to homodyne_window_is_none = True (Point Mode).
+    # And passing homodyne_resolution > 0.
 
-    # Logic: hom_win arg is None (forced), but we need the VALUE for resolution.
-    # Where to get value? 'hom_win' var was set to None.
-    # I need to retrieve the original value before I overwrote it.
+    homodyne_window_is_none = True
+    homodyne_resolution_is_none = homodyne_res_val <= 1e-9
+    homodyne_x_is_none = False
 
-    # Define legacy variables used later
     hom_x_val = hom_x
-    hom_win_val = homodyne_res_val  # Use captured value, or 0.0?
-    if hom_win_val is None:
-        hom_win_val = 0.0  # Safety
+    hom_win_val = homodyne_res_val
 
     # Point homodyne setup
     hom_xs = jnp.atleast_1d(hom_x_val)
@@ -433,23 +425,9 @@ def compute_state_with_jax(
     else:
         phi_vec = phi_mat.T
 
-    # Window setup
+    # V_matrix unused in Point Mode
     V_matrix = jnp.zeros((cutoff, 1))
     dx_weights = jnp.zeros(1)
-
-    # Note: homodyne_window_is_none is True (forced), so this block skipped.
-    if not homodyne_window_is_none:
-        from numpy.polynomial.legendre import leggauss
-
-        n_nodes = 61
-        _, weights = leggauss(n_nodes)
-        half_w = hom_win_val / 2.0
-        center = hom_x_val
-        xs = center + half_w * params.get("nodes_cache", np.zeros(n_nodes))
-        nodes, weights = leggauss(n_nodes)
-        xs = center + half_w * nodes
-        dx_weights = jnp.array(half_w * weights)
-        V_matrix = jax_hermite_phi_matrix(jnp.array(xs), cutoff)
 
     # Call Superblock
     (
@@ -470,15 +448,15 @@ def compute_state_with_jax(
         mix_params,
         # mix_source removed
         hom_x_val,
-        hom_win_val,
+        0.0,  # hom_window ignored in Point Mode
         homodyne_res_val,  # resolution = window size
         phi_vec,
-        V_matrix,
-        dx_weights,
+        V_matrix,  # Ignored
+        dx_weights,  # Ignored
         cutoff,
         homodyne_window_is_none,
         homodyne_x_is_none,
-        False,  # homodyne_resolution_is_none=False (Apply Scaling)
+        homodyne_resolution_is_none,
     )
 
     # 3. Final Gaussian
@@ -630,13 +608,14 @@ def extract_genotype_index(p_data: Dict[str, Any], df_len: int = 0) -> int:
 
     return genotype_idx
 
+
 def compute_active_metrics(params: Dict[str, Any]) -> Tuple[float, float]:
     """
     Compute Total Photons and Max PNR considering ONLY active leaves.
-    
+
     Args:
         params: Decoded circuit parameters dict.
-        
+
     Returns:
         (total_active_photons, max_active_pnr)
     """
@@ -648,26 +627,64 @@ def compute_active_metrics(params: Dict[str, Any]) -> Tuple[float, float]:
     if "pnr" not in leaf_params:
         return 0.0, 0.0
 
-    pnr = np.array(leaf_params["pnr"]) # Shape (L, N_C)
-    
+    pnr = np.array(leaf_params["pnr"])  # Shape (L, N_C)
+
     # 2. Get Active Flags
     if "leaf_active" in params:
         active = np.array(params["leaf_active"], dtype=bool)
     else:
         # Fallback to all active
         active = np.ones(pnr.shape[0], dtype=bool)
-        
+
     # Ensure shapes match
     if active.shape[0] != pnr.shape[0]:
         active = np.ones(pnr.shape[0], dtype=bool)
-        
-    # 3. Filter
-    active_pnr = pnr[active] # Shape (N_active, N_C)
-    
+
+    # 3. Get n_ctrl for masking
+    # n_ctrl shape (L,) or (L, 1) or list
+    if "n_ctrl" in leaf_params:
+        n_ctrl_raw = leaf_params["n_ctrl"]
+        if isinstance(n_ctrl_raw, list):
+            n_ctrl = np.array(n_ctrl_raw)
+        else:
+            n_ctrl = np.array(n_ctrl_raw)
+        # Flatten
+        n_ctrl = n_ctrl.flatten()
+    else:
+        # Default 1? Or 0?
+        # If missing, assume 1? Or all valid?
+        # Safe to assume all valid if n_ctrl active
+        n_ctrl = np.full(pnr.shape[0], pnr.shape[1], dtype=int)
+
+    # 4. Construct Mask
+    # PNR shape (L, N_C). We want mask[i, j] = j < n_ctrl[i]
+    rows, cols = pnr.shape
+    # Ensure n_ctrl matches rows
+    if n_ctrl.shape[0] != rows:
+        # Broadcast or truncation?
+        if n_ctrl.size == 1:
+            n_ctrl = np.full(rows, n_ctrl[0], dtype=int)
+        else:
+            # Mismatch fallback: use all
+            n_ctrl = np.full(rows, cols, dtype=int)
+
+    # col_indices: (1, N_C)
+    col_indices = np.arange(cols)[None, :]
+    # limits: (L, 1)
+    limits = n_ctrl[:, None]
+
+    mask = col_indices < limits  # (L, N_C) boolean
+
+    # 5. Mask PNR
+    pnr_masked = pnr * mask
+
+    # 6. Filter Active
+    active_pnr = pnr_masked[active]  # Shape (N_active, N_C)
+
     if active_pnr.size == 0:
         return 0.0, 0.0
-        
+
     total_photons = float(np.sum(active_pnr))
     max_pnr = float(np.max(active_pnr)) if active_pnr.size > 0 else 0.0
-    
+
     return total_photons, max_pnr

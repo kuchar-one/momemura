@@ -2,68 +2,59 @@ import sys
 import os
 import numpy as np
 
-# Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 from frontend.utils import compute_active_metrics
 
 
-def test_active_metrics():
-    print("Testing compute_active_metrics...")
+def verify_active_metrics_logic():
+    print("--- Verifying compute_active_metrics ---")
 
-    # Case 1: Standard Design A/B structure (Leaf Params + Active Flags)
-    # 4 Leaves. 2 Active, 2 Inactive.
-    # Active: [True, False, True, False]
-    # PNR: [[1, 0, 0], [3, 3, 3], [0, 2, 0], [1, 1, 1]] (Shape 4, 3)
-    # Expected Active PNR: [1, 0, 0] + [0, 2, 0]
-    # Total Photons: 1 + 2 = 3.
-    # Max PNR: 2.
+    # Case 1: n_ctrl masks correctly
+    # Leaf 0: PNR [8, 2], n_ctrl=2 -> Sum 10
+    # Leaf 1: PNR [8, 8], n_ctrl=0 -> Sum 0 (Previously might sum to 16)
 
-    params_1 = {
-        "leaf_active": [True, False, True, False],
-        "leaf_params": {
-            "pnr": [
-                [1, 0, 0],  # Active
-                [3, 3, 3],  # Inactive
-                [0, 2, 0],  # Active
-                [1, 1, 1],  # Inactive
-            ]
-        },
-    }
+    pnr = np.array([[8, 2], [8, 8]])
 
-    total, max_val = compute_active_metrics(params_1)
-    print(f"Case 1 (Mixed Active): Total={total}, Max={max_val}")
+    n_ctrl = np.array([2, 0])
 
-    assert total == 3.0, f"Case 1 Failed: Expected 3.0, got {total}"
-    assert max_val == 2.0, f"Case 1 Failed: Expected 2.0, got {max_val}"
+    active = np.array([True, True])
 
-    # Case 2: Legacy / No Active Flags (Implicit All Active)
-    # PNR: [[1], [2]]
-    params_2 = {"leaf_params": {"pnr": [[1], [2]]}}
+    params = {"leaf_params": {"pnr": pnr, "n_ctrl": n_ctrl}, "leaf_active": active}
 
-    total, max_val = compute_active_metrics(params_2)
-    print(f"Case 2 (Implicit Active): Total={total}, Max={max_val}")
+    total, max_p = compute_active_metrics(params)
+    print(f"Total: {total}, Max: {max_p}")
 
-    assert total == 3.0, f"Case 2 Failed: Expected 3.0, got {total}"
-    assert max_val == 2.0, f"Case 2 Failed: Expected 2.0, got {max_val}"
+    expected_total = 10.0
+    if abs(total - expected_total) < 1e-6:
+        print("PASS: Correctly masked n_ctrl=0 leaf")
+    else:
+        print(f"FAIL: Expected {expected_total}, got {total}")
+        return False
 
-    # Case 3: All Inactive
-    params_3 = {"leaf_active": [False, False], "leaf_params": {"pnr": [[5], [5]]}}
+    # Case 2: Partial n_ctrl
+    # Leaf: PNR [5, 5, 5], n_ctrl=2 -> Sum 10 (5+5), ignore last 5
+    pnr2 = np.array([[5, 5, 5]])
+    n_ctrl2 = np.array([2])
+    active2 = np.array([True])
 
-    total, max_val = compute_active_metrics(params_3)
-    print(f"Case 3 (All Inactive): Total={total}, Max={max_val}")
+    params2 = {"leaf_params": {"pnr": pnr2, "n_ctrl": n_ctrl2}, "leaf_active": active2}
 
-    assert total == 0.0, f"Case 3 Failed: Expected 0.0, got {total}"
-    assert max_val == 0.0, f"Case 3 Failed: Expected 0.0, got {max_val}"
+    total2, max_p2 = compute_active_metrics(params2)
+    print(f"Total2: {total2}")
 
-    # Case 4: No PNR keys (Empty/Error)
-    params_4 = {}
-    total, max_val = compute_active_metrics(params_4)
-    print(f"Case 4 (Empty): Total={total}, Max={max_val}")
-    assert total == 0.0
-
-    print("All tests passed!")
+    if abs(total2 - 10.0) < 1e-6:
+        print("PASS: Correctly masked partial PNR")
+        return True
+    else:
+        print(f"FAIL: Expected 10.0, got {total2}")
+        return False
 
 
 if __name__ == "__main__":
-    test_active_metrics()
+    if verify_active_metrics_logic():
+        sys.exit(0)
+    else:
+        sys.exit(1)

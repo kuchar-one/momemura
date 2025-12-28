@@ -143,6 +143,7 @@ def jax_compose_pair(
     p_xs = jnp.real(jnp.einsum("aai->i", rho_cond_stack))
 
     Pwin = jnp.sum(p_xs * dx_weights)
+    Pwin = jnp.minimum(Pwin, 1.0)
 
     rho_cond_integrated = jnp.sum(rho_cond_stack * dx_weights[None, None, :], axis=2)
 
@@ -638,6 +639,13 @@ def jax_superblock(
 
     mix_idx = 0
 
+    # Handle V_matrix broadcasting if needed
+    # If V_matrix is (cutoff, n_points), broadcast to (n_mix, cutoff, n_points)
+    # n_mix in this topology is 7 (4+2+1).
+    # We can infer from mix_params or hom_xs.
+    n_mix_total = 7  # Fixed for depth 3.
+    # But hom_xs might be (7,).
+
     # Layer 0 (8 -> 4)
     n_pairs = 4
     params_0 = mix_params[mix_idx : mix_idx + n_pairs]
@@ -645,18 +653,18 @@ def jax_superblock(
     phi_0 = phi_vecs[mix_idx : mix_idx + n_pairs]
     mix_idx += n_pairs
 
-    sA = current_states[0::2]
-    sB = current_states[1::2]
-    pA = current_probs[0::2]
-    pB = current_probs[1::2]
-    actA = current_actives[0::2]
-    actB = current_actives[1::2]
-    pnrA = current_pnrs[0::2]
-    pnrB = current_pnrs[1::2]
-    sumA = current_sum_pnrs[0::2]
-    sumB = current_sum_pnrs[1::2]
-    mA = current_modes[0::2]
-    mB = current_modes[1::2]
+    sA = leaf_states[0::2]
+    sB = leaf_states[1::2]
+    pA = leaf_probs[0::2]
+    pB = leaf_probs[1::2]
+    actA = leaf_active[0::2]
+    actB = leaf_active[1::2]
+    pnrA = leaf_pnr[0::2]
+    pnrB = leaf_pnr[1::2]
+    sumA = leaf_total_pnr[0::2]
+    sumB = leaf_total_pnr[1::2]
+    mA = leaf_modes[0::2]
+    mB = leaf_modes[1::2]
 
     (
         current_states,
@@ -751,13 +759,13 @@ def jax_superblock(
     mB = current_modes[1::2]
 
     (
-        current_states,
+        final_state,
         _,
-        current_probs,
-        current_actives,
-        current_pnrs,
-        current_sum_pnrs,
-        current_modes,
+        joint_prob,
+        is_active,
+        max_pnr,
+        total_sum_pnr,
+        active_modes,
     ) = jax.vmap(mix_node)(
         sA,
         sB,
@@ -777,11 +785,12 @@ def jax_superblock(
     )
 
     # Final result
-    root_state = current_states[0]
-    root_prob = current_probs[0]
-    root_modes = current_modes[0]
-    root_pnr = current_pnrs[0]
-    root_sum_pnr = current_sum_pnrs[0]
-    root_active = current_actives[0]
+    # Final result
+    root_state = final_state[0]
+    root_prob = joint_prob[0]
+    root_active = is_active[0]
+    root_pnr = max_pnr[0]
+    root_sum_pnr = total_sum_pnr[0]
+    root_modes = active_modes[0]
 
     return root_state, 1.0, root_prob, root_active, root_pnr, root_sum_pnr, root_modes

@@ -199,16 +199,58 @@ def render_solution_details(row, result_obj, key_suffix=""):
                         W_target,
                         xvec,
                         pvec,
-                        title="Target GKP (Ground State)",
+                        title=f"Target Ground State (Cutoff {cutoff})<br>Eigenvalue: {vals[0]:.4f}",
                     )
                     st.plotly_chart(
                         fig_target,
                         use_container_width=True,
-                        key=f"wigner_target_{genotype_idx}_{key_suffix}",
+                        key=f"target_wigner_{genotype_idx}_{key_suffix}",
                     )
-
                 except Exception as e:
-                    st.error(f"Could not compute target state: {e}")
+                    st.error(f"Error computing target Wigner: {e}")
+
+            st.divider()
+
+            # Rank-Matched Plot Row
+            if active_total_photons > 1:
+                st.subheader(
+                    f"Rank-Matched Target (Dimension {int(active_total_photons)})"
+                )
+                with st.spinner("Computing Rank-Matched Target..."):
+                    try:
+                        rank_cutoff = int(active_total_photons)
+                        # Ensure valid dimension (at least 2)
+                        rank_cutoff = max(2, rank_cutoff)
+
+                        # Construct Operator
+                        op_rank = construct_gkp_operator(
+                            rank_cutoff, t_alpha, t_beta, backend="thewalrus"
+                        )
+
+                        # Ground State
+                        vals_r, vecs_r = np.linalg.eigh(op_rank)
+                        ground_state_r = vecs_r[:, 0]
+
+                        # Wigner
+                        W_rank = utils.compute_wigner(ground_state_r, xvec, pvec)
+
+                        fig_rank = viz.plot_wigner_function(
+                            W_rank,
+                            xvec,
+                            pvec,
+                            title=f"Rank{rank_cutoff} Target<br>Dim: {rank_cutoff} | Eigenvalue: {vals_r[0]:.4f}",
+                        )
+
+                        # Center or full width?
+                        col_r1, col_r2, col_r3 = st.columns([1, 2, 1])
+                        with col_r2:
+                            st.plotly_chart(
+                                fig_rank,
+                                use_container_width=True,
+                                key=f"rank_wigner_{genotype_idx}_{key_suffix}",
+                            )
+                    except Exception as e:
+                        st.warning(f"Could not compute Rank-Matched Target: {e}")
 
         except Exception as e:
             st.error(f"Error computing Wigner: {e}")
