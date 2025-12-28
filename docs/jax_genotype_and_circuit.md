@@ -240,6 +240,24 @@ Shared across all leaves. **No Active flag** (handled separately or implicitly T
 
 ---
 
+### Balanced Genotypes (Fixed 50:50 Mixing)
+
+New variants with suffix `B` (e.g., `C2B`, `C20B`, `B3B`, `B30B`) enforce **Balanced Beam Splitters** for all mixing nodes.
+- **$\theta = \pi/4$ (50:50)**
+- **$\phi = 0$**
+- **$\varphi = 0$**
+
+The genotype length is reduced by removing the mixing parameters:
+- **Tied Mixing (C2B, C20B)**: Reduces length by 3.
+- **Independent Mixing (B3B, B30B)**: Reduces length by $3 \times (L-1)$ (e.g., 21 for depth 3).
+
+| Genotype | Base | Description |
+| :--- | :--- | :--- |
+| **C2B** | C2 | C2 with fixed balanced mixing. |
+| **C20B** | C20 | C20 with fixed balanced mixing. |
+| **B3B** | B3 | B3 with fixed balanced mixing. |
+| **B30B** | B30 | B30 with fixed balanced mixing. |
+
 ## Circuit Evaluation
 
 Evaluation logic remains consistent across designs. State generation (`jax_get_heralded_state`) and Superblock combination (`jax_superblock`) consume the decoded parameters to produce a final state and score.

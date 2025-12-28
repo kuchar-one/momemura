@@ -3,16 +3,15 @@ import os
 import numpy as np
 import jax
 import jax.numpy as jnp
-from typing import Dict, Any
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.genotypes.genotypes import get_genotype_decoder
-from src.simulation.jax.runner import jax_get_heralded_state
-from frontend.utils import compute_state_with_jax
-from src.simulation.jax.composer import jax_superblock
+from src.genotypes.genotypes import get_genotype_decoder  # noqa: E402
+from src.simulation.jax.runner import jax_get_heralded_state  # noqa: E402
+from frontend.utils import compute_state_with_jax  # noqa: E402
+from src.simulation.jax.composer import jax_superblock  # noqa: E402
 
 
 def verify_c20_probabilities():
@@ -67,7 +66,7 @@ def verify_c20_probabilities():
     )
 
     # Call superblock manually
-    op_matrix = jnp.eye(cutoff)  # Dummy op
+    # op_matrix = jnp.eye(cutoff)  # Dummy op (Unused)
 
     # Point Homodyne Logic
     hom_x_val = params["homodyne_x"]

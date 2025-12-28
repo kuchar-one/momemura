@@ -414,7 +414,7 @@ def compute_state_with_jax(
     homodyne_x_is_none = False
 
     hom_x_val = hom_x
-    hom_win_val = homodyne_res_val
+    # hom_win_val = homodyne_res_val # Unused
 
     # Point homodyne setup
     hom_xs = jnp.atleast_1d(hom_x_val)

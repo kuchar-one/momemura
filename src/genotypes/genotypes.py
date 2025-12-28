@@ -1211,6 +1211,136 @@ class DesignC20Genotype(DesignC2Genotype):
         return decoded
 
 
+class DesignC2BGenotype(DesignC2Genotype):
+    """Balanced version of C2 (50:50 Beam Splitters)."""
+
+    def get_length(self, depth: int = 3) -> int:
+        # C2 includes C1 part (Hom, BP, Mix, Final) + Active.
+        # C1 mixed params are 3 (Tied-All: theta, phi, varphi).
+        # We remove these 3.
+        return super().get_length(depth) - 3
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # C2 input g: [Hom(1), BP, Final, Active]
+        # Need to inject 3 zeros into C2 structure between BP and Final.
+        # Structure of C1 (which C2 uses): Hom(1) + BP + Mix(3) + Final.
+
+        # Calculate BP (Shared Block Length)
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        len_pnr = N_C
+        BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        split_idx = 1 + BP  # After Hom(1) + BP
+
+        g_mix_zeros = jnp.zeros(3)
+        g_syn = jnp.concatenate([g[:split_idx], g_mix_zeros, g[split_idx:]])
+
+        decoded = super().decode(g_syn, cutoff)
+
+        # Override Mix to Balanced (Time-Reversal Symmetric 50:50 BS?)
+        # Standard Balanced BS: theta=pi/4, phi=0.
+        mix_one = jnp.array([[jnp.pi / 4, 0.0, 0.0]])
+        mix_angles = jnp.broadcast_to(mix_one, (self.nodes, 3))
+        decoded["mix_params"] = mix_angles
+
+        return decoded
+
+
+class DesignC20BGenotype(DesignC20Genotype):
+    """Balanced version of C20 (50:50 Beam Splitters)."""
+
+    def get_length(self, depth: int = 3) -> int:
+        # C20 inherits C2. Mix params are 3 (Tied).
+        return super().get_length(depth) - 3
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # C20 expects: [Hom(L-1), BP, Mix(3), Final, Active]
+        # C20B input: [Hom(L-1), BP, Final, Active]
+
+        # Calculate BP
+        N_C = self.n_control
+        n_uc_pairs = (N_C * (N_C - 1)) // 2
+        len_uc = 2 * n_uc_pairs + N_C
+        len_disp_c = 2 * N_C
+        len_pnr = N_C
+        BP = 1 + 1 + 1 + len_uc + 2 + len_disp_c + len_pnr
+
+        # Split after Hom(L-1) + BP
+        # C20 uses (L-1) nodes for homodyne x
+        split_idx = self.nodes + BP
+
+        g_mix_zeros = jnp.zeros(3)
+        g_syn = jnp.concatenate([g[:split_idx], g_mix_zeros, g[split_idx:]])
+
+        # Use super().decode() which is C20.decode -> C2.decode (via swap) logic
+        decoded = super().decode(g_syn, cutoff)
+
+        # Override Mix
+        mix_one = jnp.array([[jnp.pi / 4, 0.0, 0.0]])
+        mix_angles = jnp.broadcast_to(mix_one, (self.nodes, 3))
+        decoded["mix_params"] = mix_angles
+
+        return decoded
+
+
+class DesignB3BGenotype(DesignB3Genotype):
+    """Balanced version of B3 (50:50 Beam Splitters)."""
+
+    def get_length(self, depth: int = 3) -> int:
+        # B3 has 'nodes' mixing blocks, each 3 params.
+        return super().get_length(depth) - 3 * self.nodes
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # B3 Input: [Hom(1), Shared, Unique*L, Mix(3*nodes), Final]
+        # B3B Input: [Hom(1), Shared, Unique*L, Final]
+
+        # B3 decode structure matches definition.
+        split_idx = 1 + self.Sharedv + self.leaves * self.Unique
+
+        n_mix_params = 3 * self.nodes
+        g_mix = jnp.zeros(n_mix_params)
+        g_syn = jnp.concatenate([g[:split_idx], g_mix, g[split_idx:]])
+
+        decoded = super().decode(g_syn, cutoff)
+
+        # Override Mix
+        mix_one = jnp.array([[jnp.pi / 4, 0.0, 0.0]])
+        mix_angles = jnp.broadcast_to(mix_one, (self.nodes, 3))
+        decoded["mix_params"] = mix_angles
+
+        return decoded
+
+
+class DesignB30BGenotype(DesignB30Genotype):
+    """Balanced version of B30 (50:50 Beam Splitters)."""
+
+    def get_length(self, depth: int = 3) -> int:
+        return super().get_length(depth) - 3 * self.nodes
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # B30 Input: [Hom(L-1), Shared, Unique*L, Mix, Final]
+        # B30B Input: [Hom(L-1), Shared, Unique*L, Final]
+
+        # Split after Hom(L-1) + Shared + Unique*L
+        split_idx = self.nodes + self.Sharedv + self.leaves * self.Unique
+
+        n_mix_params = 3 * self.nodes
+        g_mix = jnp.zeros(n_mix_params)
+        g_syn = jnp.concatenate([g[:split_idx], g_mix, g[split_idx:]])
+
+        decoded = super().decode(g_syn, cutoff)
+
+        # Override Mix
+        mix_one = jnp.array([[jnp.pi / 4, 0.0, 0.0]])
+        mix_angles = jnp.broadcast_to(mix_one, (self.nodes, 3))
+        decoded["mix_params"] = mix_angles
+
+        return decoded
+
+
 GENOTYPE_REGISTRY = {
     "legacy": LegacyGenotype,
     "A": DesignAGenotype,
@@ -1218,9 +1348,13 @@ GENOTYPE_REGISTRY = {
     "B2": DesignB2Genotype,
     "B3": DesignB3Genotype,
     "B30": DesignB30Genotype,
+    "B3B": DesignB3BGenotype,
+    "B30B": DesignB30BGenotype,
     "C1": DesignC1Genotype,
     "C2": DesignC2Genotype,
     "C20": DesignC20Genotype,
+    "C2B": DesignC2BGenotype,
+    "C20B": DesignC20BGenotype,
 }
 
 
