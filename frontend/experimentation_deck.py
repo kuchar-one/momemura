@@ -82,7 +82,7 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
     """
 
     # 1. Generate Source A
-    if config_a["type"] == "Fock":
+    if config_a["type"] == "Fock State":
         vec_a = parse_fock_input(config_a["fock_coeffs"], cutoff_dim)
         prob_a = 1.0
     else:
@@ -108,7 +108,7 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
         prob_a = float(prob_a_jax)
 
     # 2. Generate Source B (Mirror A)
-    if config_b["type"] == "Fock":
+    if config_b["type"] == "Fock State":
         vec_b = parse_fock_input(config_b["fock_coeffs"], cutoff_dim)
         prob_b = 1.0
     else:
