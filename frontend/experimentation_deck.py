@@ -228,7 +228,7 @@ def get_drawing_params(config_params):
 
     # 4. Displacements
     # Zero
-    disp_s = []
+    disp_s = [0.0]
     disp_c = [0.0] * n_c
 
     return {
