@@ -311,6 +311,7 @@ with col_in_a:
             pnr_a = [0]
         if len(pnr_a) < nc_a:
             pnr_a = pnr_a + [0] * (nc_a - len(pnr_a))
+        pnr_a = pnr_a[:nc_a]
 
         config_a["params"] = {
             "r": r_a,
@@ -374,6 +375,7 @@ with col_in_b:
             pnr_b = [0]
         if len(pnr_b) < nc_b:
             pnr_b = pnr_b + [0] * (nc_b - len(pnr_b))
+        pnr_b = pnr_b[:nc_b]
 
         config_b["params"] = {
             "r": r_b,
