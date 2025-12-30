@@ -3,6 +3,8 @@ import numpy as np
 import plotly.express as px
 import jax.numpy as jnp
 from typing import Dict
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Add project root to path
 import sys
@@ -460,19 +462,52 @@ if st.button("Run Experiment", type="primary"):
             # Fock Dist
             st.subheader("Output Fock Distribution")
             psi_out = res["state_out"]
-            # Ensure 1D
-            if psi_out.ndim > 1:
-                # If DM, diag?
-                probs = np.real(np.diag(psi_out))
-            else:
+
+            if psi_out.ndim == 1:
+                # Pure State: Show Amplitudes (Real/Imag) and Probabilities
+                n_states = len(psi_out)
+                x = np.arange(n_states)
+                re = np.real(psi_out)
+                im = np.imag(psi_out)
                 probs = np.abs(psi_out) ** 2
 
-            fig_fock = px.bar(
-                x=np.arange(len(probs)),
-                y=probs,
-                labels={"x": "Fock State |n>", "y": "Probability"},
-            )
-            st.plotly_chart(fig_fock, use_container_width=True)
+                fig = make_subplots(
+                    rows=2,
+                    cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.1,
+                    subplot_titles=("Amplitudes (Real/Imag)", "Probability"),
+                )
+
+                # Row 1: Amplitudes
+                fig.add_trace(
+                    go.Bar(name="Real", x=x, y=re, marker_color="blue"), row=1, col=1
+                )
+                fig.add_trace(
+                    go.Bar(name="Imag", x=x, y=im, marker_color="red"), row=1, col=1
+                )
+
+                # Row 2: Probabilities
+                fig.add_trace(
+                    go.Bar(name="Prob", x=x, y=probs, marker_color="green"),
+                    row=2,
+                    col=1,
+                )
+
+                fig.update_layout(barmode="group", height=500)
+                fig.update_xaxes(title_text="Fock State |n>", row=2, col=1)
+                st.plotly_chart(fig, use_container_width=True)
+
+            else:
+                # Mixed State: Probabilities only (diagonal)
+                probs = np.real(np.diag(psi_out))
+                fig_fock = px.bar(
+                    x=np.arange(len(probs)),
+                    y=probs,
+                    labels={"x": "Fock State |n>", "y": "Probability"},
+                    title="Output Fock Distribution (Mixed State)",
+                )
+                st.plotly_chart(fig_fock, use_container_width=True)
 
             # Circuit Schematic
             st.divider()
