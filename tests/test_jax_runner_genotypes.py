@@ -13,7 +13,7 @@ from src.genotypes.genotypes import get_genotype_decoder
 jax.config.update("jax_enable_x64", True)
 
 
-@pytest.mark.parametrize("name", ["legacy", "A", "B1", "B2", "C1", "C2"])
+@pytest.mark.parametrize("name", ["A", "B1", "B2", "C1", "C2", "B30B"])
 def test_runner_with_genotype_types(name):
     """
     Verifies that jax_scoring_fn_batch runs with different genotype types
@@ -21,7 +21,9 @@ def test_runner_with_genotype_types(name):
     """
     cutoff = 6
     depth = 3
-    decoder = get_genotype_decoder(name, depth=depth)
+    # Use default modes=3
+    config = {"modes": 3}
+    decoder = get_genotype_decoder(name, depth=depth, config=config)
     length = decoder.get_length(depth)
 
     batch_size = 4
@@ -34,7 +36,7 @@ def test_runner_with_genotype_types(name):
 
     # Run scoring
     fitnesses, descriptors = jax_scoring_fn_batch(
-        genotypes, cutoff, operator, genotype_name=name
+        genotypes, cutoff, operator, genotype_name=name, genotype_config=config
     )
 
     assert fitnesses.shape == (batch_size, 4)
@@ -51,5 +53,4 @@ def test_runner_with_genotype_types(name):
 
 if __name__ == "__main__":
     # fast run
-    test_runner_with_genotype_types("legacy")
     test_runner_with_genotype_types("A")

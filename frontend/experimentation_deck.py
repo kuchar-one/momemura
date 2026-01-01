@@ -16,7 +16,7 @@ if project_root not in sys.path:
 
 # Import Backend Components
 try:
-    from src.simulation.jax.runner import jax_get_heralded_state
+    from src.simulation.jax.runner import jax_get_heralded_state, jax_clements_unitary
     from src.simulation.jax.composer import (
         jax_compose_pair,
         jax_u_bs,
@@ -75,12 +75,6 @@ def parse_fock_input(text_input: str, dim: int) -> np.ndarray:
 def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim: int):
     """
     Run the full simulation using JAX backend.
-
-    Returns:
-        Result Dict containing:
-        - 'state_a', 'prob_a'
-        - 'state_b', 'prob_b'
-        - 'state_out', 'prob_out', 'prob_joint'
     """
 
     # 1. Generate Source A
@@ -89,18 +83,16 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
         prob_a = 1.0
     else:
         p_a = config_a["params"]
-        n_c = p_a["n_control"]
+        # Extract General Gaussian params
+        n_ctrl = p_a["n_control"]
+        modes = n_ctrl + 1
 
         leaf_params_a = {
-            "n_ctrl": jnp.array(n_c),  # Scalar (0-D)
-            "tmss_r": jnp.array(p_a["r"]),  # Scalar (0-D)
-            "us_phase": jnp.array([p_a["phase"]]),
-            "uc_theta": jnp.array(p_a["uc_theta"]),
-            "uc_phi": jnp.array(p_a["uc_phi"]),
-            "uc_varphi": jnp.array(p_a["uc_varphi"]),
-            "disp_s": jnp.array([0.0]),
-            "disp_c": jnp.zeros(n_c),
-            "pnr": jnp.array(p_a["pnr"]),  # Shape (N_C,)
+            "n_ctrl": jnp.array(n_ctrl),
+            "r": jnp.array(p_a["r"]),  # (N,)
+            "phases": jnp.array(p_a["phases"]),  # (N^2,)
+            "disp": jnp.array(p_a["disp"]),  # (N,) complex
+            "pnr": jnp.array(p_a["pnr"]),  # (N-1,)
         }
 
         vec_a_jax, prob_a_jax, _, _, _, _ = jax_get_heralded_state(
@@ -115,16 +107,13 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
         prob_b = 1.0
     else:
         p_b = config_b["params"]
-        n_c = p_b["n_control"]
+        n_ctrl = p_b["n_control"]
+
         leaf_params_b = {
-            "n_ctrl": jnp.array(n_c),  # Scalar (0-D)
-            "tmss_r": jnp.array(p_b["r"]),  # Scalar (0-D)
-            "us_phase": jnp.array([p_b["phase"]]),
-            "uc_theta": jnp.array(p_b["uc_theta"]),
-            "uc_phi": jnp.array(p_b["uc_phi"]),
-            "uc_varphi": jnp.array(p_b["uc_varphi"]),
-            "disp_s": jnp.array([0.0]),
-            "disp_c": jnp.zeros(n_c),
+            "n_ctrl": jnp.array(n_ctrl),
+            "r": jnp.array(p_b["r"]),
+            "phases": jnp.array(p_b["phases"]),
+            "disp": jnp.array(p_b["disp"]),
             "pnr": jnp.array(p_b["pnr"]),
         }
         vec_b_jax, prob_b_jax, _, _, _, _ = jax_get_heralded_state(
@@ -136,7 +125,6 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
     # 3. Mixing / Pass
     mode = mix_config["mode"]
 
-    # Defaults
     vec_out = vec_a
     prob_joint = prob_a * prob_b
 
@@ -155,14 +143,11 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
         _hom_angle = mix_config["hom_angle"]
         hom_val = mix_config["hom_val"]  # Homodyne X
 
-        # Prepare JAX inputs
         state_A_jax = jnp.array(vec_a)
         state_B_jax = jnp.array(vec_b)
 
-        # U_BS
         U = jax_u_bs(theta, phi, cutoff_dim)
 
-        # Point Homodyne Vectors
         hom_xs = jnp.atleast_1d(jnp.array(hom_val))
         phi_mat = jax_hermite_phi_matrix(hom_xs, cutoff_dim)
         phi_vec = phi_mat[:, 0]
@@ -175,16 +160,16 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
             U,
             prob_a,
             prob_b,
-            jnp.array(hom_val),  # hom_x
-            0.0,  # win
-            res_val,  # res
+            jnp.array(hom_val),
+            0.0,
+            res_val,
             phi_vec,
             None,
-            None,  # V, dx
+            None,
             cutoff_dim,
             homodyne_window_is_none=True,
             homodyne_x_is_none=False,
-            homodyne_resolution_is_none=True,  # Just get density
+            homodyne_resolution_is_none=True,
             theta=theta,
             phi=phi,
         )
@@ -204,43 +189,80 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
     }
 
 
-def get_drawing_params(config_params):
-    """Convert config params to circuit drawing params."""
-    # config: r, phase, n_control, uc_theta/phi/varphi, pnr
-    n_c = config_params["n_control"]
+def create_gaussian_ui(key_suffix: str):
+    """
+    UI for General Gaussian Params (N modes).
+    Returns params dict.
+    """
+    nc = st.number_input(f"N Control ({key_suffix})", 1, 5, 1, key=f"nc_{key_suffix}")
+    modes = nc + 1
 
-    # 1. TMSS
-    # If n_c >= 1, r applies to (0, 1).
-    tmss_sq = [config_params["r"]] if n_c >= 1 else []
+    st.markdown(f"**Total Modes: {modes} (1 Signal + {nc} Control)**")
 
-    # 2. US
-    # config phase is scalar.
-    us_p = {"theta": [], "phi": [], "varphi": [config_params["phase"]]}
+    with st.expander("Squeezing (r)", expanded=True):
+        # Allow comma separated input
+        r_str = st.text_input(
+            f"r vector (len {modes})",
+            "0.0, " * (modes - 1) + "0.0",
+            key=f"r_{key_suffix}",
+        )
+        try:
+            r_vals = [float(x) for x in r_str.split(",")]
+        except ValueError:
+            r_vals = [0.0] * modes
+        # Pad/Truncate
+        if len(r_vals) < modes:
+            r_vals += [0.0] * (modes - len(r_vals))
+        r_vals = r_vals[:modes]
 
-    # 3. UC
-    # Split
-    def ensure_list(x):
-        return x if isinstance(x, list) else [x]
+    with st.expander("Phases (Clements)", expanded=False):
+        n_phases = modes * modes
+        st.caption(f"Requires {n_phases} phases for U({modes})")
+        ph_str = st.text_area(
+            f"Phases (len {n_phases})",
+            "0.0, " * (n_phases - 1) + "0.0",
+            key=f"ph_{key_suffix}",
+        )
+        try:
+            ph_vals = [float(x) for x in ph_str.replace("\n", ",").split(",")]
+        except ValueError:
+            ph_vals = [0.0] * n_phases
+        if len(ph_vals) < n_phases:
+            ph_vals += [0.0] * (n_phases - len(ph_vals))
+        ph_vals = ph_vals[:n_phases]
 
-    uc_p = {
-        "theta": ensure_list(config_params["uc_theta"]),
-        "phi": ensure_list(config_params["uc_phi"]),
-        "varphi": ensure_list(config_params["uc_varphi"]),
-    }
+    with st.expander("Displacement (alpha)", expanded=False):
+        st.caption(f"Requires {modes} complex vals")
+        dip_str = st.text_input(
+            f"Disp (complex)", "0.0, " * (modes - 1) + "0.0", key=f"d_{key_suffix}"
+        )
+        try:
+            d_vals = []
+            for x in dip_str.split(","):
+                d_vals.append(complex(x.strip()))
+        except ValueError:
+            d_vals = [0j] * modes
+        if len(d_vals) < modes:
+            d_vals += [0j] * (modes - len(d_vals))
+        d_vals = d_vals[:modes]
 
-    # 4. Displacements
-    # Zero
-    disp_s = [0.0]
-    disp_c = [0.0] * n_c
+    with st.expander("PNR Outcomes", expanded=True):
+        st.caption(f"Requires {nc} integers (Control Modes 1..{nc})")
+        pnr_str = st.text_input(f"PNR", "0, " * (nc - 1) + "0", key=f"pnr_{key_suffix}")
+        try:
+            pnr_vals = [int(x) for x in pnr_str.split(",")]
+        except ValueError:
+            pnr_vals = [0] * nc
+        if len(pnr_vals) < nc:
+            pnr_vals += [0] * (nc - len(pnr_vals))
+        pnr_vals = pnr_vals[:nc]
 
     return {
-        "n_signal": 1,
-        "n_control": n_c,
-        "tmss_squeezing": tmss_sq,
-        "us_params": us_p,
-        "uc_params": uc_p,
-        "disp_s": disp_s,
-        "disp_c": disp_c,
+        "n_control": nc,
+        "r": r_vals,
+        "phases": ph_vals,
+        "disp": d_vals,
+        "pnr": pnr_vals,
     }
 
 
@@ -259,71 +281,8 @@ with col_in_a:
         f_in = st.text_input("Fock Coeffs (0, 1...)", "0, 1", key="fock_a")
         config_a["fock_coeffs"] = f_in
     else:
-        # Gaussian Params
-        r_a = st.slider("r (Squeezing)", -2.0, 2.0, 1.0, key="r_a")
-        ph_a = st.slider("Signal Phase", 0.0, 2 * np.pi, 0.0, key="ph_a")
-        nc_a = st.number_input("N Control", 1, 3, 1, key="nc_a")
-
-        # UC Params
-        # Expanders for complex setups
-        with st.expander("Control Unitary Params", expanded=False):
-            # We need n_pair parameters.
-            n_pairs = (nc_a * (nc_a - 1)) // 2
-
-            uc_th = []
-            uc_phi = []
-            if n_pairs > 0:
-                st.markdown(f"**Pairs**: {n_pairs}")
-                # Simple text input for lists or just one uniform value?
-                # Let's do uniform for ease, with toggle?
-                # Or parsing "0.1, 0.2"
-                th_str = st.text_input("Thetas (comma sep)", "0.0", key="ucth_a")
-                phi_str = st.text_input("Phis (comma sep)", "0.0", key="ucphi_a")
-
-                # Parse
-                try:
-                    uc_th = [float(x) for x in th_str.split(",")]
-                except ValueError:
-                    uc_th = [0.0]
-                try:
-                    uc_phi = [float(x) for x in phi_str.split(",")]
-                except ValueError:
-                    uc_phi = [0.0]
-
-                # Pad
-                if len(uc_th) < n_pairs:
-                    uc_th = uc_th + [uc_th[-1]] * (n_pairs - len(uc_th))
-                if len(uc_phi) < n_pairs:
-                    uc_phi = uc_phi + [uc_phi[-1]] * (n_pairs - len(uc_phi))
-
-            # Varphis (N_Control)
-            var_str = st.text_input("Varphis (Control Phases)", "0.0", key="ucvar_a")
-            try:
-                uc_var = [float(x) for x in var_str.split(",")]
-            except ValueError:
-                uc_var = [0.0]
-            if len(uc_var) < nc_a:
-                uc_var = uc_var + [uc_var[-1]] * (nc_a - len(uc_var))
-
-        # PNR
-        pnr_str = st.text_input("PNR Outcome (e.g. 1,0)", "1, 0", key="pnr_a")
-        try:
-            pnr_a = [int(x) for x in pnr_str.split(",")]
-        except ValueError:
-            pnr_a = [0]
-        if len(pnr_a) < nc_a:
-            pnr_a = pnr_a + [0] * (nc_a - len(pnr_a))
-        pnr_a = pnr_a[:nc_a]
-
-        config_a["params"] = {
-            "r": r_a,
-            "phase": ph_a,
-            "n_control": nc_a,
-            "uc_theta": uc_th,
-            "uc_phi": uc_phi,
-            "uc_varphi": uc_var,
-            "pnr": pnr_a,
-        }
+        # General Gaussian UI
+        config_a["params"] = create_gaussian_ui("A")
 
 # --- Source B ---
 with col_in_b:
@@ -336,58 +295,7 @@ with col_in_b:
         f_in = st.text_input("Fock Coeffs (0, 1...)", "1", key="fock_b")
         config_b["fock_coeffs"] = f_in
     else:
-        # Gaussian Params
-        r_b = st.slider("r (Squeezing)", -2.0, 2.0, 0.0, key="r_b")
-        ph_b = st.slider("Signal Phase", 0.0, 2 * np.pi, 0.0, key="ph_b")
-        nc_b = st.number_input("N Control", 1, 3, 1, key="nc_b")
-
-        with st.expander("Control Unitary Params", expanded=False):
-            n_pairs = (nc_b * (nc_b - 1)) // 2
-            uc_th = []
-            uc_phi = []
-            if n_pairs > 0:
-                st.markdown(f"**Pairs**: {n_pairs}")
-                th_str = st.text_input("Thetas", "0.0", key="ucth_b")
-                phi_str = st.text_input("Phis", "0.0", key="ucphi_b")
-                try:
-                    uc_th = [float(x) for x in th_str.split(",")]
-                except ValueError:
-                    uc_th = [0.0]
-                try:
-                    uc_phi = [float(x) for x in phi_str.split(",")]
-                except ValueError:
-                    uc_phi = [0.0]
-                if len(uc_th) < n_pairs:
-                    uc_th = uc_th + [uc_th[-1]] * (n_pairs - len(uc_th))
-                if len(uc_phi) < n_pairs:
-                    uc_phi = uc_phi + [uc_phi[-1]] * (n_pairs - len(uc_phi))
-
-            var_str = st.text_input("Varphis", "0.0", key="ucvar_b")
-            try:
-                uc_var = [float(x) for x in var_str.split(",")]
-            except ValueError:
-                uc_var = [0.0]
-            if len(uc_var) < nc_b:
-                uc_var = uc_var + [uc_var[-1]] * (nc_b - len(uc_var))
-
-        pnr_str = st.text_input("PNR Outcome", "0", key="pnr_b")
-        try:
-            pnr_b = [int(x) for x in pnr_str.split(",")]
-        except ValueError:
-            pnr_b = [0]
-        if len(pnr_b) < nc_b:
-            pnr_b = pnr_b + [0] * (nc_b - len(pnr_b))
-        pnr_b = pnr_b[:nc_b]
-
-        config_b["params"] = {
-            "r": r_b,
-            "phase": ph_b,
-            "n_control": nc_b,
-            "uc_theta": uc_th,
-            "uc_phi": uc_phi,
-            "uc_varphi": uc_var,
-            "pnr": pnr_b,
-        }
+        config_b["params"] = create_gaussian_ui("B")
 
 # --- Mixing Section ---
 with col_mid:
@@ -402,13 +310,11 @@ with col_mid:
 
         st.markdown("---")
         st.markdown("**Measurement**")
-        # Homodyne
         hom_angle = st.slider(
-            "Homodyne Angle (Unused?)",
+            "Homodyne Angle",
             0.0,
             2 * np.pi,
             0.0,
-            help="Rotation before X meas? Assuming standard X meas in basis.",
             key="hom_ang",
         )
         hom_val = st.number_input(
@@ -446,7 +352,6 @@ if st.button("Run Experiment", type="primary"):
 
             vrow1, vrow2, vrow3 = st.columns(3)
 
-            # Helper for plot
             def show_wig(psi, title, key, col):
                 W = utils.compute_wigner(psi, xvec, pvec)
                 fig = viz.plot_wigner_function(W, xvec, pvec, title=title)
@@ -464,7 +369,6 @@ if st.button("Run Experiment", type="primary"):
             psi_out = res["state_out"]
 
             if psi_out.ndim == 1:
-                # Pure State: Show Amplitudes (Real/Imag) and Probabilities
                 n_states = len(psi_out)
                 x = np.arange(n_states)
                 re = np.real(psi_out)
@@ -478,28 +382,22 @@ if st.button("Run Experiment", type="primary"):
                     vertical_spacing=0.1,
                     subplot_titles=("Amplitudes (Real/Imag)", "Probability"),
                 )
-
-                # Row 1: Amplitudes
                 fig.add_trace(
                     go.Bar(name="Real", x=x, y=re, marker_color="blue"), row=1, col=1
                 )
                 fig.add_trace(
                     go.Bar(name="Imag", x=x, y=im, marker_color="red"), row=1, col=1
                 )
-
-                # Row 2: Probabilities
                 fig.add_trace(
                     go.Bar(name="Prob", x=x, y=probs, marker_color="green"),
                     row=2,
                     col=1,
                 )
-
                 fig.update_layout(barmode="group", height=500)
                 fig.update_xaxes(title_text="Fock State |n>", row=2, col=1)
                 st.plotly_chart(fig, use_container_width=True)
 
             else:
-                # Mixed State: Probabilities only (diagonal)
                 probs = np.real(np.diag(psi_out))
                 fig_fock = px.bar(
                     x=np.arange(len(probs)),
@@ -509,28 +407,20 @@ if st.button("Run Experiment", type="primary"):
                 )
                 st.plotly_chart(fig_fock, use_container_width=True)
 
-            # Circuit Schematic
+            # Circuit Schematic (Placeholder)
             st.divider()
-            st.subheader("Circuit Schematics (Input)")
-
+            st.subheader("Circuit Schematics")
             sc1, sc2 = st.columns(2)
             with sc1:
                 if config_a["type"] == "Gaussian Circuit":
-                    st.caption("Source A Circuit")
-                    d_params = get_drawing_params(config_a["params"])
-                    fig_circ = utils.get_circuit_figure(d_params)
+                    st.caption("Source A (General Gaussian)")
+                    fig_circ = utils.get_circuit_figure(config_a["params"])
                     st.pyplot(fig_circ)
-                else:
-                    st.info("Source A is Fock State (No Circuit)")
-
             with sc2:
                 if config_b["type"] == "Gaussian Circuit":
-                    st.caption("Source B Circuit")
-                    d_params = get_drawing_params(config_b["params"])
-                    fig_circ = utils.get_circuit_figure(d_params)
+                    st.caption("Source B (General Gaussian)")
+                    fig_circ = utils.get_circuit_figure(config_b["params"])
                     st.pyplot(fig_circ)
-                else:
-                    st.info("Source B is Fock State (No Circuit)")
 
         except Exception as e:
             st.error(f"Simulation Error: {e}")

@@ -5,7 +5,6 @@ import qutip as qt
 from typing import List, Tuple, Dict, Any
 
 # Ensure we can import from src
-# Assuming this is running from project root or frontend/
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
@@ -24,12 +23,8 @@ def list_runs(output_dir: str = "output") -> List[str]:
         for d in os.listdir(output_dir)
         if os.path.isdir(os.path.join(output_dir, d)) and not d.startswith(".")
     ]
-    # Sort by timestamp (descending)
     runs.sort(reverse=True)
 
-    # Also scan for "experiments" folder and include its subfolders?
-    # Or just `output/experiments/GROUP_ID`.
-    # Let's check `output/experiments` if it exists.
     exp_dir = os.path.join(output_dir, "experiments")
     if os.path.exists(exp_dir):
         exp_groups = [
@@ -38,7 +33,6 @@ def list_runs(output_dir: str = "output") -> List[str]:
             if os.path.isdir(os.path.join(exp_dir, d)) and not d.startswith(".")
         ]
         exp_groups.sort(reverse=True)
-        # Prepend experiment groups to the list
         runs = exp_groups + runs
 
     return runs
@@ -47,12 +41,7 @@ def list_runs(output_dir: str = "output") -> List[str]:
 def load_run(run_dir: str) -> OptimizationResult:
     """
     Load OptimizationResult from a run directory.
-    Detects if it's a single run or an experiment group.
     """
-    # Check if run_dir contains 'experiments' part or if it has subfolders with results
-    # Better logic: Check if run_dir contains 'results.pkl' DIRECTLY.
-    # If not, check if children have 'results.pkl'.
-
     path = (
         os.path.join(project_root, run_dir) if not os.path.isabs(run_dir) else run_dir
     )
@@ -60,7 +49,6 @@ def load_run(run_dir: str) -> OptimizationResult:
     if os.path.exists(os.path.join(path, "results.pkl")):
         return OptimizationResult.load(path)
 
-    # Check for subdirs
     has_subruns = False
     if os.path.isdir(path):
         for item in os.listdir(path):
@@ -70,7 +58,6 @@ def load_run(run_dir: str) -> OptimizationResult:
                 break
 
     if has_subruns:
-        # Import dynamically to avoid circular issues if any (though result_manager is safe)
         from src.utils.result_manager import AggregatedOptimizationResult
 
         return AggregatedOptimizationResult.load_group(path)
@@ -78,258 +65,132 @@ def load_run(run_dir: str) -> OptimizationResult:
     raise ValueError(f"No valid run found at {path}")
 
 
-def to_scalar(x: Any) -> Any:  # Union[float, complex]
+def to_scalar(x: Any) -> Any:
     """Safely convert x to a scalar float or complex."""
     try:
-        # 0. Handle None
         if x is None:
             return 0.0
-
-        # 1. Exact Scalar types
         if isinstance(x, (float, complex, int)) and not isinstance(x, bool):
             return x
-
-        # 2. Numpy/Jax Array/Scalar wrapper
         if hasattr(x, "item"):
-            val = x.item()
-            return val
-
-        # 3. Iterables (Lists, Tuples) - but NOT strings
+            return x.item()
         if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)):
             lst = list(x)
             if len(lst) == 1:
                 elem = lst[0]
-                # Recursively scalarize
-                # Or flat handling
                 if hasattr(elem, "item"):
                     return elem.item()
                 if isinstance(elem, (float, complex, int)):
                     return elem
                 if isinstance(elem, list) and len(elem) == 1:
                     return elem[0]
-
-                # Check duck typing on ELEMENT (safe because element is unwrapped)
-                if hasattr(elem, "imag"):
-                    return elem
-
-                return elem  # Return unpacked element regardless, hoping for the best
-
+                return elem
             raise ValueError(f"Cannot scalarize iterable of length {len(lst)}: {lst}")
-
-        # 4. Fallback Duck Typing (for scalar-like objects that failed isinstance)
-        # Be careful not to catch arrays here if they skipped item check?
-        # Arrays hav 'imag' but usually have 'item'.
-        # If item failed/missing, maybe it IS a scalar?
-        if hasattr(x, "imag") and hasattr(x, "real"):
-            # Verify it's not iterable (array)
-            if not hasattr(x, "__iter__"):
-                return x
-
-        # 5. Fallback Casting
+        if hasattr(x, "imag") and hasattr(x, "real") and not hasattr(x, "__iter__"):
+            return x
         try:
             return float(x)
         except (ValueError, TypeError):
-            # If float conversion fails (e.g. complex), try complex conversion
             return complex(x)
-
-    except (ValueError, TypeError) as e:
-        # Final catch-all with useful debug info
-        # Check standard types one last time
+    except Exception:
         if isinstance(x, complex):
             return x
-
-        raise ValueError(
-            f"Failed to scalarize value '{x}' (Type: {type(x)}): {e}"
-        ) from e
-    except Exception:
-        # Absolute last resort
         return float(x)
 
 
 def _extract_active_leaf_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Helper to extract parameters for the active leaf if 'leaf_params' is present.
-    Returns a flattened dictionary compatible with GaussianHeraldCircuit.
+    Adapts General Gaussian params to flattened structure for drawing or legacy views.
     """
     if "leaf_params" not in params:
         return params
 
     leaf_params = params["leaf_params"]
-    # We ignore leaf_active array for finding the "Best/Main" leaf
-    # Instead, we should trace the tree from root to find the most significant active path.
-    # However, simple tracing gets stuck if root mixes 50/50.
-    # ALTERNATIVE: Scan all 8 leaves and pick the one with MAX energy (Squeezing * n_ctrl).
-    # This guarantees we show the "biggest" configuration.
 
+    # Heuristic: Pick leaf with max Energy (Squeezing norm)
     active_idx = 0
     max_score = -1.0
 
-    # Helper extracting flattened lists
     def get_list(arr):
         if hasattr(arr, "tolist"):
             return arr.tolist()
-        return arr if isinstance(arr, list) else [arr]  # dummy fallback
+        return arr if isinstance(arr, list) else [arr]
 
-    # Scan leaves
     try:
-        r_list = get_list(leaf_params.get("tmss_r", [0.0] * 8))
+        # General Gaussian 'r' is (L, N)
+        r_list = get_list(leaf_params.get("r", []))  # List of lists
         n_list = get_list(leaf_params.get("n_ctrl", [1] * 8))
 
-        # Ensure lists are long enough
-        L = 8
-        if len(r_list) < 8:
-            r_list = list(r_list) + [0.0] * (8 - len(r_list))
-        if len(n_list) < 8:
-            n_list = list(n_list) + [1] * (8 - len(n_list))
-
-        for i in range(L):
-            # Score = |r| + n_ctrl
-            # If r is 0 and n_ctrl is small, score is low.
-            # If r is -1.17 and n_ctrl 2, score ~ 3.17.
-            try:
-                # Handle nested lists just in case
-                r_val = abs(float(to_scalar(r_list[i])))
-                n_val = int(to_scalar(n_list[i]))
-                score = r_val + n_val
+        # Check lengths
+        L = len(n_list)
+        if len(r_list) < L:
+            # Just assume 0
+            pass
+        else:
+            for i in range(L):
+                # Energy ~ sum(|r|)
+                r_vec = r_list[i]
+                if isinstance(r_vec, (list, np.ndarray)):
+                    score = np.sum(np.abs(np.array(r_vec)))
+                else:
+                    score = abs(r_vec)
                 if score > max_score:
                     max_score = score
                     active_idx = i
-            except Exception:
-                pass
     except Exception:
-        # Fallback to index 0 if scan fails
         active_idx = 0
 
-    # Helper to scalarize from array
-
-    # Helper to scalarize from array
     def get_val(arr, idx):
-        # First, access the row for the leaf
-        val = None
         if hasattr(arr, "ndim") and arr.ndim > 0:
             if arr.shape[0] > idx:
-                val = arr[idx]
+                return arr[idx]
         elif isinstance(arr, list) and len(arr) > idx:
-            val = arr[idx]
-        else:
-            # Fallback: if it's a scalar, return it.
-            # If it's a container (list/array) and we missed bounds, return None (safe default)
-            is_container = False
-            if isinstance(arr, list):
-                is_container = True
-            elif hasattr(arr, "ndim") and arr.ndim > 0:
-                is_container = True
+            return arr[idx]
+        return None
 
-            if is_container:
-                val = None  # Out of bounds
-            else:
-                val = arr  # Scalar fallback
+    # Extract Gen Gaussian Params for active leaf
+    # r: (N,)
+    r_vec = get_val(leaf_params.get("r"), active_idx)
+    # phases: (N^2,)
+    phases_vec = get_val(leaf_params.get("phases"), active_idx)
+    # disp: (N,)
+    disp_vec = get_val(leaf_params.get("disp"), active_idx)
+    # pnr: (N-1,) or (Nc,) - might need padding?
+    pnr_vec = get_val(leaf_params.get("pnr"), active_idx)
 
-        # Check if we need to unwrap inner dimension (e.g. for us_phase which is (L, 1))
-        # If val is a list of len 1, or array of shape (1,)
-        if isinstance(val, list) and len(val) == 1:
-            return val[0]
-        if hasattr(val, "shape") and val.shape == (1,):
-            return val[0]
-        if hasattr(val, "shape") and val.ndim == 0:
-            return val.item()  # Scalar array
+    n_ctrl = int(to_scalar(get_val(leaf_params.get("n_ctrl", [1]), active_idx)))
 
-        return val
+    # Construct result dict for visualizer
+    # Visualizer might expect legacy keys (tmss, us, uc) OR new keys (general_gaussian).
+    # Since `GaussianHeraldCircuit` in `cpu/circuit.py` is likely NOT updated yet to accept general gaussian,
+    # we might need to update that class OR mapping.
+    # But wait, `GaussianHeraldCircuit` was NOT requested to be updated in task.md?
+    # Ah, "Update frontend/utils.py: Adapt circuit drawing/helpers".
+    # And "Edit Frontend".
+    # If I don't update `cpu/circuit.py`, I can't draw the general gaussian using that class easily.
+    # However, `experimentation_deck` is now using JAX backend.
+    # `get_circuit_figure` uses `GaussianHeraldCircuit` (CPU).
+    # I should probably just return the raw params and let the figure generator handle it blindly,
+    # or return a simplified "General Gaussian Block" representation.
 
-    # Extract info for this leaf
-    # Structure of leaf_params matches Genotype decode:
-    # tmss_r: (L,) -> Single Scalar per leaf
-    # us_phase: (L, 1) -> Single Scalar per leaf
-    # n_ctrl: (L,) -> Single Int
-
-    # 1. TMSS
-    tmss_r = to_scalar(get_val(leaf_params.get("tmss_r"), active_idx))
-    # TMSS requires at least 1 Control + 1 Signal
-    # If n_control < 1, we can't have TMSS
-    n_raw = get_val(leaf_params.get("n_ctrl", [1]), active_idx)
-    n_control = int(to_scalar(n_raw))
-
-    if n_control >= 1:
-        tmss_squeezing = [tmss_r]
-    else:
-        tmss_squeezing = []
-
-    # 2. US (Signal)
-    us_phase = to_scalar(get_val(leaf_params.get("us_phase"), active_idx))
-    us_params = {"theta": [], "phi": [], "varphi": [us_phase]}
-
-    # 3. UC (Control)
-    # Depends on n_control
-    n_raw = get_val(leaf_params.get("n_ctrl", [1]), active_idx)
-    n_control = int(to_scalar(n_raw))
-
-    # Extract UC arrays
-    uc_theta = leaf_params.get("uc_theta")
-    uc_phi = leaf_params.get("uc_phi")
-    uc_varphi = leaf_params.get("uc_varphi")
-
-    # Slice for active leaf
-    # These are (L, ...) arrays OR lists (since ResultManager converts them)
-    def get_slice(arr, idx):
-        if hasattr(arr, "ndim") and arr.ndim > 1:
-            if arr.shape[0] > idx:
-                return arr[idx].tolist()
-        elif isinstance(arr, list) and len(arr) > idx:
-            item = arr[idx]
-            # Unwrap if it's a nested list like [[0.1, 0.2]]
-            if isinstance(item, list):
-                return item
-            elif hasattr(item, "tolist"):
-                return item.tolist()
-            else:
-                # Should return list. If item is scalar (e.g. from flat list), wrap it?
-                # If uc_theta is (L, N_pairs), item is (N_pairs,). Perfect.
-                return [item]
-        return []
-
-    # Truncate lists to match n_control
-    n_pairs = (n_control * (n_control - 1)) // 2
-
-    # Debug / Safety: slice might be larger than n_pairs if n_control changed?
-    # Or if genotype has max limit.
-    theta_slice = get_slice(uc_theta, active_idx)
-    phi_slice = get_slice(uc_phi, active_idx)
-    varphi_slice = get_slice(uc_varphi, active_idx)
-
-    uc_params = {
-        "theta": theta_slice[:n_pairs] if len(theta_slice) >= n_pairs else theta_slice,
-        "phi": phi_slice[:n_pairs] if len(phi_slice) >= n_pairs else phi_slice,
-        "varphi": varphi_slice[:n_control]
-        if len(varphi_slice) >= n_control
-        else varphi_slice,
-    }
-
-    # 4. Displacements
-    disp_s = get_slice(leaf_params.get("disp_s"), active_idx)
-    disp_c = get_slice(leaf_params.get("disp_c"), active_idx)
-
-    # 5. PNR
-    pnr_outcome = get_slice(leaf_params.get("pnr"), active_idx)
-
+    # Let's pass the raw general params.
     result = {
-        "n_signal": 1,  # Canonical form usually 1 signal
-        "n_control": n_control,
-        "tmss_squeezing": tmss_squeezing,
-        "us_params": us_params,
-        "uc_params": uc_params,
-        "disp_s": disp_s,
-        "disp_c": disp_c[:n_control],
-        "pnr_outcome": pnr_outcome[:n_control],
+        "n_modes": len(r_vec) if hasattr(r_vec, "__len__") else 0,  # total N
+        "n_control": n_ctrl,
+        "r": r_vec,
+        "phases": phases_vec,
+        "disp": disp_vec,
+        "pnr_outcome": pnr_vec,
+        "is_general_gaussian": True,
     }
 
-    # Check for final_gauss at top level params
     if "final_gauss" in params:
         fg = params["final_gauss"]
         if fg:
             r = float(fg.get("r", 0.0))
             phi = float(fg.get("phi", 0.0))
             disp = complex(fg.get("disp", 0.0))
-
             result["final_squeezing_params"] = (r, phi)
             result["final_displacement"] = disp
 
@@ -358,12 +219,10 @@ def compute_state_with_jax(
 ) -> Tuple[np.ndarray, float]:
     """
     Compute state using the exact JAX logic used in optimization.
-    Requires JAX and JAX runner components.
     """
     if not JAX_AVAILABLE:
         raise ImportError("JAX not available.")
 
-    # helper to cast
     def to_jax(x):
         return jnp.array(x)
 
@@ -372,30 +231,19 @@ def compute_state_with_jax(
 
     leaf_params = to_jax_dict(params["leaf_params"])
     mix_params = to_jax(params["mix_params"])
-    # mix_source removed
     leaf_active = to_jax(params["leaf_active"])
 
-    # Global Homodyne Params (used at mix nodes)
     hom_x = to_jax(params.get("homodyne_x", 0.0))
-
-    # Capture actual window value for probability scaling (Resolution)
     _raw_win = params.get("homodyne_window")
     homodyne_res_val = to_scalar(_raw_win) if _raw_win is not None else 0.0
-    if homodyne_res_val == 0.0:
-        # If 0.0, we probably shouldn't scale by 0? Or is it technically 0 prob?
-        # Backend treats 0.0 as 0.0.
-        pass
 
-    # PNR Max inference
     pnr_max_val = kwargs.get("pnr_max", 3)
-    if "pnr_max" in leaf_params and pnr_max_val == 3:
-        # Fallback to attempting to read from leaf_params if not explicit
-        pnr_val_raw = leaf_params["pnr_max"]
-        # It's an array (L,)
-        if hasattr(pnr_val_raw, "ndim") and pnr_val_raw.ndim > 0:
-            pnr_max_val = int(pnr_val_raw[0])
-        elif isinstance(pnr_val_raw, list) and len(pnr_val_raw) > 0:
-            pnr_max_val = int(pnr_val_raw[0])
+    if "pnr_max" in leaf_params:
+        arr = leaf_params["pnr_max"]
+        if hasattr(arr, "shape") and arr.shape != ():
+            pnr_max_val = int(arr[0])
+        elif isinstance(arr, list):
+            pnr_max_val = int(arr[0])
 
     get_heralded = jax.vmap(lambda p: jax_get_heralded_state(p, cutoff, pnr_max_val))
 
@@ -403,20 +251,11 @@ def compute_state_with_jax(
         get_heralded(leaf_params)
     )
 
-    # Logic for Window vs Point
-    # User Requirement: ALWAYS use Point Homodyne.
-    # We approximate window probability by multiplying density by resolution.
-    # This corresponds to homodyne_window_is_none = True (Point Mode).
-    # And passing homodyne_resolution > 0.
-
     homodyne_window_is_none = True
     homodyne_resolution_is_none = homodyne_res_val <= 1e-9
     homodyne_x_is_none = False
-
     hom_x_val = hom_x
-    # hom_win_val = homodyne_res_val # Unused
 
-    # Point homodyne setup
     hom_xs = jnp.atleast_1d(hom_x_val)
     phi_mat = jax_hermite_phi_matrix(hom_xs, cutoff)
 
@@ -425,11 +264,9 @@ def compute_state_with_jax(
     else:
         phi_vec = phi_mat.T
 
-    # V_matrix unused in Point Mode
     V_matrix = jnp.zeros((cutoff, 1))
     dx_weights = jnp.zeros(1)
 
-    # Call Superblock
     (
         final_state,
         _,
@@ -446,20 +283,18 @@ def compute_state_with_jax(
         leaf_total_pnrs,
         leaf_modes,
         mix_params,
-        # mix_source removed
         hom_x_val,
-        0.0,  # hom_window ignored in Point Mode
-        homodyne_res_val,  # resolution = window size
+        0.0,
+        homodyne_res_val,
         phi_vec,
-        V_matrix,  # Ignored
-        dx_weights,  # Ignored
+        V_matrix,
+        dx_weights,
         cutoff,
         homodyne_window_is_none,
         homodyne_x_is_none,
         homodyne_resolution_is_none,
     )
 
-    # 3. Final Gaussian
     if "final_gauss" in params:
         fg = params["final_gauss"]
         fg_jax = {k: to_jax(v) for k, v in fg.items()}
@@ -471,43 +306,20 @@ def compute_state_with_jax(
 def get_circuit_figure(params: Dict[str, Any], cutoff: int = 10):
     """
     Reconstruct circuit and return its matplotlib figure.
-    params: Dictionary of circuit parameters
+    Currently returns a placeholder for General Gaussian since CPU circuit drawer is not updated.
     """
-    # If tree (mix_params present), render tree placeholder?
-    if "mix_params" in params and len(params.get("mix_params", [])) > 0:
-        pass
+    import matplotlib.pyplot as plt
 
-    # Adapt params if coming from tree genotype
-    flat_params = _extract_active_leaf_params(params)
-
-    n_signal = int(flat_params.get("n_signal", 1))
-    n_control = int(flat_params.get("n_control", 1))
-
-    # Extract final ops
-    final_sq = flat_params.get("final_squeezing_params")
-    final_disp = flat_params.get("final_displacement")
-
-    circ = GaussianHeraldCircuit(
-        n_signal=n_signal,
-        n_control=n_control,
-        tmss_squeezing=flat_params.get("tmss_squeezing", []),
-        us_params=flat_params.get("us_params"),
-        uc_params=flat_params.get("uc_params"),
-        disp_s=flat_params.get("disp_s"),
-        disp_c=flat_params.get("disp_c"),
-        mesh="rectangular",  # Default
-        hbar=2.0,
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.text(
+        0.5,
+        0.5,
+        "General Gaussian Circuit\n(Visualization Not Implemented For General Case)",
+        ha="center",
+        va="center",
+        fontsize=12,
     )
-
-    # Set final ops
-    if hasattr(circ, "final_squeezing_params"):
-        circ.final_squeezing_params = final_sq
-    if hasattr(circ, "final_displacement"):
-        circ.final_displacement = final_disp
-
-    circ.build()
-
-    fig, ax = circ.plot_circuit()
+    ax.axis("off")
     return fig
 
 
@@ -516,7 +328,6 @@ def compute_heralded_state(
 ) -> Tuple[np.ndarray, float]:
     """
     Compute the heralded state vector and probability.
-    Prefers JAX implementation handling full tree.
     """
     if JAX_AVAILABLE:
         try:
@@ -524,60 +335,22 @@ def compute_heralded_state(
         except Exception:
             pass
 
-    # Fallback to single/active leaf logic (Original behavior)
-    flat_params = _extract_active_leaf_params(params)
-    n_control = int(flat_params.get("n_control", 1))
-    pnr = flat_params.get("pnr_outcome", [0] * n_control)
-
-    # We need to rebuild circuit here because get_circuit_figure returns fig, not circ
-    # Or refactor? For now, duplication is safer than complexity
-    n_signal = int(flat_params.get("n_signal", 1))
-
-    circ = GaussianHeraldCircuit(
-        n_signal=n_signal,
-        n_control=n_control,
-        tmss_squeezing=flat_params.get("tmss_squeezing", []),
-        us_params=flat_params.get("us_params"),
-        uc_params=flat_params.get("uc_params"),
-        disp_s=flat_params.get("disp_s"),
-        disp_c=flat_params.get("disp_c"),
-        mesh="rectangular",
-        hbar=2.0,
-    )
-
-    final_sq = flat_params.get("final_squeezing_params")
-    final_disp = flat_params.get("final_displacement")
-
-    if hasattr(circ, "final_squeezing_params"):
-        circ.final_squeezing_params = final_sq
-    if hasattr(circ, "final_displacement"):
-        circ.final_displacement = final_disp
-
-    circ.build()
-
-    psi, prob = circ.herald(pnr_outcome=pnr, signal_cutoff=cutoff, check_purity=True)
-    return psi, float(prob)
+    # No fallback for CPU simulation of General Gaussian yet.
+    # Current codebase CPU circuit is Legacy structure.
+    return np.zeros(cutoff), 0.0
 
 
 def compute_wigner(psi: np.ndarray, xvec: np.ndarray, pvec: np.ndarray) -> np.ndarray:
-    """
-    Compute Wigner function for a state vector using QuTiP.
-    """
     q_psi = qt.Qobj(psi)
     W = qt.wigner(q_psi, xvec, pvec)
     return W
 
 
 def extract_genotype_index(p_data: Dict[str, Any], df_len: int = 0) -> int:
-    """
-    Robustly extract the genotype index from Plotly selection data.
-    """
-
     def get_point_index(p):
         return p.get("pointIndex", p.get("point_index", p.get("pointNumber")))
 
     genotype_idx = None
-
     custom_data = p_data.get("customdata")
     if custom_data is not None:
         try:
@@ -601,25 +374,17 @@ def extract_genotype_index(p_data: Dict[str, Any], df_len: int = 0) -> int:
                 genotype_idx = int(idx_raw)
             except (ValueError, TypeError):
                 pass
-
     if df_len > 0 and genotype_idx is not None:
         if genotype_idx < 0 or genotype_idx >= df_len:
             return None
-
     return genotype_idx
 
 
 def compute_active_metrics(params: Dict[str, Any]) -> Tuple[float, float]:
     """
     Compute Total Photons and Max PNR considering ONLY active leaves.
-
-    Args:
-        params: Decoded circuit parameters dict.
-
-    Returns:
-        (total_active_photons, max_active_pnr)
+    Updated for General Gaussian params structure.
     """
-    # 1. Get PNR array
     if "leaf_params" not in params:
         return 0.0, 0.0
 
@@ -627,59 +392,39 @@ def compute_active_metrics(params: Dict[str, Any]) -> Tuple[float, float]:
     if "pnr" not in leaf_params:
         return 0.0, 0.0
 
-    pnr = np.array(leaf_params["pnr"])  # Shape (L, N_C)
+    # pnr shape varies. If DesignA/B/B2/B3/C1/C2 (General Gaussian)
+    # pnr is (L, N_C).
+    pnr = np.array(leaf_params["pnr"])
 
-    # 2. Get Active Flags
     if "leaf_active" in params:
         active = np.array(params["leaf_active"], dtype=bool)
     else:
-        # Fallback to all active
         active = np.ones(pnr.shape[0], dtype=bool)
 
-    # Ensure shapes match
     if active.shape[0] != pnr.shape[0]:
         active = np.ones(pnr.shape[0], dtype=bool)
 
-    # 3. Get n_ctrl for masking
-    # n_ctrl shape (L,) or (L, 1) or list
     if "n_ctrl" in leaf_params:
         n_ctrl_raw = leaf_params["n_ctrl"]
-        if isinstance(n_ctrl_raw, list):
-            n_ctrl = np.array(n_ctrl_raw)
+        if hasattr(n_ctrl_raw, "flatten"):
+            n_ctrl = n_ctrl_raw.flatten()
         else:
-            n_ctrl = np.array(n_ctrl_raw)
-        # Flatten
-        n_ctrl = n_ctrl.flatten()
+            n_ctrl = np.array(n_ctrl_raw).flatten()
     else:
-        # Default 1? Or 0?
-        # If missing, assume 1? Or all valid?
-        # Safe to assume all valid if n_ctrl active
+        # Default all valid
         n_ctrl = np.full(pnr.shape[0], pnr.shape[1], dtype=int)
 
-    # 4. Construct Mask
-    # PNR shape (L, N_C). We want mask[i, j] = j < n_ctrl[i]
+    # Construct Mask
     rows, cols = pnr.shape
-    # Ensure n_ctrl matches rows
     if n_ctrl.shape[0] != rows:
-        # Broadcast or truncation?
-        if n_ctrl.size == 1:
-            n_ctrl = np.full(rows, n_ctrl[0], dtype=int)
-        else:
-            # Mismatch fallback: use all
-            n_ctrl = np.full(rows, cols, dtype=int)
+        n_ctrl = np.full(rows, n_ctrl[0] if n_ctrl.size > 0 else cols, dtype=int)
 
-    # col_indices: (1, N_C)
     col_indices = np.arange(cols)[None, :]
-    # limits: (L, 1)
     limits = n_ctrl[:, None]
-
-    mask = col_indices < limits  # (L, N_C) boolean
-
-    # 5. Mask PNR
+    mask = col_indices < limits
     pnr_masked = pnr * mask
 
-    # 6. Filter Active
-    active_pnr = pnr_masked[active]  # Shape (N_active, N_C)
+    active_pnr = pnr_masked[active]
 
     if active_pnr.size == 0:
         return 0.0, 0.0

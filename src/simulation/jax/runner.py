@@ -14,11 +14,10 @@ from src.simulation.jax.herald import (
 )
 from src.simulation.jax.composer import jax_hermite_phi_matrix
 
-# Constants from run_mome.py (should be shared ideally)
-MAX_MODES = 3  # 1 signal + 2 control
-MAX_SIGNAL = 1
-MAX_CONTROL = 2
-MAX_PNR = 3
+# Updated Constants
+MAX_MODES = 6  # 1 Signal + 5 Controls
+# These are max limits for static array sizing if needed, but JAX code below is mostly dynamic
+# except for pnr masking which uses 'pnr' array size.
 
 
 def jax_beamsplitter_2x2(theta: float, phi: float) -> jnp.ndarray:
@@ -37,53 +36,69 @@ def jax_beamsplitter_2x2(theta: float, phi: float) -> jnp.ndarray:
     return jnp.stack([row1, row2])
 
 
-def jax_interferometer_unitary(
-    theta: jnp.ndarray, phi: jnp.ndarray, varphi: jnp.ndarray, M: int
-) -> jnp.ndarray:
+def jax_clements_unitary(phases: jnp.ndarray, N: int) -> jnp.ndarray:
     """
-    Constructs MxM unitary using rectangular mesh.
-    Unrolled for M=5 (max modes).
+    Constructs NxN unitary using Clements decomposition (Rectangular Mesh).
+    Requires N^2 phases.
+    The phases vector is assumed to contain [theta_1, phi_1, ..., theta_K, phi_K, varphi_1, ..., varphi_N]
+    Wait, Clements uses N(N-1) parameters + N phases = N^2.
+
+    Structure: M layers of beam splitters.
+    For N=3:
+       L0: BS(0,1)
+       L1: BS(1,2)
+       L2: BS(0,1)
+
+    We simply iterate through the rectangular mesh similar to `jax_interferometer_unitary` but
+    ensure we consume exactly (N^2 - N)/2 pairs of (theta, phi) plus N varphis.
+    Actually, standard Clements/Reck parameterization:
+    N(N-1)/2 beam splitters, each has theta, phi. Total N(N-1).
+    Plus N phases at input/output.
+    Total params = N^2 - N + N = N^2.
+
+    Input `phases` has length N^2.
     """
-    U = jnp.eye(M, dtype=jnp.complex_)
+    U = jnp.eye(N, dtype=jnp.complex64)
 
-    # We can't use Python loops over dynamic M if M is traced.
-    # But M is usually static (MAX_MODES or n_signal).
-    # Since we extract MAX_MODES params, we should use M=MAX_MODES?
-    # No, run_mome uses n_signal/n_control.
-    # We can use `jax.lax.fori_loop` or unroll if M is small.
-    # Let's assume M is static (passed as static arg to JIT).
-
-    # Rectangular mesh logic:
-    # for s in range(M):
-    #   start = 0 if s%2==0 else 1
-    #   for a in range(start, M-1, 2):
-    #     apply BS(theta[k], phi[k])
+    # Check if N is static or traced? Usually static.
+    # If N is small (<=6), we can unroll.
 
     param_idx = 0
 
-    # We need to carry U and param_idx?
-    # No, we can just iterate.
-    # But we need to slice theta/phi.
-
-    # Since M is small (<=5), we can use Python loops for unrolling.
-    for s in range(M):
+    # Iterate Rectangular Mesh
+    for s in range(N):
         start = 0 if (s % 2 == 0) else 1
-        for a in range(start, M - 1, 2):
-            th = theta[param_idx]
-            ph = phi[param_idx]
-            param_idx += 1
+        for a in range(start, N - 1, 2):
+            # Each BS consumes 2 phases: theta, phi
+            th = phases[param_idx]
+            ph = phases[param_idx + 1]
+            param_idx += 2
 
             B = jax_beamsplitter_2x2(th, ph)
 
-            # Update U rows [a, a+1]
+            # Update rows [a, a+1]
+            # U = B @ U  (Apply from left? Or right? Usually left builds up from output?)
+            # Standard Clements formulation: U = D * T_N * ... * T_1
+            # Let's apply B to the sub-block of U.
             sub_U = U[a : a + 2, :]
             new_sub_U = B @ sub_U
             U = U.at[a : a + 2, :].set(new_sub_U)
 
-    # Final phases
-    # R = diag(exp(i varphi))
-    phases = jnp.exp(1j * varphi)
-    U = U * phases[:, None]  # Broadcast over columns (row-wise multiplication)
+    # Final Phases (Diagonal)
+    # Are we sure we consumed exactly N^2 - N params?
+    # Mesh size logic: s in 0..N-1 (N layers).
+    # Odd N=3:
+    # s=0: a=0 (0,1). Limit 2. Range 0,2 no. Just 0.
+    # s=1: a=1 (1,2). Limit 2. Just 1.
+    # s=2: a=0 (0,1).
+    # Total BS: 3. Params 6.
+    # N^2 = 9. Varphis = 3. Total 9. Correct.
+
+    # Last N params are varphis
+    varphis = phases[param_idx : param_idx + N]
+    phases_diag = jnp.exp(1j * varphis)
+    U = U * phases_diag[:, None]  # Broadcast over columns
+
     return U
 
 
@@ -107,28 +122,20 @@ def jax_apply_final_gaussian(
 
     a, adag = jax_creation_annihilation(cutoff)
 
-    # 1. Squeeze S(z) with z = r * exp(i * 2*phi)
-    # S(z) = exp(0.5 * (z.conj() * a^2 - z * adag^2))
-    # Using user formula: K = (r/2) * (exp(-2j*phi)*a^2 - exp(2j*phi)*adag^2)
-    # This matches standard S(z) definition if z = r * exp(2j*phi).
-
-    # We use jax.scipy.linalg.expm
+    # 1. Squeeze S(z)
     term1 = jnp.exp(-2j * phi) * (a @ a)
     term2 = jnp.exp(2j * phi) * (adag @ adag)
     K_squeeze = (r / 2.0) * (term1 - term2)
     U_squeeze = jax.scipy.linalg.expm(K_squeeze)
 
-    # 2. Rotation R(varphi) = exp(i * n * varphi)
+    # 2. Rotation R(varphi)
     n_op = jnp.arange(cutoff)
     U_rot = jnp.diag(jnp.exp(1j * n_op * varphi))
 
-    # 3. Displacement D(alpha) = exp(alpha * adag - alpha.conj() * a)
+    # 3. Displacement D(alpha)
     K_disp = disp * adag - jnp.conj(disp) * a
     U_disp = jax.scipy.linalg.expm(K_disp)
 
-    # Total U
-    # Order: U_final = U_disp @ R(varphi) @ U_squeeze (Applied right to left on ket)
-    # This matches common decompositions (Squeeze then Rotate then Displace)
     U_final = U_disp @ U_rot @ U_squeeze
 
     return U_final @ state_vec
@@ -138,140 +145,132 @@ def jax_get_heralded_state(
     params: Dict[str, jnp.ndarray], cutoff: int, pnr_max: int = 3
 ):
     """
-    Computes the heralded state for a single block (1 Signal, up to 2 Controls).
+    Computes Herald State from General Gaussian Leaf parameters.
+    Leaf Params:
+      - n_ctrl: scalar int
+      - r: (N,) squeezing
+      - phases: (N^2,) unitary phases
+      - disp: (N,) complex displacement
+      - pnr: (N-1,) pnr outcomes
 
-    Args:
-        params: Dict containing leaf parameters
-        cutoff: Fock cutoff dimension
-        pnr_max: Maximum PNR value for amplitude tensor (static, must be known at trace time)
+    Logic:
+      1. Construct S_total = S_pass @ S_sq
+      2. Construct mu = disp_vec_real_imag
+      3. Covariance sigma = 0.5 * S S^T
+      4. Herald on last N-1 modes
     """
     # Extract params
-    n_ctrl_eff = params["n_ctrl"]  # (1,) int
-    # tmss_r is now SCALAR (0-D array) after vmap slicing from (L,)
-    tmss_r = params["tmss_r"]
-    us_phase = params["us_phase"]
-    uc_theta = params["uc_theta"]
-    uc_phi = params["uc_phi"]
-    uc_varphi = params["uc_varphi"]
-    disp_s = params["disp_s"]
-    disp_c = params["disp_c"]
-    pnr = params["pnr"]
+    n_ctrl_eff = params["n_ctrl"]  # (1,) or scalar
+    r_vec = params["r"]  # (N,)
+    phases_vec = params["phases"]  # (N^2,)
+    disp_vec = params["disp"]  # (N,) complex
+    pnr_vec = params["pnr"]  # (Nc_max,)
 
-    # Determine dimensions dynamically
-    # We infer N_C from pnr or disp_c shape.
-    N_C = pnr.shape[-1]
-    N = 1 + N_C  # 1 Signal + N_C Controls
+    # Infer dimension N from r_vec
+    N = r_vec.shape[0]
+    N_C = N - 1
 
     hbar = 2.0
-    mu = jnp.zeros(2 * N)
-    cov = vacuum_covariance(N, hbar)
 
-    S_total = jnp.eye(2 * N)
+    # 1. Squeezing Symplectic
+    # r_vec contains squeeze params.
+    # ordering x1..xN, p1..pN ?
+    # S_sq = diag(e^-r, e^r) if standard.
+    # Note: `two_mode_squeezer` usually is r, -r.
+    # Let's assume standard x-squeezing: var(x) = e^{-2r}.
+    # Diag should be [e^-r1 ... e^-rN, e^r1 ... e^rN] for Block Basis.
+    # Or interleaved?
+    # `src/simulation/jax/herald.py` usually assumes Block Basis (x...p...).
+    # Let's verify vacuum_covariance.
+    # It returns identity.
 
-    # 2. TMSS (Signal 0 + Control 0)
-    # Only if N_C >= 1
-    # n_ctrl_eff tells us how many controls are active
-    r0 = jnp.where(n_ctrl_eff >= 1, tmss_r, 0.0)
+    # Construct diagonal S_sq
+    exp_minus_r = jnp.exp(-r_vec)
+    exp_plus_r = jnp.exp(r_vec)
+    S_sq = jnp.diag(jnp.concatenate([exp_minus_r, exp_plus_r]))
 
-    # We always have at least 1 signal. If N_C > 0:
-    if N_C > 0:
-        S_tmss_0 = two_mode_squeezer_symplectic(r0, 0.0)
-        S_big_0 = expand_mode_symplectic(S_tmss_0, jnp.array([0, 1]), N)
-        S_total = S_big_0 @ S_total
+    # 2. Passive Unitary Symplectic
+    # Construct U_pass from phases
+    U_pass = jax_clements_unitary(phases_vec, N)
+    S_pass = passive_unitary_to_symplectic(U_pass)
 
-    # 3. Interferometers
-    # US on Signal (Mode 0)
-    phi_s = us_phase[0]
-    cp = jnp.cos(phi_s)
-    sp = jnp.sin(phi_s)
-    R_s = jnp.array([[cp, -sp], [sp, cp]])
-    S_us = expand_mode_symplectic(R_s, jnp.array([0]), N)
-    S_total = S_us @ S_total
+    # 3. Total Symplectic
+    S_total = S_pass @ S_sq
 
-    # UC on Controls (Modes 1..N_C)
-    # Construct unitary U_c for controls
-    if N_C > 0:
-        # Identity
-        U_c = jnp.eye(N_C, dtype=jnp.complex64)
+    # 4. Covariance & Mean
+    # Vacuum cov = (hbar/2) * I?
+    # Usually herald.py `vacuum_covariance` returns `(hbar/2) * I`
+    cov_vac = vacuum_covariance(N, hbar)
+    # sigma = S cov_vac S^T
+    # If cov_vac is proportional to I, then S cov S^T = (hbar/2) S S^T
+    cov = S_total @ cov_vac @ S_total.T
 
-        pair_idx = 0
-        # Iterate pairs (i, j) for i<j?
-        for i in range(N_C):
-            for j in range(i + 1, N_C):
-                # Extract params
-                th = uc_theta[pair_idx]
-                ph = uc_phi[pair_idx]
+    # Displacement
+    # mu_disp needs real representation: [Re(d), Im(d)] (Block Basis)
+    d_re = jnp.real(disp_vec)
+    d_im = jnp.imag(disp_vec)
+    # Need to verify if `complex_alpha_to_qp` does scaling?
+    # alpha = (x + ip) / sqrt(2*hbar) usually?
+    # Or d is already in alpha units?
+    # Helper `complex_alpha_to_qp` takes alpha and returns [q, p] * sqrt(2*hbar).
+    # Yes, let's use it.
+    r_disp = complex_alpha_to_qp(disp_vec, hbar)
 
-                ct = jnp.cos(th)
-                st = jnp.sin(th)
-
-                # BS matrix on i, j
-                row_i = U_c[i, :].copy()
-                row_j = U_c[j, :].copy()
-
-                U_c = U_c.at[i, :].set(ct * row_i - jnp.exp(-1j * ph) * st * row_j)
-                U_c = U_c.at[j, :].set(jnp.exp(1j * ph) * st * row_i + ct * row_j)
-
-                pair_idx += 1
-
-        # Phases at output
-        # uc_varphi has size N_C
-        U_ph = jnp.diag(jnp.exp(1j * uc_varphi))
-        U_c = U_ph @ U_c
-
-        S_uc_small = passive_unitary_to_symplectic(U_c)
-        ctrl_indices = jnp.arange(1, N)
-        S_uc = expand_mode_symplectic(S_uc_small, ctrl_indices, N)
-        S_total = S_uc @ S_total
-
-    # Apply Total Symplectic
-    cov = S_total @ cov @ S_total.T
-    mu = S_total @ mu
-
-    # 4. Displacements
-    # disp_s is (1,), disp_c is (N_C,)
-    alpha = jnp.concatenate([disp_s, disp_c])
-    r_disp = complex_alpha_to_qp(alpha, hbar)
-    mu = mu + r_disp
+    # Rotated displacement?
+    # User plan: D @ U @ S |0>.
+    # Displaced state has mean = r_disp
+    # Covariance is independent of displacement.
+    mu = r_disp
 
     # 5. Herald
-    # Project auxiliary modes (1..N_C) onto PNR
+    # Control modes indices: 1..N-1 (0 is signal)
+    # PNR Masking
+    # Map pnr_vec to effective pnr
+    # pnr_vec has size N-1? Or fixed large size?
+    # Usually Genotype decodes to fixed max size (e.g. 5 controls).
+    # But N might vary per run config?
+    # Here N is determined by r_vec.
 
-    ctrl_indices_local = jnp.arange(N_C)  # 0..N_C-1
-    # n_ctrl_eff is integer 0..N_C
+    ctrl_indices_local = jnp.arange(N_C)
+    pnr_effective = jnp.where(ctrl_indices_local < n_ctrl_eff, pnr_vec[:N_C], 0)
 
-    # Mask PNR: Use provided PNR for active controls, 0 for inactive
-    pnr_effective = jnp.where(ctrl_indices_local < n_ctrl_eff, pnr, 0)
-
-    # Use pnr_max parameter (passed as static argument)
-    MAX_PNR_LOCAL = pnr_max
-
+    # Heralding Function
+    # We use jax_get_full_amplitudes
     from src.simulation.jax.herald import jax_get_full_amplitudes
 
-    max_pnr_sequence = [MAX_PNR_LOCAL] * N_C
+    # We need to pass max_pnr_tuple.
+    # Since we can't iterate dynamically for tuple creation in JIT if N_C is dynamic,
+    # we assume N_C is static (defined by genotype config `modes`).
+    # `jax_get_heralded_state` handles static shapes usually.
+
+    max_pnr_sequence = [pnr_max] * N_C
     max_pnr_tuple = tuple(max_pnr_sequence)
 
+    # Return Amplitudes tensor H (cutoff, pnr_max+1, ..., pnr_max+1)
     H_full = jax_get_full_amplitudes(mu, cov, max_pnr_tuple, cutoff, hbar)
 
-    H_flat_ctrl = H_full.reshape(cutoff, -1)
+    # Extract the slice corresponding to pnr_effective
+    # H_full shape: (cutoff, D_ctrl, D_ctrl, ...) where D_ctrl = pnr_max+1
+    H_flat = H_full.reshape(cutoff, -1)
 
-    # Calculate flat index from pnr_effective
-    D_ctrl = MAX_PNR_LOCAL + 1
+    D_ctrl = pnr_max + 1
+
+    # Compute flat index for [pnr_0, pnr_1, ...]
+    # Stride calculation
+    # Index = sum( p[i] * D^(N_C - 1 - i) ) ?
+    # Note: `jax_get_full_amplitudes` returns indices in order of modes 1..N.
+    # So H[k, n1, n2...]
 
     flat_idx = 0
-    # Iterate backwards?
-    # H[c, i, j] -> linear [c, i*D + j]
     for i in range(N_C):
-        # pnr index for control i
         p = pnr_effective[i]
-        # power of D: (N_C - 1 - i)
         power = N_C - 1 - i
         stride = D_ctrl**power
         flat_idx += p * stride
 
-    vec_slice = H_flat_ctrl[:, flat_idx]
+    vec_slice = H_flat[:, flat_idx]
 
-    # Calculate probability of heralding
+    # Probability
     prob_slice = jnp.sum(jnp.abs(vec_slice) ** 2)
 
     # Normalize
@@ -286,9 +285,9 @@ def jax_get_heralded_state(
         vec_norm,
         prob_slice,
         1.0,
-        jnp.max(pnr_effective).astype(jnp.float_),
-        jnp.sum(pnr_effective).astype(jnp.float_),  # Total PNR sum
-        1.0,  # Count as 1 leaf (not modes per leaf) - summed to get active leaf count
+        jnp.max(pnr_effective).astype(jnp.float32),
+        jnp.sum(pnr_effective).astype(jnp.float32),
+        1.0,
     )
 
 
@@ -307,62 +306,46 @@ def _score_batch_shard(
     cutoff: int,
     operator: jnp.ndarray,
     genotype_name: str,
-    genotype_config: Any = None,  # Can be dict or tuple(items)
+    genotype_config: Any = None,
     correction_cutoff: int = None,
     pnr_max: int = 3,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     JIT-compiled scoring function for a single batch shard.
-    Supports dynamic limits via correction_cutoff simulation.
     """
-    # Reconstruct config dict if passed as tuple
     if genotype_config is not None and isinstance(genotype_config, tuple):
         config_dict = dict(genotype_config)
     else:
         config_dict = genotype_config
 
-    # Extract depth from config for tree structure (needed by decoder)
     depth = 3
     if config_dict is not None:
         depth = int(config_dict.get("depth", 3))
 
     decoder = get_genotype_decoder(genotype_name, depth=depth, config=config_dict)
 
-    # Determine Simulation Cutoff
     use_correction = (correction_cutoff is not None) and (correction_cutoff > cutoff)
     sim_cutoff = correction_cutoff if use_correction else cutoff
 
-    # pnr_max is now passed as argument (static)
-    # This overrides config, or rather assumes config was used to set the arg.
-    # Re-extracting from config is redundant but harmless unless they conflict.
-    # We use the explicit argument.
-    pass
-
     def score_one(g):
-        # Decode using simulation cutoff (scales applied here if any)
-        # Note: Decoder limits (r_scale) are in config/decoder, not passed here.
         params = decoder.decode(g, sim_cutoff)
 
-        # 1. Get Leaf States (in sim_cutoff)
+        # 1. Get Leaf States
+        # vmap over leaf_params
         leaf_vecs, leaf_probs, _, leaf_max_pnrs, leaf_total_pnrs, leaf_modes = jax.vmap(
             partial(jax_get_heralded_state, cutoff=sim_cutoff, pnr_max=pnr_max)
         )(params["leaf_params"])
 
-        # 2. Superblock (in sim_cutoff)
+        # 2. Superblock
         hom_x = params["homodyne_x"]
         hom_win = params["homodyne_window"]
 
-        # Point homodyne
-        # Handle scalar or vector hom_x
         hom_xs = jnp.atleast_1d(hom_x)
-        # jax_hermite_phi_matrix returns (cutoff, N) for input (N,)
         phi_mat = jax_hermite_phi_matrix(hom_xs, sim_cutoff)
 
-        # If scalar original, we want (cutoff,)
         if jnp.ndim(hom_x) == 0:
             phi_vec = phi_mat[:, 0]
         else:
-            # If vector, we want (N, cutoff) for compatibility with jax_superblock broadcasting
             phi_vec = phi_mat.T
 
         V_matrix = jnp.zeros((sim_cutoff, 1))
@@ -388,17 +371,17 @@ def _score_batch_shard(
             params["mix_params"],
             hom_x,
             hom_win,
-            hom_win,  # homodyne_resolution = window size
+            hom_win,
             phi_vec,
             V_matrix,
             dx_weights,
             sim_cutoff,
-            True,  # homodyne_window_is_none=True (Point Mode)
+            True,
             False,
-            False,  # homodyne_resolution_is_none=False (Apply Scaling)
+            False,
         )
 
-        # 3. Apply Final Global Gaussian (in sim_cutoff)
+        # 3. Final Global Gaussian
         final_state_transformed = jax_apply_final_gaussian(
             final_state, params["final_gauss"], sim_cutoff
         )
@@ -407,46 +390,25 @@ def _score_batch_shard(
         leakage_penalty = 0.0
 
         if use_correction:
-            # Calculate Leakage: Probability mass outside 'cutoff'
-            # final_state_transformed is vector in sim_cutoff
             probs = jnp.abs(final_state_transformed) ** 2
             prob_total = jnp.sum(probs)
-            # Safe normalize if tiny?
-
-            # Mass in [0, cutoff]
             mass_in = jnp.sum(probs[:cutoff])
             leakage = 1.0 - (mass_in / jnp.maximum(prob_total, 1e-12))
 
-            # Truncate state for evaluation
-            # Simply slice [0:cutoff]
             state_trunc = final_state_transformed[:cutoff]
-
-            # Renormalize truncated state
             norm_trunc = jnp.linalg.norm(state_trunc)
             state_eval = jax.lax.cond(
                 norm_trunc > 1e-9, lambda x: x / norm_trunc, lambda x: x, state_trunc
             )
-
-            # Leakage Penalty
-            # If leakage > 0.05 (5%), apply heavy penalty?
-            # Or continuous penalty?
-            # Continuous: penalty = leakage * 100.0
             leakage_penalty = leakage * 2.0
-
         else:
             state_eval = final_state_transformed
 
-        # 4. Expectation Value (using original operator in 'cutoff')
-        # Operator shape: (cutoff, cutoff)
-        # state_eval shape: (cutoff,)
+        # 4. Expectation Value
         op_psi = operator @ state_eval
         raw_exp_val = jnp.real(jnp.vdot(state_eval, op_psi))
 
-        # Penalize very low probability states (hard cutoff at 10^-40)
-        # This allows exploration down to 10^-40 while preserving exp_val interpretation
         exp_val = jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf)
-
-        # Add Leakage Penalty
         exp_val += leakage_penalty
 
         # 5. Fitness & Descriptors
@@ -454,10 +416,7 @@ def _score_batch_shard(
         log_prob = -jnp.log10(prob_clipped)
         total_photons = total_sum_pnr
 
-        # Fitness: [-exp_val, -log_prob, -complexity, -total_photons]
         fitness = jnp.array([-exp_val, -log_prob, -active_modes, -total_photons])
-
-        # Descriptor: [active_modes, max_pnr, total_photons]
         descriptor = jnp.array([active_modes, max_pnr, total_photons])
 
         return fitness, descriptor
@@ -481,23 +440,7 @@ def jax_scoring_fn_batch(
     """
     n_devices = jax.local_device_count()
 
-    # Debug Log (only printed during tracing/exec)
-    # Ideally should be controlled by a debug flag, but simple print here is fine for now
-    # as this function is called once per chunk usually.
-    # Actually it's called every iteration if we put it inside loop, but here it's inside `score_batch`.
-    # `jax_scoring_fn_batch` is called by `scoring_fn` in `run_mome.py`.
-    # It constructs the graph.
-    # We want runtime logging.
-    # Using jax.debug.print is better for runtime.
-
-    def log_debug(msg, *args):
-        # Fallback if host_callback/debug.print is tricky?
-        # Standard print happens at trace time.
-        pass
-
     if n_devices <= 1:
-        # Fallback to single-device JIT
-        # Ensure config is hashable (dict -> tuple of items)
         if genotype_config is not None and isinstance(genotype_config, dict):
             config_hashable = tuple(sorted(genotype_config.items()))
         else:
@@ -510,67 +453,33 @@ def jax_scoring_fn_batch(
             genotype_name,
             config_hashable,
             correction_cutoff,
-            pnr_max,  # Pass pnr_max
+            pnr_max,
         )
 
     # Multi-GPU Logic
-    # 1. Pad genotypes to be divisible by n_devices
-    # print(f"DEBUG: Using {n_devices} JAX devices.")
     batch_size = genotypes.shape[0]
     remainder = batch_size % n_devices
     padding = (n_devices - remainder) if remainder > 0 else 0
 
     if padding > 0:
-        # Pad with zeros (or duplicates)
-        # Since these are extra, their results will be discarded.
-        # Zeros might cause numerical issues in eval?
-        # Better to pad with the first element to ensure validity.
         pad_block = jnp.repeat(genotypes[:1], padding, axis=0)
         g_padded = jnp.concatenate([genotypes, pad_block], axis=0)
     else:
         g_padded = genotypes
 
-    # 2. Reshape for pmap: (n_devices, shard_size, ...)
     shard_size = g_padded.shape[0] // n_devices
     g_sharded = g_padded.reshape((n_devices, shard_size, -1))
-
-    # 3. pmap execution
-
-    # NOTE: pmap args: (shard, cutoff, operator, genotype_name)
-    # in_axes=(0, None, None, None) -> shard divides axis 0, others replicated.
-
-    # score_shard args: (genotypes, cutoff, operator, genotype_name, genotype_config, correction_cutoff)
-    # Argnum Map:
-    # 0: genotypes (Sharded)
-    # 1: cutoff (Static)
-    # 2: operator (Broadcasted)
-    # 3: genotype_name (Static)
-    # 4: genotype_config (Static)
-    # 5: correction_cutoff (Static)
-
-    # operator is array, so we BROADCAST it (None in in_axes).
-    # Cutoff, name, config, correction are constants -> STATIC.
 
     pmapped_fn = jax.pmap(
         _score_batch_shard,
         in_axes=(0, None, None, None, None, None, None),
-        static_broadcasted_argnums=(
-            1,
-            3,
-            4,
-            5,
-            6,
-        ),  # cutoff(1), name(3), config(4), correction(5), pnr_max(6) static
+        static_broadcasted_argnums=(1, 3, 4, 5, 6),
     )
 
-    # Ensure config is hashable for pmap static arg
     if genotype_config is not None and isinstance(genotype_config, dict):
         config_hashable = tuple(sorted(genotype_config.items()))
     else:
         config_hashable = genotype_config
-
-    # Explicitly log start of pmap execution
-    # jax.debug.print("DEBUG: Starting pmap on {n} devices, batch={b}", n=n_devices, b=batch_size)
 
     fitnesses_sharded, descriptors_sharded = pmapped_fn(
         g_sharded,
@@ -582,14 +491,9 @@ def jax_scoring_fn_batch(
         pnr_max,
     )
 
-    # 4. Reshape back
-    # fitnesses_sharded: (n_devices, shard_size, 4)
-    # descriptors_sharded: (n_devices, shard_size, 3)
-
     fitnesses = fitnesses_sharded.reshape((-1, 4))
     descriptors = descriptors_sharded.reshape((-1, 3))
 
-    # 5. Remove padding
     if padding > 0:
         fitnesses = fitnesses[:batch_size]
         descriptors = descriptors[:batch_size]

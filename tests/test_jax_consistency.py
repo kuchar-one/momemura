@@ -37,7 +37,7 @@ def test_jax_superblock_consistency():
     g = jax.random.normal(key, (300,))  # Enough for 256 params
 
     # params = jax_decode_genotype(g, cutoff)
-    params = get_genotype_decoder("legacy").decode(g, cutoff)
+    params = get_genotype_decoder("A").decode(g, cutoff)
 
     # Extract params
     leaf_params = params["leaf_params"]

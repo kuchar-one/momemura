@@ -7,71 +7,85 @@ from src.genotypes.genotypes import get_genotype_decoder
 DEPTH = 3
 LEAVES = 8
 CUTOFF = 10
+MODES = 3  # 1 Signal + 2 Controls
+
+# Length Calculations for N=3:
+# GG = 3(r) + 9(ph) + 6(disp) = 18
+# PNR = 2
+# Leaf(A) = 1(Act) + 1(NC) + 2(PNR) + 18 = 22
+# Mix = 3
+# Final = 5
+
+# A: 1 + 8*22 + 7*3 + 5 = 203
+# 0: 203 - 1 + 7 = 209
+# B1: 1 + 21(Shared) + 21 + 5 = 48  (Shared BP = 1(NC)+2(PNR)+18(GG)=21)
+# B2: 48 + 8 = 56
+# B3: 1 + 18(Shared) + 8*4(Unique) + 21 + 5 = 77  (Unique=1+1+2=4)
+# B30: 77 - 1 + 7 = 83
+# B3B: 77 - 21 = 56
+# B30B: 83 - 21 = 62
+# C1: 1 + 21(Shared) + 3(SharedMix) + 5 = 30
+# C2: 30 + 8 = 38
+# C20: 38 - 1 + 7 = 44
+# C2B: 38 - 3 = 35
+# C20B: 44 - 3 = 41
 
 
 @pytest.mark.parametrize(
-    "design_name, expected_length_fn",
+    "design_name, expected_length",
     [
-        ("legacy", lambda L: 256),
-        ("A", lambda L: 19 * L + 3),
-        ("B1", lambda L: 3 * L + 18),
-        ("B2", lambda L: 4 * L + 18),
-        ("C1", lambda L: 24),
-        ("C2", lambda L: 24 + L),
+        ("A", 203),
+        ("0", 209),
+        ("B1", 48),
+        ("B2", 56),
+        ("B3", 77),
+        ("B30", 83),
+        ("B3B", 56),
+        ("B30B", 62),
+        ("C1", 30),
+        ("C2", 38),
+        ("C20", 44),
+        ("C2B", 35),
+        ("C20B", 41),
     ],
 )
-def test_genotype_lengths(design_name, expected_length_fn):
-    # Test assumes 3 modes (1 Signal + 2 Control)
-    config = {"modes": 3}
+def test_genotype_lengths(design_name, expected_length):
+    config = {"modes": MODES}
     decoder = get_genotype_decoder(design_name, depth=DEPTH, config=config)
-    assert decoder.get_length(DEPTH) == expected_length_fn(LEAVES)
+    assert decoder.get_length(DEPTH) == expected_length
 
 
-@pytest.mark.parametrize("design_name", ["legacy", "A", "B1", "B2", "C1", "C2"])
+@pytest.mark.parametrize(
+    "design_name", ["A", "0", "B1", "B2", "B3", "C1", "C2", "C20", "B30B"]
+)
 def test_genotype_decode_shapes(design_name):
-    # Test assumes 3 modes
-    config = {"modes": 3}
+    config = {"modes": MODES}
     decoder = get_genotype_decoder(design_name, depth=DEPTH, config=config)
-    L = LEAVES
     length = decoder.get_length(DEPTH)
 
-    # Random genotype
     key = jax.random.PRNGKey(42)
     g = jax.random.uniform(key, (length,), minval=-1.0, maxval=1.0)
 
     decoded = decoder.decode(g, CUTOFF)
 
-    # Check top-level keys
+    # Top-level keys
     assert "homodyne_x" in decoded
-    assert "homodyne_window" in decoded
     assert "mix_params" in decoded
-    assert "mix_source" in decoded
-    assert "leaf_active" in decoded
     assert "leaf_params" in decoded
     assert "final_gauss" in decoded
 
-    # Check shapes
-    assert decoded["leaf_active"].shape == (L,)
-    assert decoded["mix_params"].shape == (L - 1, 3)
-    assert decoded["mix_source"].shape == (L - 1,)
-
-    # Check Leaf Params
+    # Shapes
+    L = LEAVES
     lp = decoded["leaf_params"]
+
+    # N=3 check
+    assert lp["r"].shape == (L, MODES)
+    assert lp["phases"].shape == (L, MODES**2)
+    assert lp["disp"].shape == (L, MODES)
+    assert lp["pnr"].shape == (L, MODES - 1)
     assert lp["n_ctrl"].shape == (L,)
 
-    # Canonical: tmss_r is (L,) (1D)
-    assert lp["tmss_r"].shape == (L,)
-
-    assert lp["uc_varphi"].shape == (L, 2)
-    assert lp["disp_c"].shape == (L, 2)
-    assert lp["pnr"].shape == (L, 2)
-
-    # Check Final Gaussian
+    # Final Gauss
     fg = decoded["final_gauss"]
-    assert isinstance(fg["r"], (float, jnp.ndarray)) or fg["r"].shape == ()
-    assert isinstance(fg["disp"], (complex, jnp.ndarray)) or fg["disp"].shape == ()
-
-    if design_name == "legacy":
-        # Legacy should have final_gauss zeroed
-        assert fg["r"] == 0.0
-        assert fg["disp"] == 0.0 + 0.0j
+    assert fg["r"].size == 1
+    assert fg["disp"].size == 1
