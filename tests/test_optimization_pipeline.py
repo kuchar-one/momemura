@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-import pytest
 import jax
 from src.utils.result_manager import OptimizationResult
 from run_mome import run

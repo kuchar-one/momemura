@@ -9,8 +9,8 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.simulation.jax.runner import jax_get_heralded_state
-from src.simulation.jax.composer import (
+from src.simulation.jax.runner import jax_get_heralded_state  # noqa: E402
+from src.simulation.jax.composer import (  # noqa: E402
     jax_compose_pair,
     jax_u_bs,
     jax_hermite_phi_matrix,

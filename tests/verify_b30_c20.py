@@ -2,16 +2,14 @@ import sys
 import os
 import numpy as np
 import jax
-import jax.numpy as jnp
-from typing import Dict, Any
 
 # Ensure we can import from src
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.genotypes.genotypes import get_genotype_decoder
-from src.simulation.cpu.composer import SuperblockTopology, Composer
+from src.genotypes.genotypes import get_genotype_decoder  # noqa: E402
+from src.simulation.cpu.composer import SuperblockTopology, Composer  # noqa: E402
 
 
 def verify_genotype(name: str, depth: int):

@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 from src.genotypes.converter import upgrade_genotype
 from src.genotypes.genotypes import get_genotype_decoder
 

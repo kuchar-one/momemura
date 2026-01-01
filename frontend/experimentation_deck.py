@@ -16,7 +16,7 @@ if project_root not in sys.path:
 
 # Import Backend Components
 try:
-    from src.simulation.jax.runner import jax_get_heralded_state, jax_clements_unitary
+    from src.simulation.jax.runner import jax_get_heralded_state
     from src.simulation.jax.composer import (
         jax_compose_pair,
         jax_u_bs,
@@ -85,7 +85,7 @@ def run_simulation(config_a: Dict, config_b: Dict, mix_config: Dict, cutoff_dim:
         p_a = config_a["params"]
         # Extract General Gaussian params
         n_ctrl = p_a["n_control"]
-        modes = n_ctrl + 1
+        n_ctrl + 1
 
         leaf_params_a = {
             "n_ctrl": jnp.array(n_ctrl),
@@ -234,7 +234,7 @@ def create_gaussian_ui(key_suffix: str):
     with st.expander("Displacement (alpha)", expanded=False):
         st.caption(f"Requires {modes} complex vals")
         dip_str = st.text_input(
-            f"Disp (complex)", "0.0, " * (modes - 1) + "0.0", key=f"d_{key_suffix}"
+            "Disp (complex)", "0.0, " * (modes - 1) + "0.0", key=f"d_{key_suffix}"
         )
         try:
             d_vals = []
@@ -248,7 +248,7 @@ def create_gaussian_ui(key_suffix: str):
 
     with st.expander("PNR Outcomes", expanded=True):
         st.caption(f"Requires {nc} integers (Control Modes 1..{nc})")
-        pnr_str = st.text_input(f"PNR", "0, " * (nc - 1) + "0", key=f"pnr_{key_suffix}")
+        pnr_str = st.text_input("PNR", "0, " * (nc - 1) + "0", key=f"pnr_{key_suffix}")
         try:
             pnr_vals = [int(x) for x in pnr_str.split(",")]
         except ValueError:

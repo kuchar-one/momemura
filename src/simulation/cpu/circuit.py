@@ -32,7 +32,6 @@ from src.utils.params import (
 )
 from src.utils.accel import njit_wrapper as njit
 from src.utils.cache_manager import CacheManager, _short_hash_bytes
-from src.simulation.cpu.ops import beamsplitter_2x2
 
 # Fallback or shared logic if needed
 try:

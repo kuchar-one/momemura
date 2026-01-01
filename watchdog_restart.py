@@ -6,8 +6,6 @@ import os
 import signal
 import fcntl
 import select
-import shutil
-from datetime import datetime
 
 # Logic Configuration
 STAGNATION_LIMIT = 1000  # Iterations without improvement to trigger restart
@@ -48,7 +46,7 @@ def run_optimization(args, run_type="SHORT", global_best=float("inf")):
     current_iter = 0
 
     # Track logic
-    start_time = time.time()
+    time.time()
 
     try:
         while True:
@@ -161,19 +159,13 @@ def main():
             "LONG" if consecutive_no_gains >= CONSECUTIVE_NO_GAINS_LIMIT else "SHORT"
         )
 
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print(f"[Watchdog] Starting Cycle (Type: {run_type})")
         print(
             f"[Watchdog] Global Best: {global_best_exp if global_best_exp != float('inf') else 'None'}"
         )
         print(f"[Watchdog] Consecutive No Gains: {consecutive_no_gains}")
         print("=" * 60 + "\n")
-
-        # Execute Run
-        # Only pass global scan flag on the FIRST run (when we have no previous history/restarts)
-        # We can detect this if global_best_exp is inf?
-        # OR better: run_type == "SHORT" and run count == 0?
-        # Actually user said "first run". Restarts only seed from current.
 
         current_args = list(mome_args)
         if use_global_scan and global_best_exp == float("inf"):

@@ -643,7 +643,6 @@ def jax_superblock(
     # If V_matrix is (cutoff, n_points), broadcast to (n_mix, cutoff, n_points)
     # n_mix in this topology is 7 (4+2+1).
     # We can infer from mix_params or hom_xs.
-    n_mix_total = 7  # Fixed for depth 3.
     # But hom_xs might be (7,).
 
     # Layer 0 (8 -> 4)

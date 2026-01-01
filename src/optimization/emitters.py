@@ -81,14 +81,9 @@ class BiasedMixingEmitter(MixingEmitter):
             )
             progress = jnp.clip(progress, 0.0, 1.0)
 
-            # Logarithmic interpolation might be better for temperature?
-            # Or simple linear on value.
             current_temp = (
                 self._base_temp * (1.0 - progress) + self._aggressive_temp * progress
             )
-
-            # Optional: Print/Log debug? (Cannot easily print from JIT, but emit is JIT-ed?)
-            # Actually emit is usually jitted. We shouldn't print.
 
         # 4. Compute Logits
         # Logits = obj0 / T
@@ -213,7 +208,6 @@ class HybridEmitter(MixingEmitter):
             # Repertoire genotypes: (Pop, D). We want (0, D).
             D = repertoire.genotypes.shape[-1]
             x_intensify = jnp.zeros((0, D))
-            state_intensify = emitter_state
 
         # 2. Exploration Stream
         if self.n_explore > 0:

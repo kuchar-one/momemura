@@ -19,7 +19,7 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
             # It's a vector (Design 0)
             try:
                 hx_str = str(list(hx_val))
-            except:
+            except Exception:
                 hx_str = str(hx_val)
             # Show abbreviated if too long?
             if len(hx_str) > 50:

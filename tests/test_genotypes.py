@@ -1,5 +1,4 @@
 import pytest
-import jax.numpy as jnp
 import jax
 from src.genotypes.genotypes import get_genotype_decoder
 

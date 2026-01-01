@@ -6,7 +6,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from frontend.utils import compute_active_metrics
+from frontend.utils import compute_active_metrics  # noqa: E402
 
 
 def verify_active_metrics_logic():

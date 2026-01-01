@@ -125,8 +125,6 @@ def main():
 
                     break  # Break inner loop to restart
 
-                # Check total time limit? (Optional)
-
         except KeyboardInterrupt:
             print("\n[Watchdog] Interrupted by User. Stopping.")
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)

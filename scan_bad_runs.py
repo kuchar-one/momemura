@@ -1,6 +1,4 @@
-import os
 import pickle
-import numpy as np
 from pathlib import Path
 import shutil
 
@@ -49,5 +47,5 @@ for run_dir in deprecated_dir.iterdir():
         print(f"Error loading {run_dir.name}: {e} - moving safely")
         try:
             shutil.move(str(run_dir), str(bad_dir / run_dir.name))
-        except:
+        except Exception:
             pass

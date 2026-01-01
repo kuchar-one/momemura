@@ -97,14 +97,6 @@ class SimpleRepertoire:
 
 
 # -------------------------
-# Genotype -> params decoder
-# -------------------------
-
-
-# Genotype Decoder is imported at top level
-
-
-# -------------------------
 # Gaussian block builder
 # -------------------------
 def gaussian_block_builder_from_params(
@@ -233,99 +225,12 @@ class HanamuraMOMEAdapter:
 
     def evaluate_one(self, genotype: np.ndarray) -> Dict[str, Any]:
         """Evaluate a single genotype and return metrics."""
-        # Use new decoder
-        # Only support "Legacy" format dict output needed for gaussian_block_builder?
-        # WAIT. gaussian_block_builder_from_params expects specific keys ("n_control", "tmss_squeezing", etc.)
-        # The new BaseGenotype.decode returns "leaf_params" structure which is DIFFERENT from legacy "flat" structure used in `run_mome.py`.
-        # This is a critical mismatch!
-
-        # We need to adapt the new dict structure to what `gaussian_block_builder_from_params` expects,
-        # OR update `gaussian_block_builder_from_params` to understand the new structure.
-        # But `gaussian_block_builder_from_params` builds a `GaussianHeraldCircuit`.
-
-        # In JAX pipeline (jax_runner), we construct the circuit directly via JAX primitives (jax_get_heralded_state).
-        # In "random" mode (using HanamuraMOMEAdapter.evaluate_one), it uses `gaussian_block_builder_from_params` which uses `thewalrus`.
-
-        # Do we need to support "random" mode with "thewalrus" backend for NEW genotypes?
-        # The user implies full integration.
-        # BUT maintaining `thewalrus` builder for all new genotypes is complex because `GaussianHeraldCircuit` might not support broadcasting etc. easily.
-        # ACTUALLY, the JAX runner now supports all genotypes.
-        # Ideally, `run_mome.py` should prefer JAX backend even for "random" mode if available, or we update the adapter to use JAX for evaluate_one too?
-
-        # Current `evaluate_one` uses `gaussian_block_builder_from_params` -> `GaussianHeraldCircuit` -> standard pipeline.
-        # If we switch to new genotypes, `decode_genotype` is gone.
-
-        # Temporary Fix: Map params from new keys to legacy keys if possible?
-        # Legacy Genotype class returns:
-        # { "homodyne_x", "mix_params", ..., "leaf_params": { "n_ctrl", ... } }
-
-        # `gaussian_block_builder_from_params` needs: "n_signal", "n_control", "tmss_squeezing", "us_params", etc.
-
-        # It seems `gaussian_block_builder_from_params` was built around the SPECIFIC legacy decoding.
-        # The new designs (A, B, C) produce `leaf_params` arrays.
-        # `GaussianHeraldCircuit` (the Python class) expects lists of params.
-
-        # If we want to use the Python/Walrus backend with new genotypes, we need to bridge this.
-        # However, for `mode="qdax"`, it uses `jax_scoring_fn_batch` which works fine (it uses JAX runner).
-        # For `mode="random"`, `evaluate_one` is called on CPU.
-
-        # If JAX is available, `evaluate_one` is mostly used for debugging or non-JAX environments?
-        # But `run_mome` uses `jax_scoring_fn_batch` IF `self.backend == "jax"`.
-        # So for high performance, we use JAX.
-
-        # If we use new genotypes, we should probably enforce/prefer JAX backend.
-        # Implementing the bridge for `thewalrus` backend for all complex tied designs is tedious and maybe unnecessary if JAX is the future.
-
-        # The decoded dict has "leaf_params" with arrays of shape (8, ...).
-        # We need to construct `GaussianHeraldCircuit` for each leaf?
-        # `gaussian_block_builder_from_params` builds ONE block.
-        # The topology evaluation loops over leaves.
-
-        # This shows `evaluate_one` relies on the old "single genotype encodes single block params + global" assumption?
-        # WAIT. The legacy code was:
-        # `params = decode_genotype(...)`
-        # `vec, prob = gaussian_block_builder_from_params(params)`
-        # `fock_vecs = [vec for _ in range(n_leaves)]`
-        # This implies standard "random" mode ONLY supported the case where ALL leaves are identical?
-        # Yes, line 364: `fock_vecs = [vec.copy() for _ in range(n_leaves)]`.
-        # The legacy random search assumed a single block type replicated.
-
-        # The NEW genotypes allow heterogeneous leaves (Design A, B).
-        # So `evaluate_one` logic of "decode once -> build one block -> replicate" is WRONG for Design A/B.
-
-        # If we want to support Design A/B in `evaluate_one`, we must:
-        # 1. Decode genotype -> get params for EACH leaf.
-        # 2. Build circuit for EACH leaf.
-
-        # But `gaussian_block_builder_from_params` takes a dict for one block.
-        # We can reconstruct that dict 8 times.
-
-        # Let's write an adapter helper `_params_to_legacy_dict(new_params, leaf_idx)`.
-
-        # If backend is JAX, `evaluate_one` is NOT used in `scoring_fn_batch` (optimized path).
-        # It IS used in `scoring_fn_batch` fallback loop (lines 508+).
-
-        # For this task, I will implement a JAX-based `evaluate_one` if JAX is installed, or try to adapt.
-        # Actually, if we are in JAX mode, we should just use JAX function even for single evaluation?
-        # Yes.
-
-        # But `evaluate_one` returns a dict of metrics (expectation, complexity, etc.).
-        # JAX scoring function returns fitness array.
-        # We need to map back.
-
-        # Let's rely on JAX backend primarily.
-
-        # Refactoring `evaluate_one`:
 
         # Convert genotype to JAX
         g_jax = jnp.array(genotype)
 
         # Use decoder
         params = self.decoder.decode(g_jax, self.cutoff)
-
-        # To reuse `gaussian_block_builder_from_params`, we need conversion.
-        # But maybe we can skip that and use `jax_get_heralded_state`?
-        # If JAX is available, use JAX logic to compute state.
 
         if jax is not None:
             # Use JAX implementation of the block builder
@@ -342,12 +247,6 @@ class HanamuraMOMEAdapter:
                 )
             )
 
-            # Convert to numpy for topology eval?
-            # Topology eval uses `self.topology.evaluate_topology` which expects numpy arrays and uses Composer (walrus/piquasso).
-            # Mixing JAX output with Walrus composer is inefficient but works (convert to np).
-
-            # Unused analysis variables
-            # fock_vecs, p_heralds = ...
             # Homodyne
             h_x = float(params["homodyne_x"])
             h_win = params["homodyne_window"]  # might be float or None (if -1)
@@ -355,25 +254,6 @@ class HanamuraMOMEAdapter:
                 h_win = None
             else:
                 h_win = float(h_win)
-
-            # Mix params
-            # New genotypes have "mix_params" array (7, 3).
-            # Legacy topology evaluation assumes "mix_theta" constant?
-            # Line 384: `theta=params.get("mix_theta", ...)`
-            # The existing topology eval `evaluate_topology` assumes homogeneous mixing?
-
-            # Let's check `src/simulation/cpu/composer.py` `evaluate_topology`.
-            # If `evaluate_topology` doesn't support heterogeneous mixing arguments, we can't fully support Design A/B accurately with the old Python `SuperblockTopology` class.
-            # BUT `jax_runner.py` DOES support heterogeneous mixing in `jax_superblock`.
-
-            # So, for accurate evaluation of new genotypes, we MUST use `jax_superblock` logic, not the old `composer.py` logic.
-            # The old logic is insufficient for Design A (heterogeneous).
-
-            # Thus, `evaluate_one` should call `jax_superblock` effectively if we want consistency.
-            # `jax_scoring_fn_batch` (in `jax_runner.py`) does exactly this.
-
-            # So `evaluate_one` should wrapper `jax_scoring_fn_batch` for a batch of 1?
-            # Yes! That guarantees consistency.
 
             # Prepare batch 1
             g_batch = g_jax[None, :]
@@ -484,16 +364,7 @@ class HanamuraMOMEAdapter:
             # 4. Total Photons (minimize) -> -photons
 
             f_expect = metrics["expectation"]
-            f_prob = metrics["log_prob"]  # usage suggests this is -log10(P), wait.
-            # In evaluate_one I set log_prob = -math.log10(prob). This is positive for tiny prob.
-            # Minimizing "log_prob" (which is usually decreasing with P).
-            # If we want to maximize probability, we minimize -log(P).
-            # The metrics["log_prob"] returned by existing evaluate_one is usually -log10(P).
-            # In my JAX update I set log_prob = metrics["log_prob"]...
-            # In original: f_prob = metrics["log_prob"].
-            # fitness[1] = -f_prob.
-            # If f_prob = -log10(P) (positive), then fitness = log10(P) (negative).
-            # Maximizing fitness (negative number) -> Maximizing P. Correct.
+            f_prob = metrics["log_prob"]
 
             f_prob = metrics["log_prob"]
             f_complex = float(metrics["complexity"])
@@ -524,8 +395,6 @@ class HanamuraMOMEAdapter:
 
         for i, metrics, error in results:
             if error:
-                # invalid genotype — mark with -inf fitness so the repertoire cell stays empty
-                # print(f"DEBUG: Genotype invalid: {error}") # Uncomment for debugging
                 fitnesses[i, :] = -np.inf
                 # use a descriptor sentinel outside grid bounds so it cannot populate centroids
                 descriptors[i, :] = np.array([-9999.0, -9999.0, -9999.0], dtype=float)
@@ -535,10 +404,7 @@ class HanamuraMOMEAdapter:
             # Objectives
             # 1. Expectation (maximize) -> QDax maximizes fitness, so use f_expect directly
             f_expect = metrics["expectation"]
-            # 2. Log Prob (minimize -logP) -> QDax maximizes, so use -(-logP) = logP? No.
-            # We want to minimize -log(P). So we want to maximize log(P).
-            # metrics["log_prob"] is -log10(P). We want to minimize it.
-            # So fitness = -metrics["log_prob"].
+            # 2. Log Prob (minimize logP) -> QDax maximizes, so use -logP
             f_prob = metrics["log_prob"]
             # 3. Complexity (minimize) -> fitness = -complexity
             f_complex = float(metrics["complexity"])
@@ -771,11 +637,6 @@ def run(
         correction_cutoff=correction_cutoff,
     )
 
-    # Calculate Genotype Dimension D
-    # We use valid depth=3 as default for genotype length logic
-    # Use config depth if available?
-    # Genotype length might depend on depth, which is usually part of init.
-    # Where does depth come from? CLI arg now!
     depth_val = 3
     if genotype_config and "depth" in genotype_config:
         depth_val = int(genotype_config["depth"])
@@ -886,15 +747,7 @@ def run(
                 if fitnesses[i, 0] > current_best_f:
                     current_best_f = float(fitnesses[i, 0])
 
-            # Metrics
-            # fitness[0] is now f_expect (maximized)
-            # We track max expectation directly.
             history_max_exp.append(current_best_f)
-            # Similarly for log prob
-            # This is approximate since we track best f0, not best f1.
-            # But let's just take the mean or something for history?
-            # Or just the best f0's corresponding f1?
-            # For simplicity, let's track the best f0's metrics.
 
             if (it + 1) % 5 == 0:
                 print(f"iter {it + 1}/{n_iters}, best f0 (exp) so far: {best_f:.6g}")
@@ -936,23 +789,12 @@ def run(
         if jax is not None:
             print(f"JAX Devices: {jax.devices()}")
 
-        # Define scoring function using jax.pure_callback
-        # Define scoring function using jax.pure_callback
-        # Define scoring function using JAX runner
         from src.simulation.jax.runner import jax_scoring_fn_batch
 
         def scoring_fn(genotypes, key):
             """
             JAX-native scoring function.
             """
-            # We don't use key in scoring (deterministic given genotype)
-            # But we accept it for compatibility with QDax interface.
-
-            # Call batched JAX scorer
-            # Note: We removed block_until_ready() as it fails during JIT/scan tracing.
-            # Profiling will still capture kernels.
-            # We must pass the operator (GKP) to the scoring function now.
-            # operator is available in the closure (from run() scope)
             with jax.profiler.TraceAnnotation("jax_scoring_fn_batch_qdax"):
                 # Ensure operator is a JAX array
                 op_jax = jnp.array(operator)
@@ -1043,7 +885,6 @@ def run(
                 seed_source_dir = os.path.join(output_root, "experiments", group_id)
                 print(f"  - Scanning seeds in group: {seed_source_dir}")
 
-            # Increase top_k to 50 as requested ("seed more")
             # Filter by matching genotype to ensure relevance
             seeds = scan_results_for_seeds(
                 seed_source_dir,
@@ -1351,11 +1192,6 @@ def run(
                 n_chunks += 1
 
         all_metrics = {k: [] for k in init_metrics.keys()} if not resume_path else {}
-        # If resume, we might want to load old history?
-        # The checkpoint saves 'history' optionally?
-        # For simple resume, we append new history.
-        # Merging full history is complex if we don't save it in checkpoint.
-        # Let's save history in checkpoint too.
 
         # -------------------------
         # Progress Bar Setup
@@ -1382,12 +1218,6 @@ def run(
 
         # Resume History?
         if resume_path and "history" in checkpoint:
-            # We can prepopulate all_metrics if we want valid full plots?
-            # Or just assume plotting handles it.
-            # Ideally we accumulate.
-            # For now, let's init empty and only plot new stuff, OR rely on final merge?
-            # result_manager merges history?
-            # Let's try to restore `all_metrics` if present.
             if "history" in checkpoint:
                 # Checkpoint history might be numpy or list
                 all_metrics = checkpoint["history"]
@@ -1395,39 +1225,9 @@ def run(
                     f"Restored metrics history ({len(list(all_metrics.values())[0])} items)."
                 )
             else:
-                # If init_metrics needed for keys
-                all_metrics = {
-                    k: [] for k in init_metrics.keys()
-                }  # init_metrics scope issue?
-                # init_metrics defined in else block.
-                # Need keys.
-                # Usually ['coverage', 'min_expectation', ...]
-                # We can infer from first chunk if needed.
                 pass
 
         chunk_start_time = time.time()
-
-        # Python Loop for Optimization
-        # We process 'chunks' just to maintain the reporting structure,
-        # but the inner logic is now just a loop calling mome.update.
-        # Actually, since we need to save checkpoints every chunk, keeping the chunk structure is good.
-        # But we iterate step-by-step inside the chunk logic (or block of steps).
-
-        # We JIT `mome.update`?
-        # CAUTION: If `mome.update` calls `scoring_fn` which has `pmap`, `jit(mome.update)` is `jit(pmap)`.
-        # This is exactly what caused the single-GPU issue.
-        # We must NOT JIT `mome.update` as a whole.
-        # `mome.update` typically calls:
-        # 1. selection (can be jitted)
-        # 2. mutation (can be jitted)
-        # 3. scoring (pmap)
-        # 4. addition (can be jitted)
-
-        # QDax `MOME.update` implementation usually composes these.
-        # If we call `mome.update` eagerly (no jit), it will dispatch kernels.
-        # This allows `pmap` in step 3 to work correctly.
-
-        # Ensure we don't compile `mome.update` via `jax.jit`.
 
         # Signal Handling for Graceful Shutdown
         def signal_handler(signum, frame):
@@ -1467,20 +1267,9 @@ def run(
                 # Process Chunk Metrics
                 # Convert list of scalars to array for `all_metrics` extend
                 for k, v_list in chunk_metrics.items():
-                    # stack to get shape (chunk_len, ...) if needed, or just extend list
-                    # all_metrics stores flat lists usually or arrays?
-                    # Initialize: all_metrics = {k: []}
-                    # extend expects iterables. v_list is list of scalars.
-                    # But wait, `metrics` from scan was stacked (chunk_len, ...).
-                    # `all_metrics[k].extend(v)` worked because v was array.
-                    # Here v_list is list of JAX scalars.
-                    # We should convert to numpy/float to save memory?
-                    # Or keep as JAX arrays?
-                    # Let's convert to simple list of values to avoid device memory accumulation.
+                    all_metrics[k].extend(v_list)
                     if jax is not None:
                         # Pull to host
-                        # v_list usually tuple of arrays? No, step_metrics values.
-                        # We use device_get to be safe.
                         v_list_np = [jax.device_get(x) for x in v_list]
                         if k not in all_metrics:
                             all_metrics[k] = []
@@ -1491,10 +1280,6 @@ def run(
                         all_metrics[k].extend(v_list)
 
                 # --- Checkpointing at end of chunk ---
-                # Create checkpoint dict
-                # Move accumulated metrics update BEFORE checkpoint so we save it?
-                # Yes.
-
                 completed += chunk_len
 
                 # Save Checkpoint
@@ -1509,28 +1294,16 @@ def run(
                         "history": all_metrics,
                     }
 
-                    # We need a directory to save checkpoint.
-                    # If resume_path is set, save THERE (overwrite).
-                    # If new run, save in NEW output_dir.
-                    # BUT output_dir is defined at end of script!
-                    # We must define output_dir EARLIER or use a dedicated checkpoint dir?
-                    # User wants to resume from "output/..."
-                    # So we should save to the current run's output directory.
-
-                    # Define output dir early?
-                    # We moved it up!
-                    current_output_dir = output_dir  # already defined local var
-
                     # Ensure directory exists (paranoia check)
-                    if not os.path.exists(current_output_dir):
+                    if not os.path.exists(output_dir):
                         print(
-                            f"WARNING: Output directory {current_output_dir} missing. Recreating."
+                            f"WARNING: Output directory {output_dir} missing. Recreating."
                         )
-                        os.makedirs(current_output_dir, exist_ok=True)
+                        os.makedirs(output_dir, exist_ok=True)
 
                     # Temp file
-                    tmp_chk = Path(current_output_dir) / "checkpoint_tmp.pkl"
-                    final_chk = Path(current_output_dir) / "checkpoint_latest.pkl"
+                    tmp_chk = Path(output_dir) / "checkpoint_tmp.pkl"
+                    final_chk = Path(output_dir) / "checkpoint_latest.pkl"
 
                     with open(tmp_chk, "wb") as f:
                         pickle.dump(chk_data, f)
@@ -1557,7 +1330,6 @@ def run(
 
                     history_fronts.append((valid_fits, valid_descs))
 
-                # Print progress with ETR
                 # Print progress with ETR
                 # Use last val from chunk_metrics (dictionary of lists)
                 cov = float(chunk_metrics["coverage"][-1]) * 100
@@ -1604,9 +1376,6 @@ def run(
 
     # --- Result Management ---
     from src.utils.result_manager import OptimizationResult
-
-    # Output dir logic moved up.
-    # Just reiterate config save?
 
     # Config dict
     config = {

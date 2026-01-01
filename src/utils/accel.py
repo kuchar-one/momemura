@@ -3,6 +3,7 @@ from typing import Callable, Any
 try:
     # prefer to import the actual njit callable if numba is available
     from numba import njit as _numba_njit  # type: ignore
+
     _NUMBA_AVAILABLE = True
 except Exception:
     _numba_njit = None
@@ -48,7 +49,9 @@ def njit_wrapper(*dargs: Any, **dkwargs: Any) -> Callable:
         if dargs and callable(dargs[0]) and not dkwargs:
             # Direct usage: @njit_wrapper above a function
             return dargs[0]
+
         # Otherwise return a decorator that returns the function unchanged
         def _noop_decorator(func: Callable) -> Callable:
             return func
+
         return _noop_decorator

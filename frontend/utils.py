@@ -10,7 +10,6 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.utils.result_manager import OptimizationResult  # noqa: E402
-from src.simulation.cpu.circuit import GaussianHeraldCircuit  # noqa: E402
 
 
 def list_runs(output_dir: str = "output") -> List[str]:
