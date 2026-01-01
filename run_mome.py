@@ -186,7 +186,7 @@ class HanamuraMOMEAdapter:
         mode: str = "pure",
         homodyne_resolution: float = 0.01,
         backend: str = "thewalrus",
-        genotype_name: str = "legacy",
+        genotype_name: str = "A",
         genotype_config: Dict[str, Any] = None,
         correction_cutoff: int = None,
     ):
@@ -721,7 +721,7 @@ def run(
     target_alpha: complex = 2.0,
     target_beta: complex = 0.0,
     low_mem: bool = False,
-    genotype: str = "legacy",
+    genotype: str = "A",
     genotype_config: Dict[str, Any] = None,
     seed_scan: bool = False,
     correction_cutoff: int = None,

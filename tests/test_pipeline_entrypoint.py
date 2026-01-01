@@ -9,7 +9,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from run_mome import run
 
 
-@pytest.mark.parametrize("genotype", ["legacy", "A", "B1", "B2", "C1", "C2"])
+@pytest.mark.parametrize("genotype", ["A", "B1", "B2", "C1", "C2"])
 def test_pipeline_random_smoke(genotype, tmp_path):
     """
     Smoke test for the full pipeline in random mode with different genotypes.

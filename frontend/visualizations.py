@@ -294,8 +294,18 @@ def plot_tree_circuit(params: dict, genotype_name: str = "A") -> go.Figure:
             return False  # Explicitly turned off
 
         # 2. Check content (Vacuum detection)
-        # tmss_r is scalar
-        r_val = get_leaf_val(idx, "tmss_r", 0.0, scalar=True)
+        # tmss_r is scalar in legacy, but 'r' is (L, N) list/array in General Gaussian
+        # Try 'r' first
+        r_list = get_leaf_val(idx, "r", None, scalar=False)
+        if r_list is not None:
+            # General Gaussian: r is list of squeezings. Active if any distinct from 0?
+            if hasattr(r_list, "__len__"):
+                r_val = float(np.max(np.abs(r_list)))
+            else:
+                r_val = abs(utils.to_scalar(r_list))
+        else:
+            # Fallback to legacy
+            r_val = get_leaf_val(idx, "tmss_r", 0.0, scalar=True)
 
         # Simplified: If r active is True but state is vacuum, treat as Inactive for mixing?
         # Yes, "Vacuum Exclusion" logic implies ignoring vacuum.
@@ -454,9 +464,18 @@ def plot_tree_circuit(params: dict, genotype_name: str = "A") -> go.Figure:
             n_val = int(get_leaf_val(idx, "n_ctrl", 1, scalar=True))
 
             # --- Detailed Params for Visualization ---
-            # US Phase
-            us_ph = get_leaf_val(idx, "us_phase", 0.0, scalar=True)
-            us_ph_scalar = utils.to_scalar(us_ph)
+            # US Phase (Signal Phase) or General Phases
+            # Legacy: us_phase. General: phases (N^2 list).
+            us_ph = get_leaf_val(idx, "us_phase", None, scalar=True)
+            if us_ph is None:
+                # Try phases
+                phs = get_leaf_val(idx, "phases", [], scalar=False)
+                if hasattr(phs, "__len__") and len(phs) > 0:
+                    us_ph_scalar = utils.to_scalar(phs[0])  # Proxy
+                else:
+                    us_ph_scalar = 0.0
+            else:
+                us_ph_scalar = utils.to_scalar(us_ph)
 
             # PNR - Detected Photons
             # PNR is usually a list of length n_ctrl.
@@ -469,24 +488,31 @@ def plot_tree_circuit(params: dict, genotype_name: str = "A") -> go.Figure:
             else:
                 pnr_str = str(int(utils.to_scalar(raw_pnr)))
 
-            # UC Params (Control Unitary) - Just show first theta/phi for brevity in label
-            # But full details in hover
+            # UC Params or General Phases
+            uc_th_val = 0.0
             uc_th_raw = get_leaf_val(idx, "uc_theta", [], scalar=False)
-            # uc_theta is usually (L, N_pairs). get_leaf_val returns (N_pairs,) list/array
             if hasattr(uc_th_raw, "__len__") and len(uc_th_raw) > 0:
                 uc_th_val = utils.to_scalar(uc_th_raw[0])
+
+            # Label
+            if us_ph is None and get_leaf_val(idx, "r", None, scalar=False) is not None:
+                # General Gaussian Label
+                label = f"<b>L{idx}</b><br>GG<br>r_max={r_val:.2f}<br>PNR=[{pnr_str}]"
+                hover = (
+                    f"Leaf {idx} (General Gaussian)<br>Active: {isActive}<br>"
+                    f"<b>Max Squeezing:</b> r={r_val:.2f}<br>"
+                    f"<b>PNR:</b> [{pnr_str}]"
+                )
             else:
-                uc_th_val = 0.0
-
-            label = f"<b>L{idx}</b><br>r={r_val:.2f}<br>PNR=[{pnr_str}]"
-
-            hover = (
-                f"Leaf {idx}<br>Active: {isActive}<br>"
-                f"<b>Squeezing:</b> r={r_val:.2f}<br>"
-                f"<b>Signal:</b> Phase={us_ph_scalar:.2f}<br>"
-                f"<b>Control:</b> n={n_val}, PNR=[{pnr_str}]<br>"
-                f"<b>Unitary (1st):</b> Th={uc_th_val:.2f}"
-            )
+                # Legacy Label
+                label = f"<b>L{idx}</b><br>r={r_val:.2f}<br>PNR=[{pnr_str}]"
+                hover = (
+                    f"Leaf {idx}<br>Active: {isActive}<br>"
+                    f"<b>Squeezing:</b> r={r_val:.2f}<br>"
+                    f"<b>Signal:</b> Phase={us_ph_scalar:.2f}<br>"
+                    f"<b>Control:</b> n={n_val}, PNR=[{pnr_str}]<br>"
+                    f"<b>Unitary (1st):</b> Th={uc_th_val:.2f}"
+                )
         elif node.startswith("M") or node == "Root":
             # Need parameter index
             midx = (

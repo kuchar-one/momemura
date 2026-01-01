@@ -25,7 +25,7 @@ def test_end_to_end_consistency(tmp_path):
     genotype_config = {
         "pnr_max": pnr_max,
         "depth": 3,  # Standard depth to avoid topology shape mismatches
-        "modes": 1,  # Minimal modes
+        "modes": 2,  # Minimal valid modes (1 Sig + 1 Ctrl)
     }
 
     # 2. Run Optimization

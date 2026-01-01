@@ -1,0 +1,21 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.3, pytest-9.0.1, pluggy-1.6.0
+rootdir: /cluster/home/kuchar/code/momemura
+configfile: pytest.ini
+plugins: anyio-4.12.0
+collected 36 items
+
+tests/test_genotypes.py ......................                           [ 61%]
+tests/test_genotype_0_full.py ...                                        [ 69%]
+tests/test_genotype_b3.py ..                                             [ 75%]
+tests/test_frontend_utils.py ....                                        [ 86%]
+tests/test_genotype_converter.py ....                                    [ 97%]
+tests/test_end_to_end_consistency.py .                                   [100%]
+
+=============================== warnings summary ===============================
+tests/test_end_to_end_consistency.py::test_end_to_end_consistency
+  /cluster/home/kuchar/.local/lib/python3.11/site-packages/qdax/core/mome.py:60: UserWarning: This type of repertoire does not store the extra scores computed by the scoring function
+    return repertoire_init(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================== 36 passed, 1 warning in 368.49s (0:06:08) ===================

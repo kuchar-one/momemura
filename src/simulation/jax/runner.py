@@ -7,8 +7,6 @@ from src.genotypes.genotypes import get_genotype_decoder
 
 from src.simulation.jax.herald import (
     vacuum_covariance,
-    two_mode_squeezer_symplectic,
-    expand_mode_symplectic,
     passive_unitary_to_symplectic,
     complex_alpha_to_qp,
 )
@@ -207,13 +205,8 @@ def jax_get_heralded_state(
 
     # Displacement
     # mu_disp needs real representation: [Re(d), Im(d)] (Block Basis)
-    d_re = jnp.real(disp_vec)
-    d_im = jnp.imag(disp_vec)
-    # Need to verify if `complex_alpha_to_qp` does scaling?
-    # alpha = (x + ip) / sqrt(2*hbar) usually?
-    # Or d is already in alpha units?
+
     # Helper `complex_alpha_to_qp` takes alpha and returns [q, p] * sqrt(2*hbar).
-    # Yes, let's use it.
     r_disp = complex_alpha_to_qp(disp_vec, hbar)
 
     # Rotated displacement?

@@ -189,7 +189,6 @@ class Design0Genotype(DesignAGenotype):
         hom_x_raw = g[idx : idx + self.nodes]
         idx += self.nodes
         hom_x = jnp.tanh(hom_x_raw) * self.hx_scale
-        hom_win = self.window
 
         base_res = super().decode(g[idx:], cutoff)
 
@@ -391,7 +390,6 @@ class DesignB30Genotype(DesignB3Genotype):
         hom_x_raw = g[idx : idx + self.nodes]
         idx += self.nodes
         hom_x = jnp.tanh(hom_x_raw) * self.hx_scale
-        hom_win = self.window
 
         base_res = super().decode(g[idx:], cutoff)
         base_res["homodyne_x"] = hom_x

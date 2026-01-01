@@ -1,5 +1,4 @@
 import os
-import shutil
 from pathlib import Path
 import pytest
 import jax
@@ -33,6 +32,7 @@ def test_optimization_pipeline_end_to_end(tmp_path):
         backend="jax" if jax is not None else "thewalrus",
         no_plot=False,  # We want to test plotting/saving
         output_root=output_root,
+        genotype="A",
     )
 
     # 2. Check output directory

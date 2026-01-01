@@ -22,6 +22,7 @@ class TestStage1Batching(unittest.TestCase):
             self.operator,
             cutoff=self.cutoff,
             mode="random",
+            genotype_name="A",
         )
         self.D = 40  # genotype dim
 

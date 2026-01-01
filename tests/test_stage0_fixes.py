@@ -15,7 +15,7 @@ class TestStage0Fixes(unittest.TestCase):
     def test_decode_genotype_unused_slots(self):
         """Test that decode_genotype handles unused slots correctly."""
         # Create a dummy genotype of correct length
-        decoder = get_genotype_decoder("legacy")
+        decoder = get_genotype_decoder("A")
         length = decoder.get_length()
         genotype = np.random.rand(length)
 

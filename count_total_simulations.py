@@ -129,10 +129,6 @@ def count_stats(output_dir: str = "output"):
 
     run_stats.sort(key=lambda x: x["path"])
 
-    # Filter or truncate if too many? 454 is a lot for terminal.
-    # Show summary of counts? Or list all?
-    # Listing 454 lines is fine for a script output, user can pipe it.
-
     for stat in run_stats:
         print(
             f"{stat['path']:<50} | {stat['gens']:<8} | {stat['evals']:<10} | {stat['sols']:<8}"
