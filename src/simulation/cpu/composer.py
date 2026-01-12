@@ -232,7 +232,7 @@ class Composer:
                 vec_cond = v / math.sqrt(p_x_density)
             else:
                 vec_cond = np.zeros_like(v)
-            joint = float(pA * pB * p_measure)
+            joint = float(pA * pB)
             return vec_cond, p_measure, joint
 
         # --- Mixed-state / window path: construct densities and propagate exactly ---
@@ -288,7 +288,7 @@ class Composer:
                 rho_cond = new_rho / p_x_density
             else:
                 rho_cond = np.zeros_like(new_rho)
-            joint = float(pA * pB * p_measure)
+            joint = float(pA * pB)
             return rho_cond, p_measure, joint
 
         # homodyne window: integrate numerically
@@ -362,7 +362,7 @@ class Composer:
             else:
                 rho_cond = np.zeros((c, c), dtype=complex)
 
-            joint = float(pA * pB * Pwin)
+            joint = float(pA * pB)
             return rho_cond, Pwin, joint
 
         else:
@@ -382,7 +382,7 @@ class Composer:
                 rho_cond = np.zeros((c, c), dtype=complex)
                 prob = 0.0
 
-            joint = float(pA * pB * prob)
+            joint = float(pA * pB)
             return rho_cond, prob, joint
 
     # convenience wrapper that caches on input bytes + params

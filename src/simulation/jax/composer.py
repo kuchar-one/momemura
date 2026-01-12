@@ -75,7 +75,7 @@ def jax_compose_pair(
             None,
         )
 
-        joint = pA * pB * p_measure
+        joint = pA * pB
         return vec_cond, p_measure, joint
 
     # --- Mixed-state path ---
@@ -128,7 +128,7 @@ def jax_compose_pair(
             None,
         )
 
-        joint = pA * pB * p_measure
+        joint = pA * pB
         return rho_cond, p_measure, joint
 
     # Window
@@ -154,7 +154,7 @@ def jax_compose_pair(
         None,
     )
 
-    joint = pA * pB * Pwin
+    joint = pA * pB
     return rho_cond, Pwin, joint
 
 
@@ -558,10 +558,11 @@ def jax_superblock(
             )
 
             def construct_U():
-                return jax_u_bs(theta, phi, cutoff)
+                target_dtype = (theta + 0j).dtype
+                return jax_u_bs(theta, phi, cutoff).astype(target_dtype)
 
             def dummy_U():
-                # Dynamically match dtype of construct_U (which depends on theta)
+                # Fix: Dynamically match theta dtype
                 target_dtype = (theta + 0j).dtype
                 return jnp.zeros((cutoff * cutoff, cutoff * cutoff), dtype=target_dtype)
 

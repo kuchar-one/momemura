@@ -56,7 +56,7 @@ def jax_clements_unitary(phases: jnp.ndarray, N: int) -> jnp.ndarray:
 
     Input `phases` has length N^2.
     """
-    U = jnp.eye(N, dtype=jnp.complex64)
+    U = jnp.eye(N, dtype=jnp.complex_)
 
     # Check if N is static or traced? Usually static.
     # If N is small (<=6), we can unroll.
@@ -139,81 +139,66 @@ def jax_apply_final_gaussian(
     return U_final @ state_vec
 
 
-def jax_get_heralded_state(
-    params: Dict[str, jnp.ndarray], cutoff: int, pnr_max: int = 3
-):
+def jax_get_gaussian_moments(
+    params: Dict[str, jnp.ndarray],
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Computes Herald State from General Gaussian Leaf parameters.
-    Leaf Params:
-      - n_ctrl: scalar int
-      - r: (N,) squeezing
-      - phases: (N^2,) unitary phases
-      - disp: (N,) complex displacement
-      - pnr: (N-1,) pnr outcomes
-
-    Logic:
-      1. Construct S_total = S_pass @ S_sq
-      2. Construct mu = disp_vec_real_imag
-      3. Covariance sigma = 0.5 * S S^T
-      4. Herald on last N-1 modes
+    Compute (mu, cov) for a General Gaussian state defined by params.
     """
-    # Extract params
-    n_ctrl_eff = params["n_ctrl"]  # (1,) or scalar
     r_vec = params["r"]  # (N,)
     phases_vec = params["phases"]  # (N^2,)
     disp_vec = params["disp"]  # (N,) complex
-    pnr_vec = params["pnr"]  # (Nc_max,)
 
-    # Infer dimension N from r_vec
     N = r_vec.shape[0]
-    N_C = N - 1
-
     hbar = 2.0
 
     # 1. Squeezing Symplectic
-    # r_vec contains squeeze params.
-    # ordering x1..xN, p1..pN ?
-    # S_sq = diag(e^-r, e^r) if standard.
-    # Note: `two_mode_squeezer` usually is r, -r.
-    # Let's assume standard x-squeezing: var(x) = e^{-2r}.
-    # Diag should be [e^-r1 ... e^-rN, e^r1 ... e^rN] for Block Basis.
-    # Or interleaved?
-    # `src/simulation/jax/herald.py` usually assumes Block Basis (x...p...).
-    # Let's verify vacuum_covariance.
-    # It returns identity.
-
-    # Construct diagonal S_sq
+    # S_sq = diag(e^-r, e^r) (x-squeezing)
     exp_minus_r = jnp.exp(-r_vec)
     exp_plus_r = jnp.exp(r_vec)
     S_sq = jnp.diag(jnp.concatenate([exp_minus_r, exp_plus_r]))
 
     # 2. Passive Unitary Symplectic
-    # Construct U_pass from phases
     U_pass = jax_clements_unitary(phases_vec, N)
     S_pass = passive_unitary_to_symplectic(U_pass)
 
     # 3. Total Symplectic
     S_total = S_pass @ S_sq
 
-    # 4. Covariance & Mean
-    # Vacuum cov = (hbar/2) * I?
-    # Usually herald.py `vacuum_covariance` returns `(hbar/2) * I`
-    cov_vac = vacuum_covariance(N, hbar)
-    # sigma = S cov_vac S^T
-    # If cov_vac is proportional to I, then S cov S^T = (hbar/2) S S^T
-    cov = S_total @ cov_vac @ S_total.T
+    # Moments calculated above via jax_get_gaussian_moments
+
+    # 5. Mask PNR (Effective PNR vector)
 
     # Displacement
-    # mu_disp needs real representation: [Re(d), Im(d)] (Block Basis)
+    # alpha vector to mu (xp)
+    mu = complex_alpha_to_qp(disp_vec, hbar)
 
-    # Helper `complex_alpha_to_qp` takes alpha and returns [q, p] * sqrt(2*hbar).
-    r_disp = complex_alpha_to_qp(disp_vec, hbar)
+    # Covariance
+    cov_vac = vacuum_covariance(N, hbar)
+    cov = S_total @ cov_vac @ S_total.T
 
-    # Rotated displacement?
-    # User plan: D @ U @ S |0>.
-    # Displaced state has mean = r_disp
-    # Covariance is independent of displacement.
-    mu = r_disp
+    return mu, cov
+
+
+def jax_get_heralded_state(
+    params: Dict[str, jnp.ndarray], cutoff: int, pnr_max: int = 3
+):
+    """
+    Computes Herald State from General Gaussian Leaf parameters.
+    """
+    # 1. Get Gaussian Moments (Whole N-mode state)
+    mu, cov = jax_get_gaussian_moments(params)
+
+    # Extract params needed for masking/indexing
+    n_ctrl_eff = params["n_ctrl"]
+    pnr_vec = params["pnr"]
+
+    # Infer dimension N from mu
+    N = mu.shape[0] // 2
+    N_C = N - 1
+    hbar = 2.0
+
+    # 5. Herald
 
     # 5. Herald
     # Control modes indices: 1..N-1 (0 is signal)
@@ -259,7 +244,9 @@ def jax_get_heralded_state(
         p = pnr_effective[i]
         power = N_C - 1 - i
         stride = D_ctrl**power
-        flat_idx += p * stride
+        flat_idx += (p * stride).astype(jnp.int32)
+
+    flat_idx = flat_idx.astype(jnp.int32)
 
     vec_slice = H_flat[:, flat_idx]
 
@@ -302,9 +289,16 @@ def _score_batch_shard(
     genotype_config: Any = None,
     correction_cutoff: int = None,
     pnr_max: int = 3,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     JIT-compiled scoring function for a single batch shard.
+    Returns: (fitnesses, descriptors, extras)
+    extras contains:
+      - gradients: Gradient of expectation value w.r.t genotype
+      - leakage: 1 - norm_squared inside cutoff
+      - raw_expectation: Unpenalized expectation value
+      - joint_probability: Probability of the heralded event
+      - pnr_cost: Total pnr cost
     """
     if genotype_config is not None and isinstance(genotype_config, tuple):
         config_dict = dict(genotype_config)
@@ -320,7 +314,12 @@ def _score_batch_shard(
     use_correction = (correction_cutoff is not None) and (correction_cutoff > cutoff)
     sim_cutoff = correction_cutoff if use_correction else cutoff
 
-    def score_one(g):
+    def loss_fn(g):
+        """
+        Returns (Loss, Aux)
+        Loss = ExpVal (to be minimized, so we return it directly as JAX grad computes grad of this)
+        Aux = (fitness_rest, descriptor, extra_metrics)
+        """
         params = decoder.decode(g, sim_cutoff)
 
         # 1. Get Leaf States
@@ -333,6 +332,7 @@ def _score_batch_shard(
         hom_x = params["homodyne_x"]
         hom_win = params["homodyne_window"]
 
+        # Handle hom_x shape (scalar vs vector)
         hom_xs = jnp.atleast_1d(hom_x)
         phi_mat = jax_hermite_phi_matrix(hom_xs, sim_cutoff)
 
@@ -381,41 +381,118 @@ def _score_batch_shard(
 
         # --- Dynamic Limits Logic ---
         leakage_penalty = 0.0
+        leakage_val = 0.0
 
         if use_correction:
             probs = jnp.abs(final_state_transformed) ** 2
             prob_total = jnp.sum(probs)
             mass_in = jnp.sum(probs[:cutoff])
-            leakage = 1.0 - (mass_in / jnp.maximum(prob_total, 1e-12))
+            leakage_val = 1.0 - (mass_in / jnp.maximum(prob_total, 1e-12))
 
             state_trunc = final_state_transformed[:cutoff]
             norm_trunc = jnp.linalg.norm(state_trunc)
+            # Re-normalize if meaningful norm exists
             state_eval = jax.lax.cond(
                 norm_trunc > 1e-9, lambda x: x / norm_trunc, lambda x: x, state_trunc
             )
-            leakage_penalty = leakage * 2.0
+            leakage_penalty = leakage_val * 2.0
         else:
             state_eval = final_state_transformed
 
         # 4. Expectation Value
+        # Gradient Target: minimize <Psi|Op|Psi>
+        # We need real( <Psi | Op | Psi> )
         op_psi = operator @ state_eval
         raw_exp_val = jnp.real(jnp.vdot(state_eval, op_psi))
 
-        exp_val = jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf)
-        exp_val += leakage_penalty
+        # Apply penalty for invalid states (prob ~ 0)
+        # Gradient should flow through raw_exp_val where valid
+        exp_val = jnp.where(joint_prob > 1e-40, raw_exp_val, 0.0)
 
         # 5. Fitness & Descriptors
-        prob_clipped = jnp.maximum(joint_prob, 1e-45)
-        log_prob = -jnp.log10(prob_clipped)
+        # CLIP PROBABILITY at 1.0 to prevent explosion incentive
+        # If prob > 1.0, log10(prob) > 0, which increases fitness (since fitness uses log10(p)).
+        # We must clip it to stop the optimizer from exploiting numerical errors.
+        prob_safe = jnp.maximum(joint_prob, 1e-45)
+        prob_capped = jnp.minimum(prob_safe, 1.0)
+
+        # Calculate Negative Log Likelihood (NLL)
+        log_prob = -jnp.log10(prob_capped)
+
+        # Add massive penalty if prob > 1.0 + epsilon (tolerance for float errors)
+        # We add this to log_prob (which is minimized/penalized part of loss, or negative of fitness)
+        violation = jnp.maximum(joint_prob - 1.0, 0.0)
+        penalty = jnp.where(violation > 1e-4, jnp.inf, 0.0)
+
+        log_prob = log_prob + penalty
         total_photons = total_sum_pnr
 
-        fitness = jnp.array([-exp_val, -log_prob, -active_modes, -total_photons])
+        # Loss Function for Gradient Methods
+        # Default weights: 1.0 Expectation, 0.0 Probability
+        w_exp = 1.0
+        w_prob = 0.0
+        if config_dict is not None:
+            w_exp = float(config_dict.get("alpha_expectation", 1.0))
+            w_prob = float(config_dict.get("alpha_probability", 0.0))
+
+        # Weighted Sum
+        # Note: We minimize loss.
+        # - Expectation: Minimize exp_val
+        # - Probability: Maximize prob => Minimize -log_prob (which is log_prob variable here)
+        loss_val = (w_exp * exp_val) + (w_prob * log_prob) + leakage_penalty
+
+        # Construct Fitness: [-Exp, -LogP, -Complex, -Photons]
+        # Use computed loss_val which includes penalty? or separate?
+        # MOME usually uses penalized expectation.
+        final_exp = (
+            jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf) + leakage_penalty
+        )
+
+        # Fitnesses for QDax (Maximization)
+        fitness_rest = jnp.array([-log_prob, -active_modes, -total_photons])
+
+        # We stick -final_exp into the auxiliary return so we can reconstruct full fitness
+        # But loss_fn returns 'loss' to minimize.
+
         descriptor = jnp.array([active_modes, max_pnr, total_photons])
 
-        return fitness, descriptor
+        aux = {
+            "fitness_0": -final_exp,  # Maximize this
+            "fitness_rest": fitness_rest,
+            "descriptor": descriptor,
+            "leakage": leakage_val,
+            "raw_expectation": raw_exp_val,
+            "joint_probability": joint_prob,
+            "pnr_cost": total_photons,
+        }
 
-    fitnesses, descriptors = jax.vmap(score_one)(genotypes)
-    return fitnesses, descriptors
+        return jnp.real(loss_val), aux
+
+    # vmap value_and_grad over batch
+    # value_and_grad returns (loss, aux), grad
+    # internal tuple structure: ((loss, aux), grad)
+    # vmap output: ((loss_batch, aux_batch), grad_batch)
+    (loss_batch, aux_batch), grads_batch = jax.vmap(
+        jax.value_and_grad(loss_fn, has_aux=True)
+    )(genotypes)
+
+    # Reconstruct Fitnesses
+    # fitness_0 shape (N,)
+    f0 = aux_batch["fitness_0"][:, None]  # (N, 1)
+    f_rest = aux_batch["fitness_rest"]  # (N, 3)
+    fitnesses = jnp.concatenate([f0, f_rest], axis=1)
+
+    descriptors = aux_batch["descriptor"]
+
+    extras = {
+        "gradients": grads_batch,
+        "leakage": aux_batch["leakage"],
+        "raw_expectation": aux_batch["raw_expectation"],
+        "joint_probability": aux_batch["joint_probability"],
+        "pnr_cost": aux_batch["pnr_cost"],
+    }
+
+    return fitnesses, descriptors, extras
 
 
 def jax_scoring_fn_batch(
@@ -426,10 +503,10 @@ def jax_scoring_fn_batch(
     genotype_config: Dict = None,
     correction_cutoff: int = None,
     pnr_max: int = 3,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Batched scoring function for QDax.
-    Dispatches to multi-device pmap if devices > 1, else uses jit.
+    Returns: (fitnesses, descriptors, extras)
     """
     n_devices = jax.local_device_count()
 
@@ -463,6 +540,8 @@ def jax_scoring_fn_batch(
     shard_size = g_padded.shape[0] // n_devices
     g_sharded = g_padded.reshape((n_devices, shard_size, -1))
 
+    # pmap needs to handle pytree return (tuple of arrays/dicts)
+    # _score_batch_shard returns (fit, desc, extras)
     pmapped_fn = jax.pmap(
         _score_batch_shard,
         in_axes=(0, None, None, None, None, None, None),
@@ -474,7 +553,7 @@ def jax_scoring_fn_batch(
     else:
         config_hashable = genotype_config
 
-    fitnesses_sharded, descriptors_sharded = pmapped_fn(
+    fitnesses_sharded, descriptors_sharded, extras_sharded = pmapped_fn(
         g_sharded,
         cutoff,
         operator,
@@ -484,11 +563,21 @@ def jax_scoring_fn_batch(
         pnr_max,
     )
 
+    # Reshape results
+    # fitnesses: (Devices, Shard, 4) -> (Batch, 4)
     fitnesses = fitnesses_sharded.reshape((-1, 4))
     descriptors = descriptors_sharded.reshape((-1, 3))
+
+    # Extras is a Dict of sharded arrays. Need to reshape each value.
+    # extras_sharded = {"gradients": (Dev, Shard, D), ...}
+    def reshape_extra(x):
+        return x.reshape((-1, *x.shape[2:]))
+
+    extras = jax.tree_util.tree_map(reshape_extra, extras_sharded)
 
     if padding > 0:
         fitnesses = fitnesses[:batch_size]
         descriptors = descriptors[:batch_size]
+        extras = jax.tree_util.tree_map(lambda x: x[:batch_size], extras)
 
-    return fitnesses, descriptors
+    return fitnesses, descriptors, extras

@@ -410,8 +410,9 @@ def _recurrence_2d(shape, B, gamma, dtype, prefactor):
         )
 
         # Masks
-        n0_pos = (n0 > 0).astype(dtype)
-        n0_ge_2 = (n0 >= 2).astype(dtype)
+        # Masks
+        n0_pos = jnp.array(n0 > 0, dtype=dtype)
+        n0_ge_2 = jnp.array(n0 >= 2, dtype=dtype)
 
         def body_n1(n1, h):
             # n1 loop interaction
@@ -421,8 +422,8 @@ def _recurrence_2d(shape, B, gamma, dtype, prefactor):
             )
             sqrt_n1_div_n0 = jnp.sqrt(n1) * inv_sqrt_n0
 
-            n1_pos = (n1 > 0).astype(dtype)
-            n1_ge_2 = (n1 >= 2).astype(dtype)
+            n1_pos = jnp.array(n1 > 0, dtype=dtype)
+            n1_ge_2 = jnp.array(n1 >= 2, dtype=dtype)
 
             # Case i=0 (n0 > 0)
             # T1: gamma0 * A[n0-1, n1] / sqrt(n0)
@@ -486,8 +487,8 @@ def _recurrence_3d(shape, B, gamma, dtype, prefactor):
         sqrt_n0_minus_1_div_n0 = jnp.sqrt(
             (jnp.maximum(n0 - 1, 0.0)) * inv_sqrt_n0 * inv_sqrt_n0
         )
-        n0_pos = (n0 > 0).astype(dtype)
-        n0_ge_2 = (n0 >= 2).astype(dtype)
+        n0_pos = jnp.array(n0 > 0, dtype=dtype)
+        n0_ge_2 = jnp.array(n0 >= 2, dtype=dtype)
 
         def body_n1(n1, h1):
             # n1 precalcs
@@ -498,8 +499,8 @@ def _recurrence_3d(shape, B, gamma, dtype, prefactor):
             # Cross terms
             sqrt_n1_div_n0 = jnp.sqrt(n1) * inv_sqrt_n0
 
-            n1_pos = (n1 > 0).astype(dtype)
-            n1_ge_2 = (n1 >= 2).astype(dtype)
+            n1_pos = jnp.array(n1 > 0, dtype=dtype)
+            n1_ge_2 = jnp.array(n1 >= 2, dtype=dtype)
 
             # Logic: If n0 > 0, we use index i=0. Else if n1 > 0, use i=1.
 
@@ -513,8 +514,8 @@ def _recurrence_3d(shape, B, gamma, dtype, prefactor):
                 sqrt_n2_div_n0 = jnp.sqrt(n2) * inv_sqrt_n0
                 sqrt_n2_div_n1 = jnp.sqrt(n2) * inv_sqrt_n1
 
-                n2_pos = (n2 > 0).astype(dtype)
-                n2_ge_2 = (n2 >= 2).astype(dtype)
+                n2_pos = jnp.array(n2 > 0, dtype=dtype)
+                n2_ge_2 = jnp.array(n2 >= 2, dtype=dtype)
 
                 # --- VAL 0 (i=0) ---
                 # gamma0 * A[n0-1, n1, n2] / sqrt(n0)

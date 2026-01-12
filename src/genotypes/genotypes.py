@@ -72,10 +72,13 @@ class BaseGenotype(ABC):
         len_disp = 2 * n_modes
         disp_raw = flat_params[idx : idx + len_disp]
         idx += len_disp
+        target_dtype = (
+            jnp.complex64 if flat_params.dtype == jnp.float32 else jnp.complex128
+        )
         disp = (
             jnp.tanh(disp_raw[0::2]) * self.d_scale
             + 1j * jnp.tanh(disp_raw[1::2]) * self.d_scale
-        )
+        ).astype(target_dtype)
         return {"r": r, "phases": phases, "disp": disp}
 
 
@@ -129,10 +132,11 @@ class DesignAGenotype(BaseGenotype):
 
         d_start = ph_start + ph_len
         d_slice = gg_slice[:, d_start:]
+        target_dtype = jnp.complex64 if g.dtype == jnp.float32 else jnp.complex128
         disp = (
             jnp.tanh(d_slice[:, 0::2]) * self.d_scale
             + 1j * jnp.tanh(d_slice[:, 1::2]) * self.d_scale
-        )
+        ).astype(target_dtype)
 
         leaf_params = {
             "n_ctrl": leaf_n_ctrl,
@@ -157,7 +161,7 @@ class DesignAGenotype(BaseGenotype):
         disp_final = (
             jnp.tanh(final_raw[3]) * self.d_scale
             + 1j * jnp.tanh(final_raw[4]) * self.d_scale
-        )
+        ).astype(target_dtype)
 
         return {
             "homodyne_x": hom_x,
@@ -190,11 +194,45 @@ class Design0Genotype(DesignAGenotype):
         idx += self.nodes
         hom_x = jnp.tanh(hom_x_raw) * self.hx_scale
 
-        base_res = super().decode(g[idx:], cutoff)
+        # Prepend dummy Global Homodyne for parent (DesignA)
+        # Parent expects 1 global hom param at start.
+        g_parent = jnp.concatenate([jnp.zeros(1), g[idx:]])
+        base_res = super().decode(g_parent, cutoff)
 
         # Override hom_x
         base_res["homodyne_x"] = hom_x
         return base_res
+
+
+class Design00BGenotype(Design0Genotype):
+    """Design 00B: Design 0 + Balanced Mixing."""
+
+    def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
+        super().__init__(depth, config)
+        self.PN = 3
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        # Check for legacy length (PN=0)
+        input_len = g.shape[-1]
+        # Calculate approximate length for PN=0 vs PN=3
+        # PN=3 diff is (Nodes * 3)
+        # We can just check if smaller than expected.
+        expected = self.get_length(self.depth)
+
+        # Dynamic handling
+        orig_pn = self.PN
+        if input_len < expected:
+            self.PN = 0
+
+        try:
+            res = super().decode(g, cutoff)
+        finally:
+            self.PN = orig_pn
+
+        mix_params = jnp.zeros((self.nodes, 3))
+        mix_params = mix_params.at[:, 0].set(jnp.pi / 4)
+        res["mix_params"] = mix_params
+        return res
 
 
 # --- Design B Variants (Tied-Leaf / Semi-Tied) ---
@@ -260,10 +298,11 @@ class DesignB1Genotype(BaseGenotype):
         r_final = jnp.tanh(final_raw[0]) * self.r_scale
         phi_final = jnp.tanh(final_raw[1]) * (jnp.pi / 2)
         varphi_final = jnp.tanh(final_raw[2]) * (jnp.pi / 2)
+        target_dtype = jnp.complex64 if g.dtype == jnp.float32 else jnp.complex128
         disp_final = (
             jnp.tanh(final_raw[3]) * self.d_scale
             + 1j * jnp.tanh(final_raw[4]) * self.d_scale
-        )
+        ).astype(target_dtype)
 
         return {
             "homodyne_x": hom_x,
@@ -357,10 +396,11 @@ class DesignB3Genotype(BaseGenotype):
         r_final = jnp.tanh(final_raw[0]) * self.r_scale
         phi_final = jnp.tanh(final_raw[1]) * (jnp.pi / 2)
         varphi_final = jnp.tanh(final_raw[2]) * (jnp.pi / 2)
+        target_dtype = jnp.complex64 if g.dtype == jnp.float32 else jnp.complex128
         disp_final = (
             jnp.tanh(final_raw[3]) * self.d_scale
             + 1j * jnp.tanh(final_raw[4]) * self.d_scale
-        )
+        ).astype(target_dtype)
 
         return {
             "homodyne_x": hom_x,
@@ -391,7 +431,10 @@ class DesignB30Genotype(DesignB3Genotype):
         idx += self.nodes
         hom_x = jnp.tanh(hom_x_raw) * self.hx_scale
 
-        base_res = super().decode(g[idx:], cutoff)
+        # Prepend dummy Global Homodyne for parent (DesignB3)
+        g_parent = jnp.concatenate([jnp.zeros(1), g[idx:]])
+        base_res = super().decode(g_parent, cutoff)
+
         base_res["homodyne_x"] = hom_x
         return base_res
 
@@ -401,10 +444,21 @@ class DesignB3BGenotype(DesignB3Genotype):
 
     def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
         super().__init__(depth, config)
-        self.PN = 0  # No mix params
+        self.PN = 3
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        res = super().decode(g, cutoff)
+        # Legacy check
+        input_len = g.shape[-1]
+        expected = self.get_length(self.depth)
+        orig_pn = self.PN
+        if input_len < expected:
+            self.PN = 0
+
+        try:
+            res = super().decode(g, cutoff)
+        finally:
+            self.PN = orig_pn
+
         # Override random/zero mix angles with Balanced
         # Balanced: Theta=pi/4, Phi=0, Varphi=0
         nodes = self.nodes
@@ -419,12 +473,23 @@ class DesignB30BGenotype(DesignB30Genotype):
 
     def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
         super().__init__(depth, config)
-        self.PN = 0
+        self.PN = 3
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        res = super().decode(g, cutoff)
+        input_len = g.shape[-1]
+        expected = self.get_length(self.depth)
+        orig_pn = self.PN
+        if input_len < expected:
+            self.PN = 0
+
+        try:
+            res = super().decode(g, cutoff)
+        finally:
+            self.PN = orig_pn
+
         nodes = self.nodes
         mix_params = jnp.zeros((nodes, 3))
+        # Ensure we restore balanced logic (removed testing comment)
         mix_params = mix_params.at[:, 0].set(jnp.pi / 4)
         res["mix_params"] = mix_params
         return res
@@ -479,10 +544,17 @@ class DesignC1Genotype(BaseGenotype):
         leaf_active = jnp.ones(L, dtype=bool)
 
         # Shared Mix
-        mix_raw = g[idx : idx + self.PN]
-        idx += self.PN
-        mix_single = jnp.tanh(mix_raw) * (jnp.pi / 2)
-        mix_angles = jnp.broadcast_to(mix_single, (self.nodes, 3))
+        if self.PN > 0:
+            mix_raw = g[idx : idx + self.PN]
+            idx += self.PN
+            mix_single = jnp.tanh(mix_raw) * (jnp.pi / 2)
+            mix_angles = jnp.broadcast_to(mix_single, (self.nodes, 3))
+        else:
+            # If PN=0, we can't read mix params.
+            # Subclasses (C2B, C20B) will override this.
+            # Return dummy.
+            mix_angles = jnp.zeros((self.nodes, 3))
+
         mix_source = jnp.zeros(self.nodes, dtype=jnp.int32)
 
         final_raw = g[idx : idx + self.F]
@@ -529,10 +601,20 @@ class DesignC2BGenotype(DesignC2Genotype):
 
     def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
         super().__init__(depth, config)
-        self.PN = 0  # No mix params
+        self.PN = 3
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        res = super().decode(g, cutoff)
+        input_len = g.shape[-1]
+        expected = self.get_length(self.depth)
+        orig_pn = self.PN
+        if input_len < expected:
+            self.PN = 0
+
+        try:
+            res = super().decode(g, cutoff)
+        finally:
+            self.PN = orig_pn
+
         mix_params = jnp.zeros((self.nodes, 3))
         mix_params = mix_params.at[:, 0].set(jnp.pi / 4)
         res["mix_params"] = mix_params
@@ -551,7 +633,10 @@ class DesignC20Genotype(DesignC2Genotype):
         idx += self.nodes
         hom_x = jnp.tanh(hom_x_raw) * self.hx_scale
 
-        base_res = super().decode(g[idx:], cutoff)
+        # Prepend dummy Global Homodyne for parent (DesignC2 -> C1)
+        g_parent = jnp.concatenate([jnp.zeros(1), g[idx:]])
+        base_res = super().decode(g_parent, cutoff)
+
         base_res["homodyne_x"] = hom_x
         return base_res
 
@@ -561,10 +646,20 @@ class DesignC20BGenotype(DesignC20Genotype):
 
     def __init__(self, depth: int = 3, config: Dict[str, Any] = None):
         super().__init__(depth, config)
-        self.PN = 0
+        self.PN = 3
 
     def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
-        res = super().decode(g, cutoff)
+        input_len = g.shape[-1]
+        expected = self.get_length(self.depth)
+        orig_pn = self.PN
+        if input_len < expected:
+            self.PN = 0
+
+        try:
+            res = super().decode(g, cutoff)
+        finally:
+            self.PN = orig_pn
+
         mix_params = jnp.zeros((self.nodes, 3))
         mix_params = mix_params.at[:, 0].set(jnp.pi / 4)
         res["mix_params"] = mix_params
@@ -577,6 +672,7 @@ def get_genotype_decoder(
     decoders = {
         "A": DesignAGenotype,
         "0": Design0Genotype,
+        "00B": Design00BGenotype,
         "B1": DesignB1Genotype,
         "B2": DesignB2Genotype,
         "B3": DesignB3Genotype,
