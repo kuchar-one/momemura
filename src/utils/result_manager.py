@@ -17,6 +17,15 @@ except ImportError:
     jnp = None
 
 
+class SimpleRepertoire:
+    """Simple container for random search results."""
+
+    def __init__(self, genotypes, fitnesses, descriptors):
+        self.genotypes = genotypes
+        self.fitnesses = fitnesses
+        self.descriptors = descriptors
+
+
 class OptimizationResult:
     """
     Manages the results of a MOME optimization run.
@@ -425,10 +434,37 @@ class AggregatedOptimizationResult(OptimizationResult):
         # Concatenate Genotypes
         # Each item in all_genotypes is (N_valid, D)
         # We assume consistent D across runs (checked via config usually)
-        if jnp is not None:
-            self._cached_valid_genotypes = jnp.concatenate(all_genotypes, axis=0)
+        # Pad heterogeneous genotypes if necessary
+        if all_genotypes:
+            max_d = max(g.shape[1] for g in all_genotypes)
+            padded_genotypes = []
+            for g in all_genotypes:
+                n, d = g.shape
+                if d < max_d:
+                    padding = ((0, 0), (0, max_d - d))
+                    if jnp is not None and isinstance(g, jnp.ndarray):
+                        g_pad = jnp.pad(g, padding, mode="constant")
+                    else:
+                        g_pad = np.pad(g, padding, mode="constant")
+                    padded_genotypes.append(g_pad)
+                else:
+                    padded_genotypes.append(g)
+
+            # Concatenate
+            if jnp is not None:
+                # Convert all to JAX if needed
+                padded_genotypes = [
+                    jnp.array(g) if not isinstance(g, jnp.ndarray) else g
+                    for g in padded_genotypes
+                ]
+                self._cached_valid_genotypes = jnp.concatenate(padded_genotypes, axis=0)
+            else:
+                self._cached_valid_genotypes = np.concatenate(padded_genotypes, axis=0)
         else:
-            self._cached_valid_genotypes = np.concatenate(all_genotypes, axis=0)
+            if jnp is not None:
+                self._cached_valid_genotypes = jnp.array([])
+            else:
+                self._cached_valid_genotypes = np.array([])
 
         # Post-Processing: Compute Global Dominance
         # Objectives: Expectation (min), LogProb (min)

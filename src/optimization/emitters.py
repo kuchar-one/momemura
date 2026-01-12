@@ -225,3 +225,120 @@ class HybridEmitter(MixingEmitter):
         # State management: MixingEmitter is usually stateless (None).
         # We return one of them or None.
         return x_new, state_explore
+
+
+class MOMEOMGMEGAEmitter(MixingEmitter):
+    """
+    OMG-MEGA Emitter adapted for Multi-Objective MAP-Elites (MOME).
+
+    The standard OMGMEGAEmitter in QDax (qdax.core.emitters.omg_mega_emitter)
+    is designed for single-objective MAP-Elites and maintains a parallel
+    gradients repertoire, which is incompatible with MOME's Pareto-based repertoire.
+
+    This class adapts the core "Multi-objective Gradient-based Evolution" logic
+    to work natively with the MOME structure.
+
+    Logic:
+        g_new = g_old + sum(c_i * grad_i)
+        where c_i ~ N(0, sigma_g^2)
+        and c_0 (fitness) is forced positive.
+
+    Since our descriptors (Active Modes, PNR) are typically non-differentiable,
+    we currently use only the Fitness Gradient (Gradient of Expectation), effectively
+    performing Stochastic Gradient Descent with random step sizes.
+    """
+
+    def __init__(
+        self,
+        mutation_fn,
+        variation_fn,
+        variation_percentage=0.0,
+        batch_size=32,
+        sigma_g=0.5,  # Standard deviation for coefficients
+        num_descriptors=0,
+        normalize_gradients=True,
+    ):
+        super().__init__(
+            mutation_fn=mutation_fn,
+            variation_fn=variation_fn,
+            variation_percentage=variation_percentage,
+            batch_size=batch_size,
+        )
+        self._sigma_g = sigma_g
+        self._num_descriptors = num_descriptors
+        self._normalize_gradients = normalize_gradients
+
+    def emit(self, repertoire, emitter_state, random_key):
+        """
+        Emit new population using Multi-Objective Gradient logic.
+        """
+        # 1. Flatten Repertoire
+        flat_genotypes = repertoire.genotypes.reshape(
+            -1, repertoire.genotypes.shape[-1]
+        )
+
+        if (
+            not hasattr(repertoire, "extra_scores")
+            or "gradients" not in repertoire.extra_scores
+        ):
+            # Fallback
+            pass
+
+        # Valid mask
+        flat_fitnesses = repertoire.fitnesses.reshape(
+            -1, repertoire.fitnesses.shape[-1]
+        )
+        valid_mask = flat_fitnesses[:, 0] > -jnp.inf
+        valid_indices = jnp.where(valid_mask)[0]
+
+        if valid_indices.shape[0] == 0:
+            return jnp.zeros((0, flat_genotypes.shape[1])), emitter_state
+
+        # 2. Select Parents
+        key_select, key_coeffs = jax.random.split(random_key)
+        parent_indices = jax.random.choice(
+            key_select, valid_indices, shape=(self._batch_size,)
+        )
+        parents = flat_genotypes[parent_indices]
+
+        # 3. Get Gradients
+        if (
+            hasattr(repertoire, "extra_scores")
+            and "gradients" in repertoire.extra_scores
+        ):
+            flat_grads = repertoire.extra_scores["gradients"].reshape(
+                -1, repertoire.extra_scores["gradients"].shape[-1]
+            )
+            # Gradient of Expectation (Minimization) -> Gradient of Fitness (Maximization) = -Grad(Exp)
+            grad_exp = flat_grads[parent_indices]
+            grad_fitness = -grad_exp
+
+            # Normalize
+            if self._normalize_gradients:
+                gnorm = jnp.linalg.norm(grad_fitness, axis=-1, keepdims=True)
+                grad_fitness = jnp.where(
+                    gnorm > 1e-9, grad_fitness / gnorm, jnp.zeros_like(grad_fitness)
+                )
+
+            # 4. Sample Coefficients (OMG-MEGA style)
+            # c ~ N(0, sigma_g^2)
+            # shape: (Batch, 1 + NumDescriptors)
+            # Currently NumDescriptors=0 for gradients implies we only have fitness gradient.
+            # But we still sample coefficients for "magnitude".
+            coeffs = (
+                jax.random.normal(key_coeffs, shape=(self._batch_size, 1))
+                * self._sigma_g
+            )
+
+            # Force ascent on fitness (c_0 > 0)
+            coeffs = jnp.abs(coeffs)
+
+            # 5. Compute Update
+            # update = sum(c_i * g_i) -> here just c_0 * g_fitness
+            update = coeffs * grad_fitness
+
+            g_new = parents + update
+        else:
+            g_new = parents
+
+        return g_new, emitter_state
