@@ -11,3 +11,4 @@ profiles/
 *.png
 .DS_Store
 output_backup_*
+*experiments/

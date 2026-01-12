@@ -8,7 +8,7 @@ import fcntl
 import select
 
 # Logic Configuration
-STAGNATION_LIMIT = 1000  # Iterations without improvement to trigger restart
+STAGNATION_LIMIT = 500  # Iterations without improvement to trigger restart
 POLL_INTERVAL = 1.0  # Seconds
 CONSECUTIVE_NO_GAINS_LIMIT = 2  # Threshold to switch to Long Run
 
@@ -54,7 +54,7 @@ def run_optimization(args, run_type="SHORT", global_best=float("inf")):
             ret = proc.poll()
             if ret is not None:
                 print(f"\n[Watchdog] Process finished with code {ret}.")
-                return current_best, True  # Finished naturally
+                return current_best, ret  # Return exit code
 
             # Read Output
             reads = [proc.stdout.fileno()]
@@ -119,12 +119,13 @@ def run_optimization(args, run_type="SHORT", global_best=float("inf")):
                     )
                     print("[Watchdog] Stopping process to restart...")
 
-                    # Graceful Stop (SIGINT) to allow saving
-                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                    # Graceful Stop (SIGTERM) to allow saving
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
 
                     # Wait for exit
                     try:
-                        proc.wait(timeout=30)  # Give 30s to save
+                        # Increase timeout to ensure saving completes (plotting can be slow)
+                        proc.wait(timeout=600)
                     except subprocess.TimeoutExpired:
                         print("[Watchdog] Save timed out. Forcing kill.")
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -137,12 +138,20 @@ def run_optimization(args, run_type="SHORT", global_best=float("inf")):
         sys.exit(0)
 
 
+def signal_handler_sigterm(signum, frame):
+    """Handles SIGTERM by raising KeyboardInterrupt to trigger graceful shutdown logic."""
+    raise KeyboardInterrupt
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python watchdog_restart.py [run_mome.py arguments...]")
         sys.exit(1)
 
     mome_args = sys.argv[1:]
+
+    # Register SIGTERM Handler for Global Skip/Stop
+    signal.signal(signal.SIGTERM, signal_handler_sigterm)
 
     # Check for Global Seed Scan flag and strip it (we control when to pass it)
     use_global_scan = False

@@ -27,10 +27,10 @@ import matplotlib
 import pickle
 import shutil
 from pathlib import Path
-import signal
 
 # === Project imports ===
 from src.genotypes.genotypes import get_genotype_decoder
+from src.utils.result_manager import OptimizationResult, SimpleRepertoire
 
 from src.simulation.cpu.composer import Composer, SuperblockTopology
 from src.simulation.cpu.circuit import GaussianHeraldCircuit
@@ -45,7 +45,7 @@ LOW_MEM = "--low-mem" in sys.argv
 # Enable JAX x64 mode unless low-mem is requested
 # We use float32 by default for performance in all modes (User Policy),
 # so we explicitly disable x64.
-os.environ["JAX_ENABLE_X64"] = "False"
+os.environ["JAX_ENABLE_X64"] = "True"
 
 if LOW_MEM:
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -87,13 +87,7 @@ DEFAULT_CUTOFF = 6
 GLOBAL_CACHE = CacheManager(cache_dir="./cache", size_limit_bytes=1024 * 1024 * 512)
 
 
-class SimpleRepertoire:
-    """Simple container for random search results."""
-
-    def __init__(self, genotypes, fitnesses, descriptors):
-        self.genotypes = genotypes
-        self.fitnesses = fitnesses
-        self.descriptors = descriptors
+# moved to top
 
 
 # -------------------------
@@ -207,6 +201,7 @@ class HanamuraMOMEAdapter:
         self.genotype_name = genotype_name
         self.genotype_config = genotype_config or {}
         self.correction_cutoff = correction_cutoff
+        self.pnr_max = int(self.genotype_config.get("pnr_max", 3))
 
         # Instantiate decoder for local use
         self.decoder = get_genotype_decoder(genotype_name, config=self.genotype_config)
@@ -242,9 +237,11 @@ class HanamuraMOMEAdapter:
 
             # vmap to get all leaves
             leaf_vecs, leaf_probs, leaf_modes, leaf_max_pnrs, leaf_total_pnrs = (
-                jax.vmap(partial(jax_get_heralded_state, cutoff=self.cutoff))(
-                    leaf_params
-                )
+                jax.vmap(
+                    partial(
+                        jax_get_heralded_state, cutoff=self.cutoff, pnr_max=self.pnr_max
+                    )
+                )(leaf_params)
             )
 
             # Homodyne
@@ -261,13 +258,14 @@ class HanamuraMOMEAdapter:
 
             from src.simulation.jax.runner import jax_scoring_fn_batch
 
-            fitnesses, descriptors = jax_scoring_fn_batch(
+            fitnesses, descriptors, extras = jax_scoring_fn_batch(
                 g_batch,
                 self.cutoff,
                 op_batch,
                 genotype_name=self.genotype_name,
                 genotype_config=self.genotype_config,
                 correction_cutoff=self.correction_cutoff,
+                pnr_max=self.pnr_max,
             )
 
             # Extract metrics
@@ -317,13 +315,14 @@ class HanamuraMOMEAdapter:
             op_jax = jnp.array(self.operator)
 
             with jax.profiler.TraceAnnotation("jax_scoring_fn_batch"):
-                fitnesses_jax, descriptors_jax = jax_scoring_fn_batch(
+                fitnesses_jax, descriptors_jax, extras_jax = jax_scoring_fn_batch(
                     g_jax,
                     self.cutoff,
                     op_jax,
                     self.genotype_name,
                     self.genotype_config,
                     self.correction_cutoff,
+                    pnr_max=self.pnr_max,
                 )
                 fitnesses_jax.block_until_ready()
                 descriptors_jax.block_until_ready()
@@ -539,15 +538,18 @@ def plot_mome_results(repertoire, metrics, filename="mome_results.png"):
             ):
                 heatmap_data[d_complex, d_total] = val
 
-    sns.heatmap(
-        heatmap_data,
-        ax=ax,
-        cmap="viridis_r",
-        annot=False,  # Disable annotations to avoid massive text rendering overhead
-        fmt=".2f",
-        xticklabels=x_bins[:-1],
-        yticklabels=y_bins[:-1],
-    )
+    if np.all(np.isnan(heatmap_data)):
+        ax.text(0.5, 0.5, "No Data (All Cells empty)", ha="center", va="center")
+    else:
+        sns.heatmap(
+            heatmap_data,
+            ax=ax,
+            cmap="viridis_r",
+            annot=False,  # Disable annotations to avoid massive text rendering overhead
+            fmt=".2f",
+            xticklabels=x_bins[:-1],
+            yticklabels=y_bins[:-1],
+        )
     ax.set_xlabel("Total Photons")
     ax.set_ylabel("Complexity")
     ax.set_title("Best Expectation Value per Cell")
@@ -601,6 +603,15 @@ def run(
     global_seed_scan: bool = False,
 ) -> Any:
     """Main runner supporting both QDax MOME and random search baseline."""
+
+    # Register SIGTERM handler to support Watchdog gracefull kill
+    import signal
+
+    def handle_sigterm(signum, frame):
+        raise KeyboardInterrupt("Received SIGTERM")
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
     np.random.seed(seed)
 
     # Resume Check
@@ -653,7 +664,11 @@ def run(
                 polynomial_crossover,
             )
             from qdax.core.emitters.standard_emitters import MixingEmitter
-            from src.optimization.emitters import BiasedMixingEmitter, HybridEmitter
+            from src.optimization.emitters import (
+                BiasedMixingEmitter,
+                HybridEmitter,
+                MOMEOMGMEGAEmitter,
+            )
 
             # import jax # Already imported globally
             # import jax.numpy as jnp # Already imported globally
@@ -697,6 +712,153 @@ def run(
         output_dir = os.path.join(base_exp_dir, f"{timestamp}_{params_str}")
         os.makedirs(output_dir, exist_ok=True)
         print(f"Created output directory: {output_dir}")
+
+    # --- SHARED INITIALIZATION (JAX-based modes: qdax, single) ---
+    if mode in ["qdax", "single"]:
+        if jax is None:
+            print(f"JAX not found, cannot run {mode} mode.")
+            return
+
+        key = jax.random.PRNGKey(seed)
+        key, subkey = jax.random.split(key)
+
+        # Initialization Range
+        is_dynamic = genotype_config and genotype_config.get("dynamic_limits", False)
+        init_range = 0.5 if is_dynamic else 2.0
+
+        genotypes = jax.random.uniform(
+            subkey,
+            (pop_size, D),
+            minval=-init_range,
+            maxval=init_range,
+            dtype=jnp.float32,
+        )
+
+        # Seeding Strategy (Shared)
+        from src.genotypes.converter import create_vacuum_genotype, upgrade_genotype
+        from src.utils.result_scanner import scan_results_for_seeds
+
+        print("Applying Seeding Strategy...")
+        if "modes" not in genotype_config:
+            genotype_config["modes"] = 2
+
+        # 1. Vacuum Seed
+        vacuum = create_vacuum_genotype(
+            genotype, depth=depth_val, config=genotype_config
+        )
+        if len(vacuum) == D:
+            genotypes = genotypes.at[0].set(vacuum)
+            print("  - Injected Vacuum State at index 0")
+
+        # 2. Result Scanning
+        if seed_scan:
+            if global_seed_scan:
+                seed_source_dir = os.path.join(output_root, "experiments")
+                print(
+                    f"  - GLOBAL SCAN enabled. Scanning matches in: {seed_source_dir}"
+                )
+            else:
+                seed_source_dir = os.path.join(output_root, "experiments", group_id)
+                print(f"  - Scanning seeds in group: {seed_source_dir}")
+
+            seeds = scan_results_for_seeds(
+                seed_source_dir,
+                top_k=pop_size,
+                metric="pareto",
+                target_genotype=genotype,
+            )
+
+            idx = 1
+            injected_count = 0
+            for g_src, name_src, score in seeds:
+                if idx >= pop_size:
+                    break
+                try:
+                    g_new = upgrade_genotype(
+                        g_src,
+                        name_src,
+                        genotype,
+                        depth=depth_val,
+                        config=genotype_config,
+                    )
+                    if len(g_new) == D:
+                        genotypes = genotypes.at[idx].set(g_new)
+                        idx += 1
+                        injected_count += 1
+                except Exception:
+                    pass
+
+            if injected_count > 0:
+                print(f"  - Injected {injected_count} seeds.")
+            else:
+                pass
+
+        # --- GRID DEFINITION (Shared for QDax and Result Saving) ---
+        # D1: Active Modes (Complexity): 0..2^depth (Inclusive, so +1 bin)
+        max_active = 2**depth_val
+        n_bins_d1 = max_active + 1
+        d1 = jnp.linspace(0, max_active, n_bins_d1)
+
+        # D2: Max PNR
+        # Coarse Gridding for high PNR
+        pnr_max_val = 3
+        if genotype_config and "pnr_max" in genotype_config:
+            pnr_max_val = int(genotype_config["pnr_max"])
+
+        # Target ~5 bins for PNR dimension (Coarse: Low/Med/High/Peak)
+        n_bins_d2 = min(pnr_max_val + 1, 5)
+        d2 = jnp.linspace(0, pnr_max_val, n_bins_d2)
+
+        # D3: Total Photons
+        # Coarse Gridding for high photon counts
+        # Max theoretical photons = max_active * pnr_max_val * n_control
+        # Each leaf has n_control detectors, each detecting up to pnr_max photons
+        n_modes_val = 2  # Default
+        if genotype_config and "modes" in genotype_config:
+            n_modes_val = int(genotype_config["modes"])
+        n_control = max(1, n_modes_val - 1)
+        max_photons = max_active * pnr_max_val * n_control
+
+        # Target ~10 bins for Total dimension (Coarse buckets)
+        n_bins_d3 = min(max_photons + 1, 10)
+        d3 = jnp.linspace(0, max_photons, n_bins_d3)
+
+        print(
+            f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), D3(0-{max_photons})"
+        )
+        grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
+        centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
+
+        # Count achievable bins for accurate coverage calculation
+        # Constraints: total_photons in [max_pnr, active * n_control * pnr_max]
+        n_achievable_bins = 0
+        d3_width = float(d3[1] - d3[0]) if len(d3) > 1 else 1.0
+        for active_val in np.array(d1):
+            active_int = int(round(active_val))
+            for max_pnr_bin_val in np.array(d2):
+                for total_val in np.array(d3):
+                    if active_int == 0:
+                        # Only (0, ~0, ~0) is valid
+                        if max_pnr_bin_val < d3_width and total_val < d3_width:
+                            n_achievable_bins += 1
+                    else:
+                        min_total = max_pnr_bin_val
+                        max_total = active_int * n_control * pnr_max_val
+                        # Check if bin center is in valid range (with half-bin tolerance)
+                        if (
+                            total_val >= min_total - d3_width / 2
+                            and total_val <= max_total + d3_width / 2
+                        ):
+                            n_achievable_bins += 1
+
+        print(f"Generated {centroids.shape[0]} centroids.")
+        print(
+            f"Achievable bins: {n_achievable_bins}/{centroids.shape[0]} ({100 * n_achievable_bins / centroids.shape[0]:.1f}%)"
+        )
+
+        # Store for metrics (closure will capture this)
+        _n_achievable = n_achievable_bins
+        total_centroids = centroids.shape[0]
 
     if mode == "random":
         # Random search baseline
@@ -802,7 +964,7 @@ def run(
                 # Extract pnr_max from config (ensure int)
                 pnr_max_val = int(genotype_config.get("pnr_max", 3))
 
-                fitnesses, descriptors = jax_scoring_fn_batch(
+                fitnesses, descriptors, extras = jax_scoring_fn_batch(
                     genotypes,
                     cutoff,
                     op_jax,
@@ -812,34 +974,10 @@ def run(
                     pnr_max=pnr_max_val,
                 )
 
-            # QDax expects extra scores (gradients/etc) but we don't have them.
-            # We return empty dict for extras.
-            return fitnesses, descriptors, {}
+            # QDax expects extra scores (gradients/etc).
+            return fitnesses, descriptors, extras
 
         metrics_function = custom_metrics
-
-        # Initialize RNG
-        if jax is None:
-            print("JAX not found, cannot run QDax mode.")
-            return
-        key = jax.random.PRNGKey(seed)
-
-        # Create initial population
-        key, subkey = jax.random.split(key)
-
-        # Initialization Range
-        # Wider range = more initial diversity (important for coverage)
-        # Dynamic limits can handle wider values now with adaptive scaling
-        is_dynamic = genotype_config and genotype_config.get("dynamic_limits", False)
-        init_range = 0.5 if is_dynamic else 2.0
-
-        genotypes = jax.random.uniform(
-            subkey,
-            (pop_size, D),
-            minval=-init_range,
-            maxval=init_range,
-            dtype=jnp.float32,
-        )
 
         # Emitter setup
         crossover_function = partial(polynomial_crossover, proportion_var_to_change=0.5)
@@ -851,143 +989,8 @@ def run(
             proportion_to_mutate=0.3,  # Mutate 30% of genes (was 0.9)
         )
 
-        # --- SEEDING STRATEGY ---
-        # 1. Vacuum Seed (Identity) -> Index 0
-        from src.genotypes.converter import create_vacuum_genotype, upgrade_genotype
-        from src.utils.result_scanner import scan_results_for_seeds
-
-        print("Applying Seeding Strategy...")
-        if "modes" not in genotype_config:
-            genotype_config["modes"] = 2
-
-        # Inject Vacuum
-        vacuum = create_vacuum_genotype(
-            genotype, depth=depth_val, config=genotype_config
-        )
-        # Verify length
-        if len(vacuum) == D:
-            genotypes = genotypes.at[0].set(vacuum)
-            print("  - Injected Vacuum State at index 0")
-        else:
-            print(f"Warning: Vacuum len {len(vacuum)} != D {D}. Skipping vacuum.")
-
-        # 2. Result Scanning
-        if seed_scan:
-            # Determine source directory
-            if global_seed_scan:
-                # Scan all experiments under the output root
-                seed_source_dir = os.path.join(output_root, "experiments")
-                print(
-                    f"  - GLOBAL SCAN enabled. Scanning matches in: {seed_source_dir}"
-                )
-            else:
-                # Seed from the specific group folder to ensure relevance
-                seed_source_dir = os.path.join(output_root, "experiments", group_id)
-                print(f"  - Scanning seeds in group: {seed_source_dir}")
-
-            # Filter by matching genotype to ensure relevance
-            seeds = scan_results_for_seeds(
-                seed_source_dir,
-                top_k=50,
-                metric="expectation",
-                target_genotype=genotype,
-            )
-
-            injected_count = 0
-            # Start injecting at index 1
-            idx = 1
-            for g_src, name_src, score in seeds:
-                if idx >= pop_size:
-                    break
-
-                try:
-                    # Upgrade to current genotype
-                    g_new = upgrade_genotype(
-                        g_src,
-                        name_src,
-                        genotype,
-                        depth=depth_val,
-                        config=genotype_config,
-                    )
-                    if len(g_new) == D:
-                        genotypes = genotypes.at[idx].set(g_new)
-                        idx += 1
-                        injected_count += 1
-                except Exception:
-                    # Conversion failed (e.g. Legacy)
-                    # print(f"Skipping seed from {name_src}: {e}")
-                    pass
-
-            if injected_count > 0:
-                print(f"  - Injected {injected_count} seeds from previous runs.")
-            else:
-                print("  - No valid seeds found or converted.")
-
-        # Grid-based Centroids
-        # D1: Active Modes (Complexity): 0..2^depth (Inclusive, so +1 bin)
-        max_active = 2**depth_val
-        n_bins_d1 = max_active + 1
-        d1 = jnp.linspace(0, max_active, n_bins_d1)
-
-        # D2: Max PNR
-        # Coarse Gridding for high PNR
-        pnr_max_val = 3
-        if genotype_config and "pnr_max" in genotype_config:
-            pnr_max_val = int(genotype_config["pnr_max"])
-
-        # Target ~5 bins for PNR dimension (Coarse: Low/Med/High/Peak)
-        n_bins_d2 = min(pnr_max_val + 1, 5)
-        d2 = jnp.linspace(0, pnr_max_val, n_bins_d2)
-
-        # D3: Total Photons
-        # Coarse Gridding for high photon counts
-        # Max theoretical photons = max_active * pnr_max_val * n_control
-        # Each leaf has n_control detectors, each detecting up to pnr_max photons
-        n_modes_val = 2  # Default
-        if genotype_config and "modes" in genotype_config:
-            n_modes_val = int(genotype_config["modes"])
-        n_control = max(1, n_modes_val - 1)
-        max_photons = max_active * pnr_max_val * n_control
-
-        # Target ~10 bins for Total dimension (Coarse buckets)
-        n_bins_d3 = min(max_photons + 1, 10)
-        d3 = jnp.linspace(0, max_photons, n_bins_d3)
-
-        print(
-            f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), D3(0-{max_photons})"
-        )
-        grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
-        centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
-
-        # Count achievable bins for accurate coverage calculation
-        # Constraints: total_photons in [max_pnr, active * n_control * pnr_max]
-        n_achievable_bins = 0
-        d3_width = float(d3[1] - d3[0]) if len(d3) > 1 else 1.0
-        for active_val in np.array(d1):
-            active_int = int(round(active_val))
-            for max_pnr_bin_val in np.array(d2):
-                for total_val in np.array(d3):
-                    if active_int == 0:
-                        # Only (0, ~0, ~0) is valid
-                        if max_pnr_bin_val < d3_width and total_val < d3_width:
-                            n_achievable_bins += 1
-                    else:
-                        min_total = max_pnr_bin_val
-                        max_total = active_int * n_control * pnr_max_val
-                        # Check if bin center is in valid range (with half-bin tolerance)
-                        if (
-                            total_val >= min_total - d3_width / 2
-                            and total_val <= max_total + d3_width / 2
-                        ):
-                            n_achievable_bins += 1
-
-        print(f"Generated {centroids.shape[0]} centroids.")
-        print(
-            f"Achievable bins: {n_achievable_bins}/{centroids.shape[0]} ({100 * n_achievable_bins / centroids.shape[0]:.1f}%)"
-        )
-
-        # Store for metrics (closure will capture this)
-        _n_achievable = n_achievable_bins
+        # Grid-based Centroids MOVED TO SHARED INITIALIZATION
+        # (Lines 919-985 migrated to lines 790+)
 
         # --- EMITTER SETUP (Moved here to access n_achievable_bins) ---
         # Adjust batch size for low memory
@@ -1051,6 +1054,103 @@ def run(
                 intensification_ratio=hybrid_ratio,
                 batch_size=emitter_batch_size,
             )
+
+        elif emitter_type == "gradient":
+            print("  - Strategy: Gradient Propagation (OMG-MEGA style)")
+            # MOME-compatible OMG-MEGA Emitter
+            mixing_emitter = MOMEOMGMEGAEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.0,
+                batch_size=emitter_batch_size,
+                sigma_g=0.5,
+            )
+
+        elif emitter_type == "hybrid-gradient":
+            print("  - Strategy: Hybrid Gradient (Standard + OMG-MEGA)")
+            # 1. Exploration (Standard)
+            exploration_emitter = MixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,
+            )
+
+            # 2. Intensification (Gradient)
+            intensification_emitter = MOMEOMGMEGAEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.0,
+                batch_size=emitter_batch_size,
+                sigma_g=0.5,
+            )
+
+            # 3. Hybrid Wrapper
+            # This uses the GENERIC HybridEmitter class from emitters.py
+            # composed with the standard and gradient emitters.
+            mixing_emitter = HybridEmitter(
+                exploration_emitter=exploration_emitter,
+                intensification_emitter=intensification_emitter,
+                intensification_ratio=hybrid_ratio,
+                batch_size=emitter_batch_size,
+            )
+
+        elif emitter_type == "mega-hybrid":
+            print("  - Strategy: Mega Hybrid (Gradient + Biased + Standard)")
+            # Architecture:
+            # - Intensification Stream (20%): Gradient (OMG-MEGA)
+            # - Exploration Stream (80%): Hybrid (Biased + Standard)
+            #   - Intensification (50% of 80%): Biased
+            #   - Exploration (50% of 80%): Standard
+
+            # 1. Gradient Emitter (Top-Level Intensification)
+            grad_emitter = MOMEOMGMEGAEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.0,
+                batch_size=emitter_batch_size,  # Will be resized by parent
+                sigma_g=0.5,
+            )
+
+            # 2. Inner Hybrid (Biased + Standard)
+            # We need to pre-calculate its batch size to ensure internal split is correct
+            n_gradient = int(emitter_batch_size * hybrid_ratio)
+            n_inner = emitter_batch_size - n_gradient
+
+            # 2a. Standard
+            std_emitter = MixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=n_inner,  # Will be resized
+            )
+            # 2b. Biased
+            biased_emitter = BiasedMixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=n_inner,
+                temperature=emitter_temp,
+                total_bins=total_centroids,
+            )
+
+            # 2c. Inner Hybrid Construction
+            # 80% Standard (Exploration), 20% Biased (Intensification)
+            inner_hybrid = HybridEmitter(
+                exploration_emitter=std_emitter,
+                intensification_emitter=biased_emitter,
+                intensification_ratio=0.2,
+                batch_size=n_inner,
+            )
+
+            # 3. Outer Hybrid Wrapper
+            mixing_emitter = HybridEmitter(
+                exploration_emitter=inner_hybrid,
+                intensification_emitter=grad_emitter,
+                intensification_ratio=hybrid_ratio,
+                batch_size=emitter_batch_size,
+            )
+
         else:
             raise ValueError(f"Unknown emitter_type: {emitter_type}")
 
@@ -1374,8 +1474,227 @@ def run(
         # Convert JAX metrics to numpy for plotting
         final_metrics = {k: np.array(v) for k, v in all_metrics.items()}
 
+    elif mode == "single":
+        # --- Single Objective Optimization (Gradient Descent) ---
+        print("Starting Single Objective Optimization (Gradient Descent)...")
+        try:
+            import optax
+        except ImportError:
+            print("Error: optax is required for single-objective mode.")
+            return
+
+        if jax is None:
+            print("Error: JAX is required for single-objective mode.")
+            return
+
+        # Prepare Scoring Function (Gradients)
+        from src.simulation.jax.runner import jax_scoring_fn_batch
+
+        # Wrap scoring to return 'expectations' (fitness[0]) directly for gradient
+        # Actually our jax_scoring_fn_batch returns fitnesses = [exp, -logP, -comp, -photons]
+        # But we need gradients of the expectation value itself to minimize it.
+        # Wait, jax_scoring_fn_batch ALREADY returns 'gradients' in extras!
+        # extras["gradients"] = grad(loss_fn) where loss = penalized expectation.
+        # So we can just use the provided gradients directly.
+
+        # Optimizer Setup
+        # We use a multi-start gradient descent approach:
+        # 1. Start with 'pop_size' random candidates
+        # 2. Iterate optimization steps
+        # 3. Use the computed gradients to update
+
+        learning_rate = 0.01  # Reduced from 0.05 for stability
+        # Use Chain: Clip -> Adam
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0), optax.adam(learning_rate)
+        )
+        opt_state = optimizer.init(genotypes)
+
+        # Initialize Results Containers
+        history_best_exp = []
+        global_best_exp = float("inf")
+        global_best_log_prob = -float("inf")
+        global_best_genotype = None
+
+        print(f"Optimizer: Adam(lr={learning_rate})")
+        print(f"JAX Devices: {jax.devices()}")
+
+        # Optimization Loop
+        # We process in batches (population is the batch)
+
+        # We need a step function that takes (genotypes, opt_state) -> (new_genotypes, new_opt_state, metrics)
+        # But our scoring function is complex and returns gradients.
+        # We can implement a manual step using the gradients returned by scoring_fn.
+
+        @jax.jit
+        def update_step(genotypes, grads, opt_state):
+            # 1. NaN Guard: Replace NaN gradients with 0.0
+            grads = jax.tree_util.tree_map(
+                lambda x: jnp.where(jnp.isnan(x), 0.0, x), grads
+            )
+
+            # 2. Optimizer Update (includes clipping)
+            updates, new_opt_state = optimizer.update(grads, opt_state, genotypes)
+            new_genotypes = optax.apply_updates(genotypes, updates)
+
+            # 3. Parameter Clamping: Prevent unphysical energy blowup
+            new_genotypes = jnp.clip(new_genotypes, -5.0, 5.0)
+
+            return new_genotypes, new_opt_state
+
+        start_time = time.time()
+
+        all_genotypes_history = []
+        all_fitnesses_history = []
+        all_descriptors_history = []
+
+        try:
+            for i in range(n_iters):
+                # 1. Score & Get Gradients
+                fitnesses, descriptors, extras = jax_scoring_fn_batch(
+                    genotypes,
+                    cutoff,
+                    jnp.array(operator),
+                    genotype_name=genotype,
+                    genotype_config=genotype_config,
+                    correction_cutoff=correction_cutoff,
+                    pnr_max=int(genotype_config.get("pnr_max", 3)),
+                )
+
+                # fitnesses[:, 0] is -expectation (maximized).
+                # We want to MINIMIZE expectation.
+                # The `extras["gradients"]` provided by runner.py are gradients of `loss_val`
+                # where `loss_val = exp_val + leakage`.
+                # So these are exactly the gradients we need for minimization.
+
+                grads = extras["gradients"]
+
+                # 3. Metrics (Check BEFORE update to align with current fitnesses)
+                # fitness[0] = -expectation
+                current_expectations = -fitnesses[:, 0]
+
+                # Find batch best
+                batch_min_idx = jnp.argmin(current_expectations)
+                batch_min_exp = float(current_expectations[batch_min_idx])
+
+                # Update Global Best
+                if batch_min_exp < global_best_exp:
+                    global_best_exp = batch_min_exp
+                    # Store the JAX array for the best genotype
+                    global_best_genotype = genotypes[batch_min_idx]
+
+                history_best_exp.append(float(global_best_exp))
+
+                # Track Best Prob
+                current_log_probs = fitnesses[:, 1]
+                batch_max_idx = jnp.argmax(current_log_probs)
+                batch_max_log_prob = float(current_log_probs[batch_max_idx])
+
+                if batch_max_log_prob > global_best_log_prob:
+                    global_best_log_prob = batch_max_log_prob
+                    global_best_prob_genotype = genotypes[batch_max_idx]
+
+                # Formatting (Show Best Exp and Global Best Prob)
+                if (i + 1) % 10 == 0 or i == 0:
+                    best_prob_val = 10**global_best_log_prob
+                    print(
+                        f"Iter {i + 1}/{n_iters} | Best Exp: {global_best_exp:.6f} | Best Prob: {best_prob_val:.6f}"
+                    )
+
+                    # Capture bad genotype
+                    if best_prob_val > 1.01:
+                        print(f"!!! PROB > 1 DETECTED: {best_prob_val:.6f} !!!")
+                        print("Saving bad genotype to 'bad_genotype.npz'...")
+
+                        # Use global variable if set, otherwise current batch best
+                        # global_best_prob_genotype is set above if we found a new best
+                        # If we didn't update this step, we still want the GLOBAL best one (which caused the >1).
+
+                        # Note: global_best_prob_genotype might be None if start condition, but prob > 1 implies we updated it at least once.
+
+                        target_geno = (
+                            global_best_prob_genotype
+                            if global_best_prob_genotype is not None
+                            else genotypes[batch_max_idx]
+                        )
+
+                        np.savez(
+                            "bad_genotype.npz",
+                            genotype=target_geno,
+                            prob=best_prob_val,
+                        )
+
+                # Store history periodically or only final?
+                # Storing all history allows animation of convergence
+                if not no_plot:
+                    all_genotypes_history.append(genotypes)
+                    all_fitnesses_history.append(fitnesses)
+                    all_descriptors_history.append(descriptors)
+
+                # 2. Update (Now apply step to move to next)
+                genotypes, opt_state = update_step(genotypes, grads, opt_state)
+        except KeyboardInterrupt:
+            print("\nOptimization interrupted by user. Saving current progress...")
+
+        print("Single Objective Optimization Finished.")
+
+        # Final evaluation
+        fitnesses, descriptors, extras = jax_scoring_fn_batch(
+            genotypes,
+            cutoff,
+            jnp.array(operator),
+            genotype_name=genotype,
+            genotype_config=genotype_config,
+            correction_cutoff=correction_cutoff,
+            pnr_max=int(genotype_config.get("pnr_max", 3)),
+        )
+
+        # Check final batch
+        current_expectations = -fitnesses[:, 0]
+        batch_min_idx = jnp.argmin(current_expectations)
+        batch_min_exp = float(current_expectations[batch_min_idx])
+        if batch_min_exp < global_best_exp:
+            global_best_exp = batch_min_exp
+            global_best_genotype = genotypes[batch_min_idx]
+
+        # Construct Repertoire
+        g_final = np.array(genotypes)
+        f_final = np.array(fitnesses)
+        d_final = np.array(descriptors)
+
+        # Inject Global Best if available
+        if global_best_genotype is not None:
+            # Explicitly re-evaluate global best to ensure correct matching data (deterministic)
+            gb_in = global_best_genotype[None, :]
+            gb_f, gb_d, _ = jax_scoring_fn_batch(
+                gb_in,
+                cutoff,
+                jnp.array(operator),
+                genotype_name=genotype,
+                genotype_config=genotype_config,
+                correction_cutoff=correction_cutoff,
+                pnr_max=int(genotype_config.get("pnr_max", 3)),
+            )
+
+            # Append to results
+            g_final = np.concatenate([g_final, np.array(gb_in)], axis=0)
+            f_final = np.concatenate([f_final, np.array(gb_f)], axis=0)
+            d_final = np.concatenate([d_final, np.array(gb_d)], axis=0)
+            print(
+                f"Injected Global Best (Exp: {global_best_exp:.6f}) into final results."
+            )
+
+        # Reshape for Repertoire (Pop, 1, Objs)
+        g_final = g_final[:, np.newaxis, :]
+        f_final = f_final[:, np.newaxis, :]
+        d_final = d_final[:, np.newaxis, :]
+
+        repertoire = SimpleRepertoire(g_final, f_final, d_final)
+
+        # Metrics
+        final_metrics = {"min_expectation": np.array(history_best_exp)}
+
     # --- Result Management ---
-    from src.utils.result_manager import OptimizationResult
 
     # Config dict
     config = {
@@ -1391,8 +1710,11 @@ def run(
         "chunk_size": chunk_size,
     }
 
+    if correction_cutoff is not None:
+        config["correction_cutoff"] = correction_cutoff
+
     # Modes handling for results
-    modes_val = 2
+    modes_val = 3
     if genotype_config and "modes" in genotype_config:
         modes_val = int(genotype_config["modes"])
     config["modes"] = modes_val
@@ -1449,7 +1771,7 @@ def main():
     # Parse args
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", type=str, default="random", choices=["random", "qdax"]
+        "--mode", type=str, default="random", choices=["random", "qdax", "single"]
     )
     parser.add_argument(
         "--backend", type=str, default="thewalrus", choices=["thewalrus", "jax"]
@@ -1522,7 +1844,14 @@ def main():
         "--emitter",
         type=str,
         default="hybrid",
-        choices=["standard", "biased", "hybrid"],
+        choices=[
+            "standard",
+            "biased",
+            "hybrid",
+            "gradient",
+            "hybrid-gradient",
+            "mega-hybrid",
+        ],
         help="Emitter strategy to use.",
     )
     parser.add_argument(
@@ -1536,6 +1865,19 @@ def main():
         type=float,
         default=5.0,
         help="Base temperature for biased emitter.",
+    )
+
+    parser.add_argument(
+        "--alpha-expectation",
+        type=float,
+        default=1.0,
+        help="Weight for expectation value in single-objective loss (default: 1.0).",
+    )
+    parser.add_argument(
+        "--alpha-probability",
+        type=float,
+        default=0.0,
+        help="Weight for log-probability in single-objective loss (default: 0.0).",
     )
 
     parser.add_argument(
@@ -1619,6 +1961,8 @@ def main():
         "window": args.window,
         "pnr_max": pnr_max_val,
         "modes": args.modes,
+        "alpha_expectation": args.alpha_expectation,
+        "alpha_probability": args.alpha_probability,
     }
 
     # Profiling context
