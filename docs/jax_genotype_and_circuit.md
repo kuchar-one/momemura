@@ -19,6 +19,7 @@ We support multiple genotype designs offering different trade-offs between expre
 | :--- | :--- | :--- | :--- |
 | **Legacy** | Original | **REMOVED** | N/A |
 | **0** | Per-Node Homodyne | Variant of A with independent homodyne detection at each mixing node. | 209 |
+| **00B** | 0 + Balanced | Design 0 with fixed 50:50 mixing. | 188 |
 | **A** | Original (Canonical) | Per-leaf unique. General Gaussian per leaf. | 203 |
 | **B1** | Tied-Leaf (No Active) | Single shared block. 1 GG/block + Final Gauss. | 48 |
 | **B2** | Tied-Leaf (Active) | Same as B1 but with per-leaf active flags. | 56 |

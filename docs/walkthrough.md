@@ -31,14 +31,6 @@ Hanamura uses a hybrid architecture to optimize quantum circuits:
     - The number of modes can be set with `--modes N` (default 3), allowing scaling to any 1 Signal + (N-1) Control configuration.
     - Centroids for the MAP-Elites grid are generated based on descriptors (Complexity, Max PNR, Total Photons).
 
-- [x] Implement DesignB30Genotype - Complete
-- [x] Implement DesignC20Genotype - Complete
-- [x] Update JAX Superblock for array homodyne\_x - Complete
-- [x] Update CPU Backend circuit.py for array homodyne\_x - Complete
-- [x] Resolve Probability Discrepancies (Frontend/Backend) - Complete
-  - Reverted complicated DM logic in backend.
-  - Enforced "Point Mode" + Resolution Scaling in Frontend and Backend to match user requirement.
-  - Verified Prob < 1.0 and Frontend == Backend.
 
 2.  **Evaluation Loop**:
     - Genotypes are decoded into circuit parameters (`decode_genotype`).

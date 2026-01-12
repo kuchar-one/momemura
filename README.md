@@ -2,6 +2,8 @@
 
 momemura is a high-performance framework for optimizing GKP (Gottesman-Kitaev-Preskill) state preparation circuits using QDax and JAX. It supports both pure-state analytical pipelines and realistic mixed-state simulations with homodyne detection.
 
+**New:** Now supports **Differentiable Quality Diversity (DQD)** via exact gradient computation and the `OMG-MEGA` emitter!
+
 ## Installation
 
 1.  Clone the repository:
@@ -39,7 +41,15 @@ momemura is a high-performance framework for optimizing GKP (Gottesman-Kitaev-Pr
 - `--target-beta`: Target GKP |1> coefficient (default 0.0, complex).
 - `--low-mem`: Disables JAX memory preallocation to save VRAM (precision remains `float32`).
 - `--profile`: Enable JAX profiling (saves trace to `./profiles`).
+- `--profile`: Enable JAX profiling (saves trace to `./profiles`).
 - `--no-plot`: Disable plotting (useful for clusters).
+- `--emitter`: Optimization strategy (Default: `standard`).
+    - `standard`: Evolution Strategies (Mixing Emitter).
+    - `biased`: Fitness-biased selection.
+    - `hybrid`: Combination of Exploration and Intensification.
+    - `gradient`: **[New]** Gradient-based OMG-MEGA Emitter (requires JAX).
+    - `hybrid-gradient`: **[New]** Hybrid evolution + gradient descent.
+    - `mega-hybrid`: **[New]** Nested Hybrid (Gradient + Biased + Standard).
 
 **Parameter Limits:**
 - `--depth`: Circuit depth (default 3).
@@ -67,7 +77,17 @@ The watchdog automatically handles resuming from the last checkpoint.
 - `--correction-cutoff`: (Optional) The larger cutoff dimension used for simulation when dynamic limits are active. Defaults to cutoff + 15.
 - Note: When enabled, a leakage penalty (1.0 * leakage) is applied to the fitness function.
 
-### Profiling
+- Note: When enabled, a leakage penalty (1.0 * leakage) is applied to the fitness function.
+
+### Differentiable Quality Diversity (DQD)
+The framework now supports gradient-based optimization using JAX's auto-differentiation capabilities.
+- **Exact Gradients**: The simulation computes the exact gradient of the Expectation Value with respect to all continuous circuit parameters.
+- **MOME-OMG-MEGA**: A custom Emitter adapts the [OMG-MEGA](https://arxiv.org/abs/2205.10862) algorithm to the Multi-Objective MAP-Elites setting. It combines stochastic gradient descent (via random coefficient scaling) with the archive-based diversity maintenance of MOME.
+
+To use DQD:
+```bash
+python run_mome.py --mode qdax --emitter gradient --genotype B30B
+```
 
 To profile the optimization loop:
 ```bash
