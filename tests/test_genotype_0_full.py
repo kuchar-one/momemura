@@ -71,7 +71,7 @@ def test_design0_simulation():
     # Run
     # This invokes decoder.decode -> jax_get_heralded -> jax_superblock
     # Note: _score_batch_shard takes genotype_name to get decoder.
-    fitness, descriptors = _score_batch_shard(g_batch, cutoff, operator, "0")
+    fitness, descriptors, _ = _score_batch_shard(g_batch, cutoff, operator, "0")
 
     # Check output shapes
     # Fitness: [-exp, -logprob, -complexity, -pnrs]

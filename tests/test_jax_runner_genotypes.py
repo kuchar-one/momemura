@@ -35,7 +35,7 @@ def test_runner_with_genotype_types(name):
     operator = jnp.eye(cutoff, dtype=jnp.complex128)
 
     # Run scoring
-    fitnesses, descriptors = jax_scoring_fn_batch(
+    fitnesses, descriptors, extras = jax_scoring_fn_batch(
         genotypes, cutoff, operator, genotype_name=name, genotype_config=config
     )
 

@@ -103,12 +103,13 @@ def test_dynamic_limits_penalty():
     config_tuple = tuple(sorted(genotype_config.items()))
 
     # Run Score with dynamic limits
-    fitness_dyn, _ = _score_batch_shard(
+    fitness_dyn, _, _ = _score_batch_shard(
         g_high, cutoff, op, genotype_name, config_tuple, correction_cutoff
     )
 
     # Run Score WITHOUT dynamic limits (correction=cutoff)
-    fitness_static, _ = _score_batch_shard(
+    # Run Score WITHOUT dynamic limits (correction=cutoff)
+    fitness_static, _, _ = _score_batch_shard(
         g_high,
         cutoff,
         op,
@@ -167,7 +168,7 @@ def test_dynamic_limits_penalty():
     # Disp 0.5. n=0.25. Fits easily.
     g_low = jnp.zeros((1, L))  # Vacuum
 
-    fitness_vac, _ = _score_batch_shard(
+    fitness_vac, _, _ = _score_batch_shard(
         g_low, cutoff, op, genotype_name, config_tuple, correction_cutoff
     )
 

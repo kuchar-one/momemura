@@ -37,17 +37,30 @@ def test_jax_scoring_fn_batch_shapes():
     operator = jnp.eye(cutoff, dtype=jnp.complex128)
 
     # 3. Run Batch Scoring
-    fitnesses, descriptors = jax_scoring_fn_batch(genotypes, cutoff, operator)
+    fitnesses, descriptors, extras = jax_scoring_fn_batch(genotypes, cutoff, operator)
 
     # 4. Verify Shapes
     # fitnesses: (batch_size, 4)
     # descriptors: (batch_size, 3)
+    # extras["gradients"]: (batch_size, genotype_dim)
 
     print(f"Fitnesses shape: {fitnesses.shape}")
     print(f"Descriptors shape: {descriptors.shape}")
+    print(f"Gradients shape: {extras['gradients'].shape}")
 
     assert fitnesses.shape == (batch_size, 4)
     assert descriptors.shape == (batch_size, 3)
+    assert extras["gradients"].shape == (batch_size, genotype_dim)
+
+    # Check other extras
+    assert "leakage" in extras
+    assert "raw_expectation" in extras
+    assert "joint_probability" in extras
+    assert "pnr_cost" in extras
+
+    # leakage shape (batch_size,) or (batch_size, 1)?
+    # It was just array return, so probably (batch_size,)
+    assert extras["leakage"].shape == (batch_size,)
 
     # Check for NaNs
     assert not jnp.any(jnp.isnan(fitnesses))

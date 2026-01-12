@@ -71,7 +71,7 @@ def test_jax_superblock_consistency():
     leaf_probs_np = np.array(leaf_probs)
 
     print(f"Leaf Probs: {leaf_probs_np}")
-    # print(f"Mix Source: {mix_source}")
+    # Mix Source trace
     print(f"Mix Params: {mix_params}")
 
     # Build tree manually with Composer

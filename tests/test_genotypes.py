@@ -21,13 +21,13 @@ MODES = 3  # 1 Signal + 2 Controls
 # B2: 48 + 8 = 56
 # B3: 1 + 18(Shared) + 8*4(Unique) + 21 + 5 = 77  (Unique=1+1+2=4)
 # B30: 77 - 1 + 7 = 83
-# B3B: 77 - 21 = 56
-# B30B: 83 - 21 = 62
+# B3B: 77 (Fixed Balanced) -> PN=3 kept for structure alignment = 77
+# B30B: 83 (Fixed Balanced) -> PN=3 kept for structure alignment = 83
 # C1: 1 + 21(Shared) + 3(SharedMix) + 5 = 30
 # C2: 30 + 8 = 38
 # C20: 38 - 1 + 7 = 44
-# C2B: 38 - 3 = 35
-# C20B: 44 - 3 = 41
+# C2B: 38 (Fixed Balanced) -> PN=3 kept = 38
+# C20B: 44 (Fixed Balanced) -> PN=3 kept = 44
 
 
 @pytest.mark.parametrize(
@@ -39,13 +39,14 @@ MODES = 3  # 1 Signal + 2 Controls
         ("B2", 56),
         ("B3", 77),
         ("B30", 83),
-        ("B3B", 56),
-        ("B30B", 62),
+        ("B3B", 77),
+        ("B30B", 83),
         ("C1", 30),
         ("C2", 38),
         ("C20", 44),
-        ("C2B", 35),
-        ("C20B", 41),
+        ("C2B", 38),
+        ("C20B", 44),
+        ("00B", 209),
     ],
 )
 def test_genotype_lengths(design_name, expected_length):
@@ -55,7 +56,7 @@ def test_genotype_lengths(design_name, expected_length):
 
 
 @pytest.mark.parametrize(
-    "design_name", ["A", "0", "B1", "B2", "B3", "C1", "C2", "C20", "B30B"]
+    "design_name", ["A", "0", "B1", "B2", "B3", "C1", "C2", "C20", "B30B", "00B"]
 )
 def test_genotype_decode_shapes(design_name):
     config = {"modes": MODES}
