@@ -47,30 +47,74 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
 
         from frontend import utils
 
-        r = utils.to_scalar(get_val("tmss_r", idx))
+        # Squeezing: Try 'r' first (General Gaussian), then 'tmss_r' (Legacy)
+        r_list = get_val("r", idx)
+        if r_list is not None and hasattr(r_list, "__len__"):
+            # General Gaussian r is a vector (N modes). Signal mode usually first or we show Max?
+            # Or show vector.
+            # Assuming N=3 (1 sig + 2 ctrl).
+            # For brevity, let's show max r or all.
+            # Convert to simple list
+            try:
+                r_vals = [float(x) for x in r_list]
+                r_desc = f"{r_vals}"
+            except Exception:
+                r_desc = str(r_list)
+            r_str = f"r={r_desc}"
+        else:
+            # Legacy fallback
+            try:
+                r_val = utils.to_scalar(get_val("tmss_r", idx))
+                r_str = f"r={r_val:.2f}"
+            except (KeyError, TypeError):
+                r_str = "r=?"
+
         n_ctrl = int(utils.to_scalar(get_val("n_ctrl", idx)))
 
         # PNR: Slice by n_ctrl
-        raw_pnr = get_val("pnr", idx)  # array
-        # Convert to list of ints
-        if hasattr(raw_pnr, "tolist"):
-            pnr_list = raw_pnr.tolist()
-        elif isinstance(raw_pnr, list):
-            pnr_list = raw_pnr
-        else:
-            pnr_list = [raw_pnr]
+        try:
+            raw_pnr = get_val("pnr", idx)  # array
+            # Convert to list of ints
+            if hasattr(raw_pnr, "tolist"):
+                pnr_list = raw_pnr.tolist()
+            elif isinstance(raw_pnr, list):
+                pnr_list = raw_pnr
+            else:
+                pnr_list = [raw_pnr]
 
-        # Take first n_ctrl elements
-        if n_ctrl > 0:
-            final_pnr = pnr_list[:n_ctrl]
-            pnr_str = str(final_pnr)
-        else:
-            pnr_str = "[]"
+            # Format elements
+            pnr_list = [int(utils.to_scalar(x)) for x in pnr_list]
+
+            # Take first n_ctrl elements
+            if n_ctrl > 0:
+                final_pnr = pnr_list[:n_ctrl]
+                pnr_str = str(final_pnr)
+            else:
+                pnr_str = "[]"
+        except (KeyError, TypeError):
+            pnr_str = "?"
 
         # Displacements
-        disp_s = utils.to_scalar(get_val("disp_s", idx))
+        # Try 'disp' (General Gaussian) -> shape (2N,) usually.
+        # Legacy 'disp_s' (scalar for signal).
+        try:
+            disp_vec = get_val("disp", idx)
+            if disp_vec is not None:
+                # Show first 2 elements (Signal Re, Im)
+                if hasattr(disp_vec, "__len__") and len(disp_vec) >= 2:
+                    d_re = float(disp_vec[0])
+                    d_im = float(disp_vec[1])
+                    disp_str = f"Disp=({d_re:.2f}, {d_im:.2f})"
+                else:
+                    disp_str = f"Disp={disp_vec}"
+            else:
+                # Legacy
+                disp_s = utils.to_scalar(get_val("disp_s", idx))
+                disp_str = f"DispS={disp_s:.2f}"
+        except (KeyError, TypeError):
+            disp_str = "Disp=?"
 
-        desc = f"**Leaf {idx}** [{status}]: TMSS(r={r:.2f}), n_ctrl={n_ctrl}, PNR={pnr_str}, DispS={disp_s:.2f}"
+        desc = f"**Leaf {idx}** [{status}]: {r_str}, n_ctrl={n_ctrl}, PNR={pnr_str}, {disp_str}"
         return desc
 
     lines.append("\n#### 1. Leaf States (Layer 0)")

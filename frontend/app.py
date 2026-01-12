@@ -5,6 +5,12 @@ import numpy as np
 import visualizations as viz
 import utils
 import plotly.express as px
+from src.utils.result_manager import SimpleRepertoire
+
+# Pickle Compatibility Hack:
+# Old pickles expect SimpleRepertoire to be in __main__.
+# Since this script runs as __main__ in Streamlit, aliasing it here works.
+globals()["SimpleRepertoire"] = SimpleRepertoire
 
 st.set_page_config(page_title="Momemura Visualizer", layout="wide")
 
@@ -46,9 +52,9 @@ def render_solution_details(row, result_obj, key_suffix=""):
     m_col4.metric("Total Photons (Active)", f"{active_total_photons:.2f}")
 
     # Circuit Plot
-    st.subheader("Active Leaf Schematic (Topology)")
-    fig_circ = utils.get_circuit_figure(params)
-    st.pyplot(fig_circ)
+    # st.subheader("Active Leaf Schematic (Topology)")
+    # fig_circ = utils.get_circuit_figure(params)
+    # st.pyplot(fig_circ)
 
     # Wigner Function
     st.subheader("Wigner Function (Signal Mode)")
@@ -58,15 +64,32 @@ def render_solution_details(row, result_obj, key_suffix=""):
         try:
             # Compute state
             # Compute state
-            cutoff = result_obj.config.get("cutoff", 12)  # Use config or default
+            # Determine Simulation Cutoff (Dynamic Limits Check)
+            # Backend may use correction_cutoff for internal simulation to reduce leakage, then truncate.
+            # To match stored probability, we must simulate at correction_cutoff.
+            base_cutoff = int(result_obj.config.get("cutoff", 12))
+            corr_cutoff = result_obj.config.get("correction_cutoff")
+
+            sim_cutoff = base_cutoff
+            if corr_cutoff is not None:
+                cc = int(corr_cutoff)
+                if cc > base_cutoff:
+                    sim_cutoff = cc
+
+            cutoff = base_cutoff
             pnr_max = int(result_obj.config.get("pnr_max", 3))  # Use config or default
 
+            params["n_control"] = params.get(
+                "n_control", 3
+            )  # Default to 3 (standard GG) if missing
             params["pnr_outcome"] = params.get(
                 "pnr_outcome", [0] * int(params.get("n_control", 1))
             )  # Ensure pnr present
             psi, prob = utils.compute_heralded_state(
-                params, cutoff=cutoff, pnr_max=pnr_max
+                params, cutoff=sim_cutoff, pnr_max=pnr_max
             )
+            # Note: psi will be size sim_cutoff (e.g. 30), not base_cutoff (12).
+            # Wigner and Plotting tools handle this fine.
             exp_val = row["Expectation"]  # Get expectation for Wigner title
 
             # --- VISUALIZATION ROW ---
@@ -102,14 +125,19 @@ def render_solution_details(row, result_obj, key_suffix=""):
             else:
                 sim_log_prob = np.inf
 
-            stored_log_prob = utils.to_scalar(row["LogProb"])
+            stored_log_prob_val = utils.to_scalar(row["LogProb"])
+            # Stored LogProb is likely NegLog10(P) (positive number) already if coming from fitness/metrics post-processing.
+            # Empirical evidence: Val=17.59.
+            stored_neg_log_prob = stored_log_prob_val
 
             st.text(
-                f"Herald Probability (Simulated): {prob:.4e}  => LogProb: {sim_log_prob:.4f}"
+                f"Herald Probability (Simulated): {prob:.4e}  => NegLog10 P: {sim_log_prob:.4f}"
             )
-            st.text(f"Stored LogProb (Backend):       {stored_log_prob:.4f}")
+            st.text(
+                f"Stored LogProb (Backend):       {stored_log_prob_val:.4f} => NegLog10 P: {stored_neg_log_prob:.4f}"
+            )
 
-            if abs(sim_log_prob - stored_log_prob) > 1.0:
+            if abs(sim_log_prob - stored_neg_log_prob) > 1.0:
                 st.warning(
                     "⚠️ Mismatch between stored metadata and re-simulated state. "
                     "This likely due to dynamic limits or different cutoff settings. "

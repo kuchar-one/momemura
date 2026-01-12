@@ -460,7 +460,15 @@ def plot_tree_circuit(params: dict, genotype_name: str = "A") -> go.Figure:
         if node.startswith("L"):
             idx = int(node[1:])
             idx = int(node[1:])
-            r_val = get_leaf_val(idx, "tmss_r", 0.0, scalar=True)
+            # Prioritize General Gaussian 'r'
+            r_list = get_leaf_val(idx, "r", None, scalar=False)
+            if r_list is not None:
+                if hasattr(r_list, "__len__"):
+                    r_val = float(np.max(np.abs(r_list)))
+                else:
+                    r_val = abs(utils.to_scalar(r_list))
+            else:
+                r_val = get_leaf_val(idx, "tmss_r", 0.0, scalar=True)
             n_val = int(get_leaf_val(idx, "n_ctrl", 1, scalar=True))
 
             # --- Detailed Params for Visualization ---
