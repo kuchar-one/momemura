@@ -185,6 +185,9 @@ def jax_get_heralded_state(
 ):
     """
     Computes Herald State from General Gaussian Leaf parameters.
+
+    When n_ctrl=0, returns the signal mode state without heralding (prob=1.0).
+    When n_ctrl>0, computes heralded state conditioned on PNR outcomes.
     """
     # 1. Get Gaussian Moments (Whole N-mode state)
     mu, cov = jax_get_gaussian_moments(params)
@@ -198,33 +201,21 @@ def jax_get_heralded_state(
     N_C = N - 1
     hbar = 2.0
 
-    # 5. Herald
+    # Import herald functions
+    from src.simulation.jax.herald import jax_get_full_amplitudes
 
-    # 5. Herald
     # Control modes indices: 1..N-1 (0 is signal)
-    # PNR Masking
-    # Map pnr_vec to effective pnr
-    # pnr_vec has size N-1? Or fixed large size?
-    # Usually Genotype decodes to fixed max size (e.g. 5 controls).
-    # But N might vary per run config?
-    # Here N is determined by r_vec.
-
     ctrl_indices_local = jnp.arange(N_C)
     pnr_effective = jnp.where(ctrl_indices_local < n_ctrl_eff, pnr_vec[:N_C], 0)
-
-    # Heralding Function
-    # We use jax_get_full_amplitudes
-    from src.simulation.jax.herald import jax_get_full_amplitudes
 
     # We need to pass max_pnr_tuple.
     # Since we can't iterate dynamically for tuple creation in JIT if N_C is dynamic,
     # we assume N_C is static (defined by genotype config `modes`).
-    # `jax_get_heralded_state` handles static shapes usually.
 
     max_pnr_sequence = [pnr_max] * N_C
     max_pnr_tuple = tuple(max_pnr_sequence)
 
-    # Return Amplitudes tensor H (cutoff, pnr_max+1, ..., pnr_max+1)
+    # Compute full amplitudes tensor H (cutoff, pnr_max+1, ..., pnr_max+1)
     H_full = jax_get_full_amplitudes(mu, cov, max_pnr_tuple, cutoff, hbar)
 
     # Extract the slice corresponding to pnr_effective
@@ -234,11 +225,6 @@ def jax_get_heralded_state(
     D_ctrl = pnr_max + 1
 
     # Compute flat index for [pnr_0, pnr_1, ...]
-    # Stride calculation
-    # Index = sum( p[i] * D^(N_C - 1 - i) ) ?
-    # Note: `jax_get_full_amplitudes` returns indices in order of modes 1..N.
-    # So H[k, n1, n2...]
-
     flat_idx = 0
     for i in range(N_C):
         p = pnr_effective[i]
@@ -248,25 +234,75 @@ def jax_get_heralded_state(
 
     flat_idx = flat_idx.astype(jnp.int32)
 
-    vec_slice = H_flat[:, flat_idx]
+    vec_heralded = H_flat[:, flat_idx]
 
-    # Probability
-    prob_slice = jnp.sum(jnp.abs(vec_slice) ** 2)
+    # Heralded probability (conditioned on PNR outcomes)
+    prob_heralded = jnp.sum(jnp.abs(vec_heralded) ** 2)
 
-    # Normalize
-    vec_norm = jax.lax.cond(
-        prob_slice > 0,
-        lambda _: vec_slice / jnp.sqrt(prob_slice),
-        lambda _: jnp.zeros_like(vec_slice),
+    # --- n_ctrl=0 case: No heralding, use signal mode only ---
+    # For n_ctrl=0, we need the unconditional state of the signal mode.
+    # This is obtained by tracing out control modes (summing over all PNR outcomes).
+    # The signal mode state is the marginal: sum over all control outcomes.
+    # Since each column of H_flat corresponds to a different control outcome,
+    # we sum |amplitude|^2 weighted by outcome probabilities.
+    # Actually, for the pure signal state without heralding:
+    # We sum the squared amplitudes over all control outcomes to get the
+    # reduced density matrix diagonal, but we need the state vector.
+    # For a pure Gaussian state, the reduced state is mixed in general.
+    # However, for the special case of no squeezing correlation between signal
+    # and controls, the signal mode is pure.
+    #
+    # Alternative interpretation: n_ctrl=0 means the circuit has no control
+    # modes connected, so no heralding occurs. The state is just the signal
+    # portion of the Gaussian state, and prob=1.0.
+    #
+    # For simplicity and consistency with the user's interpretation:
+    # n_ctrl=0 -> prob=1.0, state = normalized sum over all control outcomes
+    # (which for uncorrelated Gaussian = signal marginal).
+
+    # Sum amplitudes over all control outcomes (columns of H_flat)
+    # This gives the unnormalized signal state when all control modes are traced out
+    vec_unheralded = jnp.sum(H_flat, axis=1)
+    prob_unheralded_norm = jnp.sum(jnp.abs(vec_unheralded) ** 2)
+
+    # Normalize the unheralded state
+    vec_unheralded_norm = jax.lax.cond(
+        prob_unheralded_norm > 0,
+        lambda _: vec_unheralded / jnp.sqrt(prob_unheralded_norm),
+        lambda _: jnp.zeros_like(vec_unheralded),
         None,
     )
 
+    # Normalize heralded state
+    vec_heralded_norm = jax.lax.cond(
+        prob_heralded > 0,
+        lambda _: vec_heralded / jnp.sqrt(prob_heralded),
+        lambda _: jnp.zeros_like(vec_heralded),
+        None,
+    )
+
+    # Select based on n_ctrl_eff
+    # n_ctrl_eff == 0: use unheralded state with prob=1.0
+    # n_ctrl_eff > 0: use heralded state with computed probability
+    is_unheralded = n_ctrl_eff == 0
+
+    vec_out = jnp.where(is_unheralded, vec_unheralded_norm, vec_heralded_norm)
+    prob_out = jnp.where(is_unheralded, 1.0, prob_heralded)
+
+    # For unheralded case, max_pnr and total_pnr should be 0
+    max_pnr_out = jnp.where(
+        is_unheralded, 0.0, jnp.max(pnr_effective).astype(jnp.float32)
+    )
+    total_pnr_out = jnp.where(
+        is_unheralded, 0.0, jnp.sum(pnr_effective).astype(jnp.float32)
+    )
+
     return (
-        vec_norm,
-        prob_slice,
+        vec_out,
+        prob_out,
         1.0,
-        jnp.max(pnr_effective).astype(jnp.float32),
-        jnp.sum(pnr_effective).astype(jnp.float32),
+        max_pnr_out,
+        total_pnr_out,
         1.0,
     )
 
@@ -289,6 +325,7 @@ def _score_batch_shard(
     genotype_config: Any = None,
     correction_cutoff: int = None,
     pnr_max: int = 3,
+    gs_eig: float = -4.0,  # Default safe-ish value if not passed
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     JIT-compiled scoring function for a single batch shard.
@@ -435,11 +472,23 @@ def _score_batch_shard(
             w_exp = float(config_dict.get("alpha_expectation", 1.0))
             w_prob = float(config_dict.get("alpha_probability", 0.0))
 
-        # Weighted Sum
+        # Weighted Sum -> Augmented Tchebycheff
         # Note: We minimize loss.
-        # - Expectation: Minimize exp_val
-        # - Probability: Maximize prob => Minimize -log_prob (which is log_prob variable here)
-        loss_val = (w_exp * exp_val) + (w_prob * log_prob) + leakage_penalty
+        # Utopia points
+        # Expectation: gs_eig - eps
+        # Probability: -eps (Ideal -logP = 0)
+        eps = 0.01
+        z_star_exp = gs_eig - eps
+        z_star_prob = -eps
+        rho = 0.01
+
+        # Terms (Minimize distance to Utopia)
+        # We want to minimize (exp_val - z*) and (log_prob - z*)
+        # Since z* is strictly lower bound, value - z* is positive.
+        d_exp = w_exp * jnp.abs(exp_val - z_star_exp)
+        d_prob = w_prob * jnp.abs(log_prob - z_star_prob)
+
+        loss_val = jnp.maximum(d_exp, d_prob) + rho * (d_exp + d_prob) + leakage_penalty
 
         # Construct Fitness: [-Exp, -LogP, -Complex, -Photons]
         # Use computed loss_val which includes penalty? or separate?
@@ -503,6 +552,7 @@ def jax_scoring_fn_batch(
     genotype_config: Dict = None,
     correction_cutoff: int = None,
     pnr_max: int = 3,
+    gs_eig: float = -4.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Batched scoring function for QDax.
@@ -524,6 +574,7 @@ def jax_scoring_fn_batch(
             config_hashable,
             correction_cutoff,
             pnr_max,
+            gs_eig,
         )
 
     # Multi-GPU Logic
@@ -544,8 +595,8 @@ def jax_scoring_fn_batch(
     # _score_batch_shard returns (fit, desc, extras)
     pmapped_fn = jax.pmap(
         _score_batch_shard,
-        in_axes=(0, None, None, None, None, None, None),
-        static_broadcasted_argnums=(1, 3, 4, 5, 6),
+        in_axes=(0, None, None, None, None, None, None, None),
+        static_broadcasted_argnums=(1, 3, 4, 5, 6, 7),
     )
 
     if genotype_config is not None and isinstance(genotype_config, dict):
@@ -561,6 +612,7 @@ def jax_scoring_fn_batch(
         config_hashable,
         correction_cutoff,
         pnr_max,
+        gs_eig,
     )
 
     # Reshape results

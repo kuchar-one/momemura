@@ -214,6 +214,12 @@ class HanamuraMOMEAdapter:
         max_workers = min(32, (os.cpu_count() or 1) + 4)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
+        # Pre-calculate Ground State Expectation
+        if jax is not None:
+            self.gs_exp = float(jnp.linalg.eigvalsh(jnp.array(operator))[0])
+        else:
+            self.gs_exp = -4.0  # Fallback
+
     def __del__(self):
         if hasattr(self, "executor"):
             self.executor.shutdown(wait=False)
@@ -266,6 +272,7 @@ class HanamuraMOMEAdapter:
                 genotype_config=self.genotype_config,
                 correction_cutoff=self.correction_cutoff,
                 pnr_max=self.pnr_max,
+                gs_eig=self.gs_exp,
             )
 
             # Extract metrics
@@ -323,6 +330,7 @@ class HanamuraMOMEAdapter:
                     self.genotype_config,
                     self.correction_cutoff,
                     pnr_max=self.pnr_max,
+                    gs_eig=self.gs_exp,
                 )
                 fitnesses_jax.block_until_ready()
                 descriptors_jax.block_until_ready()
@@ -972,6 +980,9 @@ def run(
                     genotype_config=genotype_config,
                     correction_cutoff=correction_cutoff,
                     pnr_max=pnr_max_val,
+                    gs_eig=float(
+                        jnp.linalg.eigvalsh(op_jax)[0]
+                    ),  # Calculated here for QDax
                 )
 
             # QDax expects extra scores (gradients/etc).
@@ -1519,6 +1530,10 @@ def run(
         print(f"Optimizer: Adam(lr={learning_rate})")
         print(f"JAX Devices: {jax.devices()}")
 
+        # Pre-calc GS Eig
+        gs_eig = float(jnp.linalg.eigvalsh(jnp.array(operator))[0])
+        print(f"Ground State Expectation: {gs_eig:.6f}")
+
         # Optimization Loop
         # We process in batches (population is the batch)
 
@@ -1559,6 +1574,7 @@ def run(
                     genotype_config=genotype_config,
                     correction_cutoff=correction_cutoff,
                     pnr_max=int(genotype_config.get("pnr_max", 3)),
+                    gs_eig=gs_eig,
                 )
 
                 # fitnesses[:, 0] is -expectation (maximized).

@@ -50,19 +50,13 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
         # Squeezing: Try 'r' first (General Gaussian), then 'tmss_r' (Legacy)
         r_list = get_val("r", idx)
         if r_list is not None and hasattr(r_list, "__len__"):
-            # General Gaussian r is a vector (N modes). Signal mode usually first or we show Max?
-            # Or show vector.
-            # Assuming N=3 (1 sig + 2 ctrl).
-            # For brevity, let's show max r or all.
-            # Convert to simple list
             try:
                 r_vals = [float(x) for x in r_list]
-                r_desc = f"{r_vals}"
+                r_desc = f"{[round(x, 3) for x in r_vals]}"
             except Exception:
                 r_desc = str(r_list)
             r_str = f"r={r_desc}"
         else:
-            # Legacy fallback
             try:
                 r_val = utils.to_scalar(get_val("tmss_r", idx))
                 r_str = f"r={r_val:.2f}"
@@ -73,8 +67,7 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
 
         # PNR: Slice by n_ctrl
         try:
-            raw_pnr = get_val("pnr", idx)  # array
-            # Convert to list of ints
+            raw_pnr = get_val("pnr", idx)
             if hasattr(raw_pnr, "tolist"):
                 pnr_list = raw_pnr.tolist()
             elif isinstance(raw_pnr, list):
@@ -82,10 +75,8 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
             else:
                 pnr_list = [raw_pnr]
 
-            # Format elements
             pnr_list = [int(utils.to_scalar(x)) for x in pnr_list]
 
-            # Take first n_ctrl elements
             if n_ctrl > 0:
                 final_pnr = pnr_list[:n_ctrl]
                 pnr_str = str(final_pnr)
@@ -94,27 +85,88 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
         except (KeyError, TypeError):
             pnr_str = "?"
 
-        # Displacements
-        # Try 'disp' (General Gaussian) -> shape (2N,) usually.
-        # Legacy 'disp_s' (scalar for signal).
+        # Phases (Passive Unitary) - N^2 phases for Clements decomposition
+        try:
+            phases = get_val("phases", idx)
+            if phases is not None and hasattr(phases, "__len__"):
+                phases_list = [float(x) for x in phases]
+                n_phases = len(phases_list)
+                # N² = n_phases, so N = sqrt(n_phases)
+                import math
+
+                N = int(math.sqrt(n_phases))
+
+                if N > 0 and N * N == n_phases:
+                    # Number of BS = N(N-1)/2, each has 2 params = N(N-1)
+                    n_bs_params = N * (N - 1)
+
+                    bs_params = phases_list[:n_bs_params]
+                    final_phases = phases_list[n_bs_params:]
+
+                    # Clements mesh structure - iterate to find BS mode indices
+                    # Same logic as jax_clements_unitary
+                    bs_strs = []
+                    param_idx = 0
+                    for s in range(N):  # N layers
+                        start = 0 if (s % 2 == 0) else 1
+                        for a in range(start, N - 1, 2):
+                            if param_idx + 1 < len(bs_params):
+                                theta = bs_params[param_idx]
+                                phi = bs_params[param_idx + 1]
+                                # Subscript showing which modes are connected
+                                bs_strs.append(
+                                    f"BS_{a}{a + 1}(θ={theta:.2f}, φ={phi:.2f})"
+                                )
+                                param_idx += 2
+
+                    # Format final phases with mode labels
+                    final_strs = [f"φ_{i}={p:.2f}" for i, p in enumerate(final_phases)]
+                    final_str = ", ".join(final_strs)
+
+                    phases_str = f"Passive Unitary (N={N} modes):\n"
+                    phases_str += f"    {', '.join(bs_strs)}\n"
+                    phases_str += f"    Final: [{final_str}]"
+                else:
+                    # Fallback: just show raw values
+                    phases_fmt = [round(x, 3) for x in phases_list]
+                    phases_str = f"phases={phases_fmt}"
+            else:
+                phases_str = "phases=[]"
+        except (KeyError, TypeError):
+            phases_str = "phases=?"
+
+        # Displacements - complex valued
         try:
             disp_vec = get_val("disp", idx)
             if disp_vec is not None:
-                # Show first 2 elements (Signal Re, Im)
-                if hasattr(disp_vec, "__len__") and len(disp_vec) >= 2:
-                    d_re = float(disp_vec[0])
-                    d_im = float(disp_vec[1])
-                    disp_str = f"Disp=({d_re:.2f}, {d_im:.2f})"
+                if hasattr(disp_vec, "__len__"):
+                    # Complex array - show all values
+                    disp_list = []
+                    for d in disp_vec:
+                        try:
+                            c = complex(d)
+                            if abs(c.imag) < 1e-6:
+                                disp_list.append(f"{c.real:.3f}")
+                            else:
+                                disp_list.append(f"{c.real:.3f}{c.imag:+.3f}j")
+                        except Exception:
+                            disp_list.append(str(d))
+                    disp_str = f"disp=[{', '.join(disp_list)}]"
                 else:
-                    disp_str = f"Disp={disp_vec}"
+                    disp_str = f"disp={disp_vec}"
             else:
                 # Legacy
                 disp_s = utils.to_scalar(get_val("disp_s", idx))
-                disp_str = f"DispS={disp_s:.2f}"
+                disp_str = f"disp_s={disp_s:.2f}"
         except (KeyError, TypeError):
-            disp_str = "Disp=?"
+            disp_str = "disp=?"
 
-        desc = f"**Leaf {idx}** [{status}]: {r_str}, n_ctrl={n_ctrl}, PNR={pnr_str}, {disp_str}"
+        # Build description with all parameters
+        desc = f"**Leaf {idx}** [{status}]:\n"
+        desc += f"  - {r_str}\n"
+        desc += f"  - n_ctrl={n_ctrl}, PNR={pnr_str}\n"
+        desc += f"  - {disp_str}\n"
+        desc += f"  - {phases_str}"
         return desc
 
     lines.append("\n#### 1. Leaf States (Layer 0)")
