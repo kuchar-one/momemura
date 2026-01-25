@@ -51,11 +51,13 @@ class TestPipelineLogic(unittest.TestCase):
 
         def side_effect_run_cmd(cmd_args, log_prefix):
             sent_commands.append(cmd_args)
-            return mock_process
+            return (mock_process, f"mock_{log_prefix}.log", log_prefix)
 
         # We use a mocked run_watchdog_command for inspection
-        with patch(
-            "run_pipeline.run_watchdog_command", side_effect=side_effect_run_cmd
+        # Also mock monitor_processes since it does real I/O
+        with (
+            patch("run_pipeline.run_watchdog_command", side_effect=side_effect_run_cmd),
+            patch("run_pipeline.monitor_processes"),
         ):
             # We only want to run 1 step to verify logic, not all 11
             # Adjust STEPS temporarily
@@ -80,9 +82,9 @@ class TestPipelineLogic(unittest.TestCase):
         self.assertIn("--mode", cmd1)
         self.assertIn("single", cmd1)
         self.assertIn("--alpha-expectation", cmd1)
-        self.assertIn("1.0", cmd1)  # Split 0: Exp=1.0, Prob=0.0
         self.assertIn("--alpha-probability", cmd1)
-        self.assertIn("0.0", cmd1)
+        # With 1 step, linspace(0.9, 0.0, 1) = [0.9], so Prob=0.9, Exp=0.1
+        self.assertIn("0.9", cmd1)
 
         # Check QDAX
         cmd2 = sent_commands[2]

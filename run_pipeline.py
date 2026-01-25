@@ -28,7 +28,7 @@ import select
 from typing import List
 
 # --- Configuration ---
-STEPS = 10  # 0.9 to 0.0 (inclusive) -> 10 steps for 0.1 increments
+STEPS = 5  # 5 steps (matching scalarization)
 SINGLE_OBJ_PARALLELISM = 2
 
 # Global tracking for signal handling
