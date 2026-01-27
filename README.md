@@ -73,7 +73,7 @@ The watchdog automatically handles resuming from the last checkpoint.
 
 
 **Dynamic Limits (Advanced):**
-- `--dynamic-limits`: Enable dynamic parameter limits. allows the optimizer to explore larger parameter ranges (e.g., r_scale=20, d_scale=20) by stimulating in a larger Hilbert space and penalizing leakage.
+- `--dynamic-limits`: Enable dynamic parameter limits. Adapts `r_scale` and `d_scale` based on the simulation `cutoff` to allow maximum energy usage while maintaining a safety buffer (50% of cutoff) to minimize truncation artifacts.
 - `--correction-cutoff`: (Optional) The larger cutoff dimension used for simulation when dynamic limits are active. Defaults to cutoff + 15.
 - Note: When enabled, a leakage penalty (1.0 * leakage) is applied to the fitness function.
 

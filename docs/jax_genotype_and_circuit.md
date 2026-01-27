@@ -137,3 +137,21 @@ Reduces length by removing mix parameters.
 ## Dynamic Parameter Limits
 
 The system supports `correction_cutoff` and `pnr_max` expansion via CLI arguments (`--dynamic-limits`), enabling simulation in larger Hilbert spaces to avoid truncation artifacts during optimization.
+
+- **Adaptive Limits**:
+  - **Squeezing**: $r_{max} = \text{asinh}(\sqrt{\text{cutoff}/2})$. Prevents squeezing energy from exceeding 50% of the basis capacity.
+  - **Displacement**: $d_{max} = \sqrt{\text{cutoff}/2}$. Prevents displacement energy from exceeding 50% of the basis capacity.
+  - **PNR Resolution**: Automatically scales `pnr_max` up to 15 based on cutoff to capture higher photon numbers.
+
+## Circuit Logic Details
+
+### Dynamic Mode Allocation (`n_ctrl`)
+To improve performance and physical accuracy, the number of modes simulated for each leaf is dynamically determined by its `n_ctrl` parameter:
+- **`n_ctrl = 0`**: 1 Mode (Signal only). Prepared as Vacuum $|0\rangle$. (Prob = 1.0).
+- **`n_ctrl = 1`**: 2 Modes.
+- **`n_ctrl = 2`**: 3 Modes.
+This removes the computational overhead of simulating unused control modes and correctly handles the vacuum baseline.
+
+### Inactive Leaves
+Leaves flagged as **Inactive** (via genotype boolean) are treated as "Empty":
+- They produce a valid `state` vector (Vacuum) but are **skipped** in the mixing logic (treated as identity pass-through or zero-vector depending on context), ensuring they do not affect the main circuit state.
