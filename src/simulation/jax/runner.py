@@ -205,6 +205,23 @@ def jax_get_heralded_state(
     disp_vec = params["disp"]
     hbar = 2.0
 
+    # Ensure params are padded to support max modes (3) for jax.lax.switch branches
+    # This prevents shape mismatches if the genotype was configured with fewer modes
+    # but the static graph traces the n_ctrl=2 branch.
+    MAX_MODES = 3
+
+    pad_r = MAX_MODES - r_vec.shape[0]
+    if pad_r > 0:
+        r_vec = jnp.pad(r_vec, (0, pad_r), constant_values=0.0)
+
+    pad_phases = (MAX_MODES * MAX_MODES) - phases_vec.shape[0]
+    if pad_phases > 0:
+        phases_vec = jnp.pad(phases_vec, (0, pad_phases), constant_values=0.0)
+
+    pad_disp = MAX_MODES - disp_vec.shape[0]
+    if pad_disp > 0:
+        disp_vec = jnp.pad(disp_vec, (0, pad_disp), constant_values=0.0)
+
     def _build_gaussian_moments(N_modes):
         """Build Gaussian moments for N_modes using first N_modes params."""
         # Squeezing symplectic
