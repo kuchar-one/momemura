@@ -360,10 +360,42 @@ def _score_batch_shard(
         params = decoder.decode(g, sim_cutoff)
 
         # 1. Get Leaf States
-        # vmap over leaf_params
+        # Conditionally compute heralded states only for active leaves
+        # Inactive leaves return dummy values that will be ignored by mixing logic
+        leaf_active = params["leaf_active"]
+
+        # Infer dtype from leaf params for consistent output types
+        sample_disp = params["leaf_params"]["disp"]
+        complex_dtype = sample_disp.dtype
+        # JAX uses float64 by default for Python floats (like 1.0)
+        float_dtype = jnp.float64
+
+        def conditional_herald(leaf_p, is_active):
+            """Compute heralded state only if active, otherwise return dummy."""
+
+            def compute(_):
+                return jax_get_heralded_state(
+                    leaf_p, cutoff=sim_cutoff, pnr_max=pnr_max
+                )
+
+            def skip(_):
+                # Return dummy values with matching dtypes
+                dummy_vec = jnp.zeros(sim_cutoff, dtype=complex_dtype)
+                return (
+                    dummy_vec,
+                    jnp.array(0.0, dtype=float_dtype),
+                    jnp.array(1.0, dtype=float_dtype),
+                    jnp.array(0.0, dtype=jnp.float32),  # max_pnr is float32
+                    jnp.array(0.0, dtype=jnp.float32),  # total_pnr is float32
+                    jnp.array(0.0, dtype=float_dtype),
+                )
+
+            return jax.lax.cond(is_active, compute, skip, None)
+
+        # vmap over leaves with active flag
         leaf_vecs, leaf_probs, _, leaf_max_pnrs, leaf_total_pnrs, leaf_modes = jax.vmap(
-            partial(jax_get_heralded_state, cutoff=sim_cutoff, pnr_max=pnr_max)
-        )(params["leaf_params"])
+            conditional_herald
+        )(params["leaf_params"], leaf_active)
 
         # 2. Superblock
         hom_x = params["homodyne_x"]
