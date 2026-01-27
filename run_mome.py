@@ -1927,13 +1927,13 @@ def main():
 
         # Adaptive r_scale based on cutoff:
         # Mean photon number for squeezed vacuum ~ sinh^2(r)
-        # To keep mean photons roughly at cutoff, use r ~ asinh(sqrt(cutoff))
-        r_scale_val = float(np.arcsinh(np.sqrt(args.cutoff)))
+        # To keep mean photons roughly at cutoff/2 (SAFE), use r ~ asinh(sqrt(cutoff/2))
+        r_scale_val = float(np.arcsinh(np.sqrt(args.cutoff / 2.0)))
 
         # Adaptive d_scale based on cutoff:
         # Mean photon number for coherent state ~ |alpha|^2
-        # To keep mean photons at cutoff, use alpha ~ sqrt(cutoff)
-        d_scale_val = float(np.sqrt(args.cutoff))
+        # To keep mean photons at cutoff/2 (SAFE), use alpha ~ sqrt(cutoff/2)
+        d_scale_val = float(np.sqrt(args.cutoff / 2.0))
 
         print(
             f"  - Adaptive r_scale: {r_scale_val:.2f} (mean photons ~ {int(np.sinh(r_scale_val) ** 2)})"
