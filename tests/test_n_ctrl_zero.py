@@ -9,18 +9,18 @@ import pytest
 from src.simulation.jax.runner import jax_get_heralded_state
 
 
-def test_n_ctrl_zero_returns_prob_one():
-    """When n_ctrl=0, the leaf is a single-mode Gaussian with prob=1.0."""
+def test_n_ctrl_zero_returns_vacuum_postselection_prob():
+    """When n_ctrl=0, post-select on vacuum for all control modes, 0 < prob <= 1.0."""
 
     # Create params for a leaf with n_ctrl=0
-    # 3 modes total (1 signal + 2 controls), but n_ctrl=0 means no heralding
+    # 3 modes total (1 signal + 2 controls), but n_ctrl=0 means all pnr=0
     N = 3
     params = {
         "r": jnp.array([0.5, 0.0, 0.0]),  # Some squeezing on signal mode
         "phases": jnp.zeros(N * N),  # Identity unitary
         "disp": jnp.zeros(N, dtype=jnp.complex64),  # No displacement
-        "n_ctrl": jnp.array(0),  # No control modes
-        "pnr": jnp.array([0, 0]),  # PNR values (should be ignored)
+        "n_ctrl": jnp.array(0),  # No control modes used
+        "pnr": jnp.array([0, 0]),  # PNR values (all masked to 0)
     }
 
     cutoff = 10
@@ -30,8 +30,10 @@ def test_n_ctrl_zero_returns_prob_one():
         params, cutoff, pnr_max
     )
 
-    # n_ctrl=0 should give probability 1.0
-    assert np.isclose(float(prob), 1.0, atol=1e-6), f"Expected prob=1.0, got {prob}"
+    # n_ctrl=0 now uses standard heralding path with vacuum post-selection
+    # For squeezed vacuum with no displacement, vacuum prob is high
+    assert float(prob) <= 1.0, f"Expected prob<=1.0, got {prob}"
+    assert float(prob) > 0.0, f"Expected prob>0 for vacuum post-selection, got {prob}"
 
     # max_pnr and total_pnr should be 0
     assert float(max_pnr) == 0.0, f"Expected max_pnr=0, got {max_pnr}"
@@ -204,7 +206,7 @@ def test_n_ctrl_with_nonzero_pnr():
 
 
 if __name__ == "__main__":
-    test_n_ctrl_zero_returns_prob_one()
+    test_n_ctrl_zero_returns_vacuum_postselection_prob()
     test_n_ctrl_nonzero_returns_heralded_prob()
     test_n_ctrl_one_partial_heralding()
     test_n_ctrl_with_nonzero_pnr()

@@ -239,40 +239,6 @@ def jax_get_heralded_state(
     # Heralded probability (conditioned on PNR outcomes)
     prob_heralded = jnp.sum(jnp.abs(vec_heralded) ** 2)
 
-    # --- n_ctrl=0 case: No heralding, use signal mode only ---
-    # For n_ctrl=0, we need the unconditional state of the signal mode.
-    # This is obtained by tracing out control modes (summing over all PNR outcomes).
-    # The signal mode state is the marginal: sum over all control outcomes.
-    # Since each column of H_flat corresponds to a different control outcome,
-    # we sum |amplitude|^2 weighted by outcome probabilities.
-    # Actually, for the pure signal state without heralding:
-    # We sum the squared amplitudes over all control outcomes to get the
-    # reduced density matrix diagonal, but we need the state vector.
-    # For a pure Gaussian state, the reduced state is mixed in general.
-    # However, for the special case of no squeezing correlation between signal
-    # and controls, the signal mode is pure.
-    #
-    # Alternative interpretation: n_ctrl=0 means the circuit has no control
-    # modes connected, so no heralding occurs. The state is just the signal
-    # portion of the Gaussian state, and prob=1.0.
-    #
-    # For simplicity and consistency with the user's interpretation:
-    # n_ctrl=0 -> prob=1.0, state = normalized sum over all control outcomes
-    # (which for uncorrelated Gaussian = signal marginal).
-
-    # Sum amplitudes over all control outcomes (columns of H_flat)
-    # This gives the unnormalized signal state when all control modes are traced out
-    vec_unheralded = jnp.sum(H_flat, axis=1)
-    prob_unheralded_norm = jnp.sum(jnp.abs(vec_unheralded) ** 2)
-
-    # Normalize the unheralded state
-    vec_unheralded_norm = jax.lax.cond(
-        prob_unheralded_norm > 0,
-        lambda _: vec_unheralded / jnp.sqrt(prob_unheralded_norm),
-        lambda _: jnp.zeros_like(vec_unheralded),
-        None,
-    )
-
     # Normalize heralded state
     vec_heralded_norm = jax.lax.cond(
         prob_heralded > 0,
@@ -281,25 +247,14 @@ def jax_get_heralded_state(
         None,
     )
 
-    # Select based on n_ctrl_eff
-    # n_ctrl_eff == 0: use unheralded state with prob=1.0
-    # n_ctrl_eff > 0: use heralded state with computed probability
-    is_unheralded = n_ctrl_eff == 0
-
-    vec_out = jnp.where(is_unheralded, vec_unheralded_norm, vec_heralded_norm)
-    prob_out = jnp.where(is_unheralded, 1.0, prob_heralded)
-
-    # For unheralded case, max_pnr and total_pnr should be 0
-    max_pnr_out = jnp.where(
-        is_unheralded, 0.0, jnp.max(pnr_effective).astype(jnp.float32)
-    )
-    total_pnr_out = jnp.where(
-        is_unheralded, 0.0, jnp.sum(pnr_effective).astype(jnp.float32)
-    )
+    # Always use the heralded path - when n_ctrl=0, pnr_effective is all zeros,
+    # so we post-select on detecting vacuum on all control modes.
+    max_pnr_out = jnp.max(pnr_effective).astype(jnp.float32)
+    total_pnr_out = jnp.sum(pnr_effective).astype(jnp.float32)
 
     return (
-        vec_out,
-        prob_out,
+        vec_heralded_norm,
+        prob_heralded,
         1.0,
         max_pnr_out,
         total_pnr_out,
@@ -364,9 +319,8 @@ def _score_batch_shard(
         # Inactive leaves return dummy values that will be ignored by mixing logic
         leaf_active = params["leaf_active"]
 
-        # Infer dtype from leaf params for consistent output types
-        sample_disp = params["leaf_params"]["disp"]
-        complex_dtype = sample_disp.dtype
+        # Use JAX's dynamic complex dtype (matches herald.py internal dtype)
+        complex_dtype = (jnp.zeros(1) + 1j).dtype
         # JAX uses float64 by default for Python floats (like 1.0)
         float_dtype = jnp.float64
 
