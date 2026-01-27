@@ -186,78 +186,122 @@ def jax_get_heralded_state(
     """
     Computes Herald State from General Gaussian Leaf parameters.
 
-    When n_ctrl=0, returns the signal mode state without heralding (prob=1.0).
-    When n_ctrl>0, computes heralded state conditioned on PNR outcomes.
+    The number of modes is determined by n_ctrl:
+    - n_ctrl=0: 1-mode Gaussian (signal only), no heralding, prob=1.0
+    - n_ctrl=1: 2-mode Gaussian, herald on 1 control mode
+    - n_ctrl=2: 3-mode Gaussian, herald on 2 control modes
     """
-    # 1. Get Gaussian Moments (Whole N-mode state)
-    mu, cov = jax_get_gaussian_moments(params)
+    from src.simulation.jax.herald import (
+        jax_get_full_amplitudes,
+        vacuum_covariance,
+        passive_unitary_to_symplectic,
+        complex_alpha_to_qp,
+    )
 
-    # Extract params needed for masking/indexing
     n_ctrl_eff = params["n_ctrl"]
     pnr_vec = params["pnr"]
-
-    # Infer dimension N from mu
-    N = mu.shape[0] // 2
-    N_C = N - 1
+    r_vec = params["r"]
+    phases_vec = params["phases"]
+    disp_vec = params["disp"]
     hbar = 2.0
 
-    # Import herald functions
-    from src.simulation.jax.herald import jax_get_full_amplitudes
+    def _build_gaussian_moments(N_modes):
+        """Build Gaussian moments for N_modes using first N_modes params."""
+        # Squeezing symplectic
+        r_N = r_vec[:N_modes]
+        exp_minus_r = jnp.exp(-r_N)
+        exp_plus_r = jnp.exp(r_N)
+        S_sq = jnp.diag(jnp.concatenate([exp_minus_r, exp_plus_r]))
 
-    # Control modes indices: 1..N-1 (0 is signal)
-    ctrl_indices_local = jnp.arange(N_C)
-    pnr_effective = jnp.where(ctrl_indices_local < n_ctrl_eff, pnr_vec[:N_C], 0)
+        # Passive unitary (extract N^2 phases for NxN unitary)
+        phases_N = phases_vec[: N_modes * N_modes]
+        U_pass = jax_clements_unitary(phases_N, N_modes)
+        S_pass = passive_unitary_to_symplectic(U_pass)
 
-    # We need to pass max_pnr_tuple.
-    # Since we can't iterate dynamically for tuple creation in JIT if N_C is dynamic,
-    # we assume N_C is static (defined by genotype config `modes`).
+        # Total symplectic
+        S_total = S_pass @ S_sq
 
-    max_pnr_sequence = [pnr_max] * N_C
-    max_pnr_tuple = tuple(max_pnr_sequence)
+        # Displacement
+        disp_N = disp_vec[:N_modes]
+        mu = complex_alpha_to_qp(disp_N, hbar)
 
-    # Compute full amplitudes tensor H (cutoff, pnr_max+1, ..., pnr_max+1)
-    H_full = jax_get_full_amplitudes(mu, cov, max_pnr_tuple, cutoff, hbar)
+        # Covariance
+        cov_vac = vacuum_covariance(N_modes, hbar)
+        cov = S_total @ cov_vac @ S_total.T
 
-    # Extract the slice corresponding to pnr_effective
-    # H_full shape: (cutoff, D_ctrl, D_ctrl, ...) where D_ctrl = pnr_max+1
-    H_flat = H_full.reshape(cutoff, -1)
+        return mu, cov
 
-    D_ctrl = pnr_max + 1
+    def _compute_n0(_):
+        """n_ctrl=0: 1-mode Gaussian, no heralding, prob=1.0"""
+        mu, cov = _build_gaussian_moments(1)
+        # For N=1, use recurrence with empty pnr tuple
+        H = jax_get_full_amplitudes(mu, cov, (), cutoff, hbar)
+        # H has shape (cutoff,) - just the signal amplitudes
+        prob = jnp.sum(jnp.abs(H) ** 2)
+        vec_norm = jax.lax.cond(
+            prob > 0,
+            lambda _: H / jnp.sqrt(prob),
+            lambda _: jnp.zeros(cutoff, dtype=H.dtype),
+            None,
+        )
+        # For 1-mode pure Gaussian, prob should be 1.0
+        return vec_norm, prob, jnp.float32(0.0), jnp.float32(0.0)
 
-    # Compute flat index for [pnr_0, pnr_1, ...]
-    flat_idx = 0
-    for i in range(N_C):
-        p = pnr_effective[i]
-        power = N_C - 1 - i
-        stride = D_ctrl**power
-        flat_idx += (p * stride).astype(jnp.int32)
+    def _compute_n1(_):
+        """n_ctrl=1: 2-mode Gaussian, herald on 1 control mode"""
+        mu, cov = _build_gaussian_moments(2)
+        pnr_tuple = (pnr_max,)
+        H = jax_get_full_amplitudes(mu, cov, pnr_tuple, cutoff, hbar)
+        # H shape: (cutoff, pnr_max+1) - index with pnr[0]
+        pnr_idx = jnp.clip(pnr_vec[0], 0, pnr_max).astype(jnp.int32)
+        vec = H[:, pnr_idx]
+        prob = jnp.sum(jnp.abs(vec) ** 2)
+        vec_norm = jax.lax.cond(
+            prob > 0,
+            lambda _: vec / jnp.sqrt(prob),
+            lambda _: jnp.zeros(cutoff, dtype=vec.dtype),
+            None,
+        )
+        max_pnr = pnr_vec[0].astype(jnp.float32)
+        total_pnr = pnr_vec[0].astype(jnp.float32)
+        return vec_norm, prob, max_pnr, total_pnr
 
-    flat_idx = flat_idx.astype(jnp.int32)
+    def _compute_n2(_):
+        """n_ctrl=2: 3-mode Gaussian, herald on 2 control modes"""
+        mu, cov = _build_gaussian_moments(3)
+        pnr_tuple = (pnr_max, pnr_max)
+        H = jax_get_full_amplitudes(mu, cov, pnr_tuple, cutoff, hbar)
+        # H shape: (cutoff, pnr_max+1, pnr_max+1)
+        pnr_0 = jnp.clip(pnr_vec[0], 0, pnr_max).astype(jnp.int32)
+        pnr_1 = jnp.clip(pnr_vec[1], 0, pnr_max).astype(jnp.int32)
+        vec = H[:, pnr_0, pnr_1]
+        prob = jnp.sum(jnp.abs(vec) ** 2)
+        vec_norm = jax.lax.cond(
+            prob > 0,
+            lambda _: vec / jnp.sqrt(prob),
+            lambda _: jnp.zeros(cutoff, dtype=vec.dtype),
+            None,
+        )
+        max_pnr = jnp.maximum(pnr_vec[0], pnr_vec[1]).astype(jnp.float32)
+        total_pnr = (pnr_vec[0] + pnr_vec[1]).astype(jnp.float32)
+        return vec_norm, prob, max_pnr, total_pnr
 
-    vec_heralded = H_flat[:, flat_idx]
+    # Dispatch based on n_ctrl
+    # n_ctrl_eff is 0, 1, or 2 (clipped to valid range)
+    n_ctrl_clamped = jnp.clip(n_ctrl_eff, 0, 2).astype(jnp.int32)
 
-    # Heralded probability (conditioned on PNR outcomes)
-    prob_heralded = jnp.sum(jnp.abs(vec_heralded) ** 2)
-
-    # Normalize heralded state
-    vec_heralded_norm = jax.lax.cond(
-        prob_heralded > 0,
-        lambda _: vec_heralded / jnp.sqrt(prob_heralded),
-        lambda _: jnp.zeros_like(vec_heralded),
+    vec_out, prob_out, max_pnr_out, total_pnr_out = jax.lax.switch(
+        n_ctrl_clamped,
+        [_compute_n0, _compute_n1, _compute_n2],
         None,
     )
 
-    # Always use the heralded path - when n_ctrl=0, pnr_effective is all zeros,
-    # so we post-select on detecting vacuum on all control modes.
-    max_pnr_out = jnp.max(pnr_effective).astype(jnp.float32)
-    total_pnr_out = jnp.sum(pnr_effective).astype(jnp.float32)
-
     return (
-        vec_heralded_norm,
-        prob_heralded,
+        vec_out,
+        prob_out,
         1.0,
-        max_pnr_out,
-        total_pnr_out,
+        max_pnr_out.astype(jnp.float32),
+        total_pnr_out.astype(jnp.float32),
         1.0,
     )
 
