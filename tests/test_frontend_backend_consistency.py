@@ -48,7 +48,7 @@ def test_frontend_backend_consistency_n_ctrl_zero():
         "final_gauss": {"r": 0.0, "phi": 0.0, "varphi": 0.0, "disp": 0.0 + 0j},
     }
 
-    cutoff = 10
+    cutoff = 15
 
     # Direct backend call for leaf 0
     backend_params = {
