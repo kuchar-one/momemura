@@ -94,10 +94,13 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
                 # N² = n_phases, so N = sqrt(n_phases)
                 import math
 
-                N = int(math.sqrt(n_phases))
+                # Use effective N based on n_ctrl (backend physics)
+                # n_ctrl=0 -> 1 mode, n_ctrl=1 -> 2 modes
+                N = n_ctrl + 1
 
-                if N > 0 and N * N == n_phases:
-                    # Number of BS = N(N-1)/2, each has 2 params = N(N-1)
+                if N * N <= n_phases:
+                    # Truncate phases to match backend usage (first N*N params)
+                    phases_list = phases_list[: N * N]
                     n_bs_params = N * (N - 1)
 
                     bs_params = phases_list[:n_bs_params]
