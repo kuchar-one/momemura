@@ -466,6 +466,7 @@ def _score_batch_shard(
         # --- Dynamic Limits Logic ---
         leakage_penalty = 0.0
         leakage_val = 0.0
+        structure_penalty = 0.0
 
         if use_correction:
             probs = jnp.abs(final_state_transformed) ** 2
@@ -480,6 +481,21 @@ def _score_batch_shard(
                 norm_trunc > 1e-9, lambda x: x / norm_trunc, lambda x: x, state_trunc
             )
             leakage_penalty = leakage_val * 2.0
+
+            # --- Structural Fidelity Penalty ---
+            # Measures probability mass in \"danger zone\" (upper half of Fock space)
+            # States with significant mass near cutoff have truncation-induced fidelity loss
+            # which causes different results at different cutoffs (the root cause of the
+            # PNR=0 non-Gaussianity bug we diagnosed).
+            half_cutoff = cutoff // 2
+            probs_trunc = jnp.abs(state_trunc) ** 2
+            danger_mass = jnp.sum(probs_trunc[half_cutoff:])
+            # Combined linear + quadratic penalty:
+            # - Linear term catches moderate danger (>5% mass)
+            # - Quadratic term severely penalizes extreme cases
+            # danger_mass=0.14 (like solution 3711) -> penalty ~0.34
+            # danger_mass=0.30 -> penalty ~1.2
+            structure_penalty = danger_mass * 1.0 + (danger_mass**2) * 10.0
         else:
             state_eval = final_state_transformed
 
@@ -535,13 +551,20 @@ def _score_batch_shard(
         d_exp = w_exp * jnp.abs(exp_val - z_star_exp)
         d_prob = w_prob * jnp.abs(log_prob - z_star_prob)
 
-        loss_val = jnp.maximum(d_exp, d_prob) + rho * (d_exp + d_prob) + leakage_penalty
+        loss_val = (
+            jnp.maximum(d_exp, d_prob)
+            + rho * (d_exp + d_prob)
+            + leakage_penalty
+            + structure_penalty
+        )
 
         # Construct Fitness: [-Exp, -LogP, -Complex, -Photons]
         # Use computed loss_val which includes penalty? or separate?
         # MOME usually uses penalized expectation.
         final_exp = (
-            jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf) + leakage_penalty
+            jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf)
+            + leakage_penalty
+            + structure_penalty
         )
 
         # Fitnesses for QDax (Maximization)
@@ -557,6 +580,7 @@ def _score_batch_shard(
             "fitness_rest": fitness_rest,
             "descriptor": descriptor,
             "leakage": leakage_val,
+            "structure_penalty": structure_penalty,
             "raw_expectation": raw_exp_val,
             "joint_probability": joint_prob,
             "pnr_cost": total_photons,
