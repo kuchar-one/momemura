@@ -1927,13 +1927,15 @@ def main():
 
         # Adaptive r_scale based on cutoff:
         # Mean photon number for squeezed vacuum ~ sinh^2(r)
-        # To keep mean photons roughly at cutoff/2 (SAFE), use r ~ asinh(sqrt(cutoff/2))
-        r_scale_val = float(np.arcsinh(np.sqrt(args.cutoff / 2.0)))
+        # To keep mean photons at cutoff/3, use r ~ asinh(sqrt(cutoff/3))
+        # This leaves ~67% of Fock space as headroom for mixing
+        r_scale_val = float(np.arcsinh(np.sqrt(args.cutoff / 3.0)))
 
         # Adaptive d_scale based on cutoff:
         # Mean photon number for coherent state ~ |alpha|^2
-        # To keep mean photons at cutoff/2 (SAFE), use alpha ~ sqrt(cutoff/2)
-        d_scale_val = float(np.sqrt(args.cutoff / 2.0))
+        # With complex alpha, max |alpha|^2 = 2 * d_scale^2 when both real/imag maxed
+        # To keep mean photons at cutoff/3, use d_scale ~ sqrt(cutoff/6)
+        d_scale_val = float(np.sqrt(args.cutoff / 6.0))
 
         print(
             f"  - Adaptive r_scale: {r_scale_val:.2f} (mean photons ~ {int(np.sinh(r_scale_val) ** 2)})"
