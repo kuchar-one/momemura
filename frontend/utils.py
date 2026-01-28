@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Force JAX to use CPU backend for frontend visualization
+# This avoids GPU/CUDA issues and ensures consistent behavior
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import numpy as np
 import qutip as qt
 from typing import List, Tuple, Dict, Any
