@@ -412,6 +412,47 @@ def _score_batch_shard(
             conditional_herald
         )(params["leaf_params"], leaf_active)
 
+        # --- Leaf Upper-Mass Penalty ---
+        # Check leaf states at BASE cutoff (not sim_cutoff) for truncation issues
+        # This catches high-photon leaf states that will cause divergent evolution
+        # through the mixing tree due to BS unitary truncation
+        leaf_penalty = 0.0
+        if use_correction:
+            # Compute leaf states at base cutoff
+            def compute_base_leaf(leaf_p, is_active):
+                def compute(_):
+                    vec, _, _, _, _, _ = jax_get_heralded_state(
+                        leaf_p, cutoff=cutoff, pnr_max=pnr_max
+                    )
+                    return vec
+
+                def skip(_):
+                    return jnp.zeros(cutoff, dtype=complex_dtype)
+
+                return jax.lax.cond(is_active, compute, skip, None)
+
+            base_leaf_vecs = jax.vmap(compute_base_leaf)(
+                params["leaf_params"], leaf_active
+            )
+
+            # Compute upper mass for each active leaf at base cutoff
+            half_cutoff = cutoff // 2
+
+            def leaf_upper_mass(vec, is_active):
+                probs = jnp.abs(vec) ** 2
+                upper = jnp.sum(probs[half_cutoff:])
+                # Only count for active leaves
+                return jnp.where(is_active, upper, 0.0)
+
+            leaf_upper_masses = jax.vmap(leaf_upper_mass)(base_leaf_vecs, leaf_active)
+            max_leaf_upper = jnp.max(leaf_upper_masses)
+
+            # Penalty: heavy penalty for any leaf with >5% upper mass
+            # max_leaf_upper=0.10 -> penalty ~0.25
+            # max_leaf_upper=0.20 -> penalty ~0.60
+            # max_leaf_upper=0.40 -> penalty ~2.0
+            leaf_penalty = max_leaf_upper * 1.0 + (max_leaf_upper**2) * 10.0
+
         # 2. Superblock
         hom_x = params["homodyne_x"]
         hom_win = params["homodyne_window"]
@@ -556,6 +597,7 @@ def _score_batch_shard(
             + rho * (d_exp + d_prob)
             + leakage_penalty
             + structure_penalty
+            + leaf_penalty
         )
 
         # Construct Fitness: [-Exp, -LogP, -Complex, -Photons]
@@ -565,6 +607,7 @@ def _score_batch_shard(
             jnp.where(joint_prob > 1e-40, raw_exp_val, jnp.inf)
             + leakage_penalty
             + structure_penalty
+            + leaf_penalty
         )
 
         # Fitnesses for QDax (Maximization)
@@ -581,6 +624,7 @@ def _score_batch_shard(
             "descriptor": descriptor,
             "leakage": leakage_val,
             "structure_penalty": structure_penalty,
+            "leaf_penalty": leaf_penalty,
             "raw_expectation": raw_exp_val,
             "joint_probability": joint_prob,
             "pnr_cost": total_photons,
