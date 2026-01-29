@@ -1942,8 +1942,8 @@ def main():
         # Homodyne projection at position x selects Hermite functions phi_n(x)
         # For large |x|, this concentrates probability in high Fock states
         # After BS mixing, this can create states with mean_n >> cutoff/2
-        # Same limit as d_scale keeps homodyne safe
-        hx_scale_val = float(np.sqrt(args.cutoff / 6.0))
+        # More conservative than d_scale since multiple homodyne detections compound
+        hx_scale_val = float(np.sqrt(args.cutoff / 8.0))
 
         print(
             f"  - Adaptive r_scale: {r_scale_val:.2f} (mean photons ~ {int(np.sinh(r_scale_val) ** 2)})"
@@ -1952,7 +1952,7 @@ def main():
             f"  - Adaptive d_scale: {d_scale_val:.2f} (mean photons ~ {int(d_scale_val**2)})"
         )
         print(
-            f"  - Adaptive hx_scale: {hx_scale_val:.2f} (same as d_scale for safe projection)"
+            f"  - Adaptive hx_scale: {hx_scale_val:.2f} (more conservative for compounding detections)"
         )
 
         # Determine pnr_max:
