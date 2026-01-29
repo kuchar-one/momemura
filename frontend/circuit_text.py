@@ -192,8 +192,18 @@ def describe_preparation_circuit(params: Dict[str, Any], genotype_name="A") -> s
         theta = utils.to_scalar(mix_params[mix_idx][0])
         phi = utils.to_scalar(mix_params[mix_idx][1])
 
+        # Get homodyne X for this node if available
+        hx_str = ""
+        if "homodyne_x" in params:
+            hx_val = params["homodyne_x"]
+            if hasattr(hx_val, "__len__") and not isinstance(hx_val, str):
+                # Vector of homodyne X values, one per node
+                if mix_idx < len(hx_val):
+                    hx = utils.to_scalar(hx_val[mix_idx])
+                    hx_str = f", x={hx:.3f}"
+
         # Action is implicit
-        bs_desc = f"BS(θ={theta:.2f}, φ={phi:.2f})"
+        bs_desc = f"BS(θ={theta:.2f}, φ={phi:.2f}){hx_str}"
         lines.append(f"- **Node {mix_idx}** (Inputs {in_A}, {in_B}): {bs_desc}")
 
     lines.append("\n#### 2. Mixing Layers")
