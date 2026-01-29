@@ -1919,6 +1919,7 @@ def main():
     # Dynamic Limits Override
     r_scale_val = args.r_scale
     d_scale_val = args.d_scale
+    hx_scale_val = args.hx_scale
     corr_cutoff_val = args.correction_cutoff
     pnr_max_val = args.pnr_max
 
@@ -1937,11 +1938,21 @@ def main():
         # To keep mean photons at cutoff/3, use d_scale ~ sqrt(cutoff/6)
         d_scale_val = float(np.sqrt(args.cutoff / 6.0))
 
+        # Adaptive hx_scale based on cutoff:
+        # Homodyne projection at position x selects Hermite functions phi_n(x)
+        # For large |x|, this concentrates probability in high Fock states
+        # After BS mixing, this can create states with mean_n >> cutoff/2
+        # Same limit as d_scale keeps homodyne safe
+        hx_scale_val = float(np.sqrt(args.cutoff / 6.0))
+
         print(
             f"  - Adaptive r_scale: {r_scale_val:.2f} (mean photons ~ {int(np.sinh(r_scale_val) ** 2)})"
         )
         print(
             f"  - Adaptive d_scale: {d_scale_val:.2f} (mean photons ~ {int(d_scale_val**2)})"
+        )
+        print(
+            f"  - Adaptive hx_scale: {hx_scale_val:.2f} (same as d_scale for safe projection)"
         )
 
         # Determine pnr_max:
@@ -1975,7 +1986,7 @@ def main():
         "depth": args.depth,
         "r_scale": r_scale_val,
         "d_scale": d_scale_val,
-        "hx_scale": args.hx_scale,
+        "hx_scale": hx_scale_val,
         "window": args.window,
         "pnr_max": pnr_max_val,
         "modes": args.modes,
