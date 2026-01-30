@@ -524,18 +524,82 @@ def _score_batch_shard(
             leakage_penalty = leakage_val * 2.0
 
             # --- Structural Fidelity Penalty ---
-            # Measures probability mass in \"danger zone\" (upper half of Fock space)
-            # States with significant mass near cutoff have truncation-induced fidelity loss
-            # which causes different results at different cutoffs (the root cause of the
-            # PNR=0 non-Gaussianity bug we diagnosed).
+            # Run superblock at BASE cutoff and check native upper_mass.
+            # This catches divergence from intermediate mixing/homodyne operations
+            # that produce high-n states even when input leaves are fine.
+            # Example: Solution 511 has leaves with mean_n<5, but after BS+homodyne
+            # mixing, one node has mean_n=10.14 and 14% upper mass.
+
+            # Compute leaf states at base cutoff
+            def compute_base_leaf_for_structure(leaf_p, is_active):
+                def compute(_):
+                    return jax_get_heralded_state(
+                        leaf_p, cutoff=cutoff, pnr_max=pnr_max
+                    )
+
+                def skip(_):
+                    return (
+                        jnp.zeros(cutoff, dtype=complex_dtype),
+                        jnp.array(0.0, dtype=float_dtype),
+                        jnp.array(1.0, dtype=float_dtype),
+                        jnp.array(0.0, dtype=jnp.float32),
+                        jnp.array(0.0, dtype=jnp.float32),
+                        jnp.array(0.0, dtype=float_dtype),
+                    )
+
+                return jax.lax.cond(is_active, compute, skip, None)
+
+            (
+                base_leaf_vecs_s,
+                base_leaf_probs_s,
+                _,
+                base_leaf_max_pnrs_s,
+                base_leaf_total_pnrs_s,
+                base_leaf_modes_s,
+            ) = jax.vmap(compute_base_leaf_for_structure)(
+                params["leaf_params"], leaf_active
+            )
+
+            # Compute phi_vec at base cutoff
+            hom_xs_base = jnp.atleast_1d(hom_x)
+            phi_mat_base = jax_hermite_phi_matrix(hom_xs_base, cutoff)
+            if jnp.ndim(hom_x) == 0:
+                phi_vec_base = phi_mat_base[:, 0]
+            else:
+                phi_vec_base = phi_mat_base.T
+
+            V_matrix_base = jnp.zeros((cutoff, 1))
+            dx_weights_base = jnp.zeros(1)
+
+            (base_final_state, _, _, _, _, _, _) = jax_superblock(
+                base_leaf_vecs_s,
+                base_leaf_probs_s,
+                params["leaf_active"],
+                base_leaf_max_pnrs_s,
+                base_leaf_total_pnrs_s,
+                base_leaf_modes_s,
+                params["mix_params"],
+                hom_x,
+                hom_win,
+                hom_win,
+                phi_vec_base,
+                V_matrix_base,
+                dx_weights_base,
+                cutoff,
+                True,
+                False,
+                False,
+            )
+
+            # Check upper mass of state BEFORE final Gaussian
+            # The final Gaussian can hide divergence (e.g., squeezing transforms
+            # a high-n state to appear low-n). We must catch the issue at the
+            # mixing tree output, not after the final transformation.
             half_cutoff = cutoff // 2
-            probs_trunc = jnp.abs(state_trunc) ** 2
-            danger_mass = jnp.sum(probs_trunc[half_cutoff:])
-            # Combined linear + quadratic penalty:
-            # - Linear term catches moderate danger (>5% mass)
-            # - Quadratic term severely penalizes extreme cases
-            # danger_mass=0.14 (like solution 3711) -> penalty ~0.34
-            # danger_mass=0.30 -> penalty ~1.2
+            probs_base = jnp.abs(base_final_state) ** 2
+            danger_mass = jnp.sum(probs_base[half_cutoff:])
+
+            # Combined linear + quadratic penalty
             structure_penalty = danger_mass * 1.0 + (danger_mass**2) * 10.0
         else:
             state_eval = final_state_transformed
