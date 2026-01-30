@@ -342,6 +342,7 @@ def _score_batch_shard(
     correction_cutoff: int = None,
     pnr_max: int = 3,
     gs_eig: float = -4.0,  # Default safe-ish value if not passed
+    gaussian_limit: float = 2.0 / 3.0,  # Gaussian achievable limit (2/3 for GKP)
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     JIT-compiled scoring function for a single batch shard.
@@ -451,7 +452,9 @@ def _score_batch_shard(
             # max_leaf_upper=0.10 -> penalty ~0.25
             # max_leaf_upper=0.20 -> penalty ~0.60
             # max_leaf_upper=0.40 -> penalty ~2.0
-            leaf_penalty = max_leaf_upper * 1.0 + (max_leaf_upper**2) * 10.0
+            # DEACTIVATED: Now relying on conservative hx_scale instead
+            # leaf_penalty = max_leaf_upper * 1.0 + (max_leaf_upper**2) * 10.0
+            leaf_penalty = 0.0  # Deactivated
 
         # 2. Superblock
         hom_x = params["homodyne_x"]
@@ -600,7 +603,9 @@ def _score_batch_shard(
             danger_mass = jnp.sum(probs_base[half_cutoff:])
 
             # Combined linear + quadratic penalty
-            structure_penalty = danger_mass * 1.0 + (danger_mass**2) * 10.0
+            # DEACTIVATED: Now relying on conservative hx_scale instead
+            # structure_penalty = danger_mass * 1.0 + (danger_mass**2) * 10.0
+            structure_penalty = 0.0  # Deactivated
         else:
             state_eval = final_state_transformed
 
@@ -630,6 +635,17 @@ def _score_batch_shard(
         penalty = jnp.where(violation > 1e-4, jnp.inf, 0.0)
 
         log_prob = log_prob + penalty
+
+        # --- Physics-Based Artifact Penalty ---
+        # If expectation < gaussian_limit AND no photons detected, this is an artifact.
+        # You cannot beat the Gaussian limit without non-Gaussian resources (PNR detection).
+        # This catches cases where numerical artifacts create false sub-Gaussian states.
+        is_below_gaussian = exp_val < gaussian_limit
+        no_photons_detected = total_sum_pnr < 0.5  # Effectively 0
+        is_artifact = jnp.logical_and(is_below_gaussian, no_photons_detected)
+        artifact_penalty = jnp.where(is_artifact, jnp.inf, 0.0)
+        log_prob = log_prob + artifact_penalty
+
         total_photons = total_sum_pnr
 
         # Loss Function for Gradient Methods
@@ -732,6 +748,7 @@ def jax_scoring_fn_batch(
     correction_cutoff: int = None,
     pnr_max: int = 3,
     gs_eig: float = -4.0,
+    gaussian_limit: float = 2.0 / 3.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Batched scoring function for QDax.
@@ -754,6 +771,7 @@ def jax_scoring_fn_batch(
             correction_cutoff,
             pnr_max,
             gs_eig,
+            gaussian_limit,
         )
 
     # Multi-GPU Logic
@@ -774,8 +792,8 @@ def jax_scoring_fn_batch(
     # _score_batch_shard returns (fit, desc, extras)
     pmapped_fn = jax.pmap(
         _score_batch_shard,
-        in_axes=(0, None, None, None, None, None, None, None),
-        static_broadcasted_argnums=(1, 3, 4, 5, 6, 7),
+        in_axes=(0, None, None, None, None, None, None, None, None),
+        static_broadcasted_argnums=(1, 3, 4, 5, 6, 7, 8),
     )
 
     if genotype_config is not None and isinstance(genotype_config, dict):
@@ -792,6 +810,7 @@ def jax_scoring_fn_batch(
         correction_cutoff,
         pnr_max,
         gs_eig,
+        gaussian_limit,
     )
 
     # Reshape results
