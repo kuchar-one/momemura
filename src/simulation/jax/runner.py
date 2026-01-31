@@ -640,11 +640,13 @@ def _score_batch_shard(
         # If expectation < gaussian_limit AND no photons detected, this is an artifact.
         # You cannot beat the Gaussian limit without non-Gaussian resources (PNR detection).
         # This catches cases where numerical artifacts create false sub-Gaussian states.
+        # Penalty on BOTH objectives: exp_val=inf (bad expectation) and log_prob=inf (zero probability)
         is_below_gaussian = exp_val < gaussian_limit
         no_photons_detected = total_sum_pnr < 0.5  # Effectively 0
         is_artifact = jnp.logical_and(is_below_gaussian, no_photons_detected)
         artifact_penalty = jnp.where(is_artifact, jnp.inf, 0.0)
-        log_prob = log_prob + artifact_penalty
+        exp_val = exp_val + artifact_penalty  # Make expectation infinitely bad
+        log_prob = log_prob + artifact_penalty  # Make probability zero (inf NLL)
 
         total_photons = total_sum_pnr
 
