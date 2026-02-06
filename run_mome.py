@@ -1746,6 +1746,27 @@ def run(
     # Pass history_fronts if available (only in qdax mode)
     h_fronts = locals().get("history_fronts", None)
 
+    # --- Final Archive Validation (Option F) ---
+    # Validate all archive solutions at dual cutoffs to remove numerical artifacts
+    if correction_cutoff is not None and cutoff is not None:
+        try:
+            from src.utils.archive_validator import final_archive_validation
+
+            print("\n=== Final Archive Validation ===")
+            repertoire, num_removed = final_archive_validation(
+                repertoire=repertoire,
+                base_cutoff=cutoff,
+                correction_cutoff=correction_cutoff,
+                genotype_name=genotype,
+                genotype_config=genotype_config,
+                pnr_max=3,  # Fixed default for artifact validation
+                fidelity_threshold=0.9,
+                max_iterations=5,
+            )
+            print(f"Archive validation complete. Removed {num_removed} artifacts.\n")
+        except Exception as e:
+            print(f"Archive validation failed (non-fatal): {e}")
+
     result = OptimizationResult(
         repertoire=repertoire,
         history=final_metrics,
