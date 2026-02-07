@@ -1425,6 +1425,36 @@ def run(
                 except Exception as e:
                     print(f"Checkpoint prep failed: {e}")
 
+                # --- Periodic Archive Sweep (Option D) ---
+                # Validate archive every 250 generations to remove numerical artifacts
+                sweep_interval = 250
+                if (
+                    correction_cutoff is not None
+                    and completed % sweep_interval == 0
+                    and completed > 0
+                ):
+                    try:
+                        from src.utils.archive_validator import (
+                            validate_and_clean_archive,
+                        )
+
+                        print(f"\n=== Periodic Archive Sweep (gen {completed}) ===")
+                        repertoire, num_removed = validate_and_clean_archive(
+                            repertoire=repertoire,
+                            base_cutoff=cutoff,
+                            correction_cutoff=correction_cutoff,
+                            genotype_name=genotype,
+                            genotype_config=genotype_config,
+                            pnr_max=3,
+                            fidelity_threshold=0.9,
+                        )
+                        if num_removed > 0:
+                            print(f"Removed {num_removed} artifacts.\n")
+                        else:
+                            print("Archive is clean.\n")
+                    except Exception as e:
+                        print(f"Periodic sweep failed (non-fatal): {e}")
+
                 # ETR Calculation
 
                 # Capture Pareto Front Snapshot

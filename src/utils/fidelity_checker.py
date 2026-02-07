@@ -69,7 +69,12 @@ def compute_state_at_cutoff(
     """
     from src.genotypes.genotypes import get_genotype_decoder
 
-    decoder = get_genotype_decoder(genotype_name, cutoff, genotype_config)
+    # Extract depth from config (default to 3 if not specified)
+    depth = 3
+    if genotype_config is not None and "depth" in genotype_config:
+        depth = genotype_config["depth"]
+
+    decoder = get_genotype_decoder(genotype_name, depth, genotype_config)
     params = decoder.decode(genotype, cutoff)
 
     # Get heralded leaf states
