@@ -1677,6 +1677,46 @@ def run(
                     all_fitnesses_history.append(fitnesses)
                     all_descriptors_history.append(descriptors)
 
+                # --- Mid-Run Fidelity Validation (Single Mode) ---
+                # Every 250 iterations, validate genotypes and replace artifacts
+                sweep_interval = 250
+                if correction_cutoff is not None and (i + 1) % sweep_interval == 0:
+                    try:
+                        from src.utils.fidelity_checker import validate_genotype
+
+                        print(f"\n=== Mid-Run Fidelity Check (iter {i + 1}) ===")
+                        num_invalid = 0
+                        genotype_list = list(genotypes)  # Copy to modify
+
+                        for idx in range(len(genotype_list)):
+                            g = np.array(genotype_list[idx])
+                            is_valid, fid = validate_genotype(
+                                g,
+                                cutoff,
+                                correction_cutoff,
+                                genotype,
+                                genotype_config=genotype_config,
+                                fidelity_threshold=0.9,
+                                pnr_max=3,
+                            )
+                            if not is_valid:
+                                num_invalid += 1
+                                # Replace with random noise (scaled small)
+                                genotype_list[idx] = jnp.array(
+                                    np.random.uniform(-0.3, 0.3, g.shape)
+                                )
+
+                        if num_invalid > 0:
+                            genotypes = jnp.stack(genotype_list)
+                            opt_state = optimizer.init(genotypes)  # Re-init optimizer
+                            print(
+                                f"Replaced {num_invalid}/{pop_size} invalid genotypes.\n"
+                            )
+                        else:
+                            print("All genotypes valid.\n")
+                    except Exception as e:
+                        print(f"Mid-run validation failed (non-fatal): {e}")
+
                 # 2. Update (Now apply step to move to next)
                 genotypes, opt_state = update_step(genotypes, grads, opt_state)
         except KeyboardInterrupt:
