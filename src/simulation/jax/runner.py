@@ -737,6 +737,7 @@ def _score_batch_shard(
         "raw_expectation": aux_batch["raw_expectation"],
         "joint_probability": aux_batch["joint_probability"],
         "pnr_cost": aux_batch["pnr_cost"],
+        "final_state": aux_batch["final_state"],
     }
 
     return fitnesses, descriptors, extras
