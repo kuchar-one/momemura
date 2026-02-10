@@ -710,6 +710,7 @@ def _score_batch_shard(
             "raw_expectation": raw_exp_val,
             "joint_probability": joint_prob,
             "pnr_cost": total_photons,
+            "final_state": state_eval,  # Normalized state at base cutoff dim
         }
 
         return jnp.real(loss_val), aux

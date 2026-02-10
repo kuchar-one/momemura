@@ -1682,33 +1682,29 @@ def run(
                 sweep_interval = 250
                 if correction_cutoff is not None and (i + 1) % sweep_interval == 0:
                     try:
-                        from src.utils.fidelity_checker import validate_genotype
+                        from src.utils.archive_validator import batch_validate_genotypes
 
                         print(f"\n=== Mid-Run Fidelity Check (iter {i + 1}) ===")
-                        num_invalid = 0
-                        genotype_list = list(genotypes)  # Copy to modify
+                        valid_mask, fidelities = batch_validate_genotypes(
+                            genotypes,
+                            cutoff,
+                            correction_cutoff,
+                            genotype,
+                            genotype_config=genotype_config,
+                            pnr_max=3,
+                            fidelity_threshold=0.9,
+                        )
 
-                        for idx in range(len(genotype_list)):
-                            g = np.array(genotype_list[idx])
-                            is_valid, fid = validate_genotype(
-                                g,
-                                cutoff,
-                                correction_cutoff,
-                                genotype,
-                                genotype_config=genotype_config,
-                                fidelity_threshold=0.9,
-                                pnr_max=3,
-                            )
-                            if not is_valid:
-                                num_invalid += 1
-                                # Replace with random noise (scaled small)
-                                genotype_list[idx] = jnp.array(
-                                    np.random.uniform(-0.3, 0.3, g.shape)
-                                )
-
+                        num_invalid = int(jnp.sum(~valid_mask))
                         if num_invalid > 0:
-                            genotypes = jnp.stack(genotype_list)
-                            opt_state = optimizer.init(genotypes)  # Re-init optimizer
+                            # Replace invalid genotypes with random noise
+                            replacement = jnp.array(
+                                np.random.uniform(-0.3, 0.3, genotypes.shape)
+                            )
+                            genotypes = jnp.where(
+                                valid_mask[:, None], genotypes, replacement
+                            )
+                            opt_state = optimizer.init(genotypes)
                             print(
                                 f"Replaced {num_invalid}/{pop_size} invalid genotypes.\n"
                             )
