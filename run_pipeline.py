@@ -166,19 +166,30 @@ def main():
     parser.add_argument(
         "--alpha-probability", type=float, help="Ignored (Pipeline controls weights)"
     )
+    parser.add_argument(
+        "--single-run",
+        action="store_true",
+        help="Run only one single-objective instance instead of two parallely",
+    )
     args, remainder = parser.parse_known_args()
 
     # If user asked for help
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
-        print("Usage: python run_pipeline.py [any run_mome.py arguments...]")
+        print(
+            "Usage: python run_pipeline.py [--single-run] [any run_mome.py arguments...]"
+        )
         sys.exit(0)
 
     base_mome_args = remainder
 
+    # Determine Parallelism
+    num_parallel = 1 if args.single_run else SINGLE_OBJ_PARALLELISM
+
     print("=" * 60)
     print("Starting Optimization Pipeline")
     print(f"Pass-through Arguments: {' '.join(base_mome_args)}")
+    print(f"Single-Objective Parallelism: {num_parallel}")
     print(f"Steps: {STEPS} (Splits from 90-10 to 0-100)")
     print("=" * 60)
 
@@ -193,7 +204,7 @@ def main():
 
         # --- Phase 1: Single Objective (Parallel) ---
         print(
-            f"[Pipeline] Launching {SINGLE_OBJ_PARALLELISM} Parallel Single-Objective Runs..."
+            f"[Pipeline] Launching {num_parallel} {'Parallel' if num_parallel > 1 else 'Single'} Single-Objective Run(s)..."
         )
 
         current_processes = []
@@ -210,7 +221,7 @@ def main():
             "--global-seed-scan",
         ]
 
-        for k in range(SINGLE_OBJ_PARALLELISM):
+        for k in range(num_parallel):
             # Unique Seed Logic
             worker_seed = int(time.time()) + i * 100 + k
             worker_args = list(single_obj_args)
