@@ -10,6 +10,64 @@ import jax.numpy as jnp
 from typing import Dict, Tuple, Any
 
 
+VALIDATION_CHUNK_SIZE = 32  # Process genotypes in small chunks to fit in VRAM
+
+
+def _compute_chunk_fidelities(
+    genotypes_chunk: jnp.ndarray,
+    base_cutoff: int,
+    correction_cutoff: int,
+    operator: jnp.ndarray,
+    genotype_name: str,
+    genotype_config: Dict = None,
+    pnr_max: int = 3,
+) -> np.ndarray:
+    """Compute fidelities for a single chunk of genotypes."""
+    from src.simulation.jax.runner import jax_scoring_fn_batch
+
+    # Run 1: Score at base_cutoff only (no correction)
+    _, _, extras_base = jax_scoring_fn_batch(
+        genotypes_chunk,
+        base_cutoff,
+        operator,
+        genotype_name=genotype_name,
+        genotype_config=genotype_config,
+        correction_cutoff=None,
+        pnr_max=pnr_max,
+    )
+    states_base = extras_base["final_state"]
+
+    # Run 2: Score at base_cutoff WITH correction
+    _, _, extras_corr = jax_scoring_fn_batch(
+        genotypes_chunk,
+        base_cutoff,
+        operator,
+        genotype_name=genotype_name,
+        genotype_config=genotype_config,
+        correction_cutoff=correction_cutoff,
+        pnr_max=pnr_max,
+    )
+    states_corr = extras_corr["final_state"]
+
+    # Vectorized fidelity: |<s1|s2>|^2
+    norms_base = jnp.linalg.norm(states_base, axis=1, keepdims=True)
+    norms_corr = jnp.linalg.norm(states_corr, axis=1, keepdims=True)
+
+    safe_norms_base = jnp.maximum(norms_base, 1e-12)
+    safe_norms_corr = jnp.maximum(norms_corr, 1e-12)
+
+    states_base_n = states_base / safe_norms_base
+    states_corr_n = states_corr / safe_norms_corr
+
+    overlaps = jnp.sum(jnp.conj(states_base_n) * states_corr_n, axis=1)
+    fidelities = jnp.abs(overlaps) ** 2
+
+    valid = (norms_base.squeeze() > 1e-10) & (norms_corr.squeeze() > 1e-10)
+    fidelities = jnp.where(valid, fidelities, 0.0)
+
+    return np.array(fidelities)
+
+
 def batch_compute_fidelities(
     genotypes: jnp.ndarray,
     base_cutoff: int,
@@ -17,12 +75,12 @@ def batch_compute_fidelities(
     genotype_name: str,
     genotype_config: Dict = None,
     pnr_max: int = 3,
+    chunk_size: int = VALIDATION_CHUNK_SIZE,
 ) -> np.ndarray:
     """
     Compute fidelity for a batch of genotypes using GPU-batched scoring.
 
-    Runs jax_scoring_fn_batch twice (base + correction cutoff) and computes
-    fidelity between the resulting states vectorized.
+    Processes genotypes in chunks to avoid VRAM exhaustion.
 
     Args:
         genotypes: Batch of genotypes, shape (N, genome_dim).
@@ -31,61 +89,31 @@ def batch_compute_fidelities(
         genotype_name: Name of genotype type.
         genotype_config: Optional genotype configuration.
         pnr_max: Maximum PNR value.
+        chunk_size: Number of genotypes per chunk (default: 32).
 
     Returns:
         Array of fidelities, shape (N,).
     """
-    from src.simulation.jax.runner import jax_scoring_fn_batch
-
-    # Dummy operator (not used for fidelity, but required by scoring fn)
+    n_total = genotypes.shape[0]
     operator = jnp.eye(base_cutoff, dtype=jnp.complex128)
 
-    # Run 1: Score at base_cutoff only (no correction) → state at base cutoff
-    _, _, extras_base = jax_scoring_fn_batch(
-        genotypes,
-        base_cutoff,
-        operator,
-        genotype_name=genotype_name,
-        genotype_config=genotype_config,
-        correction_cutoff=None,  # No correction → state at base_cutoff
-        pnr_max=pnr_max,
-    )
-    states_base = extras_base["final_state"]  # (N, base_cutoff)
+    all_fidelities = []
+    for start in range(0, n_total, chunk_size):
+        end = min(start + chunk_size, n_total)
+        chunk = genotypes[start:end]
 
-    # Run 2: Score at base_cutoff WITH correction → state truncated from correction_cutoff
-    _, _, extras_corr = jax_scoring_fn_batch(
-        genotypes,
-        base_cutoff,
-        operator,
-        genotype_name=genotype_name,
-        genotype_config=genotype_config,
-        correction_cutoff=correction_cutoff,  # Correction → state at correction then truncated
-        pnr_max=pnr_max,
-    )
-    states_corr = extras_corr["final_state"]  # (N, base_cutoff)
+        chunk_fids = _compute_chunk_fidelities(
+            chunk,
+            base_cutoff,
+            correction_cutoff,
+            operator,
+            genotype_name,
+            genotype_config,
+            pnr_max,
+        )
+        all_fidelities.append(chunk_fids)
 
-    # Vectorized fidelity: |<s1|s2>|^2 for each genotype
-    # Both states are already normalized in runner.py (state_eval)
-    # Re-normalize for safety
-    norms_base = jnp.linalg.norm(states_base, axis=1, keepdims=True)
-    norms_corr = jnp.linalg.norm(states_corr, axis=1, keepdims=True)
-
-    # Handle zero-norm states (prob ~ 0)
-    safe_norms_base = jnp.maximum(norms_base, 1e-12)
-    safe_norms_corr = jnp.maximum(norms_corr, 1e-12)
-
-    states_base_n = states_base / safe_norms_base
-    states_corr_n = states_corr / safe_norms_corr
-
-    # Fidelity = |<psi1|psi2>|^2
-    overlaps = jnp.sum(jnp.conj(states_base_n) * states_corr_n, axis=1)
-    fidelities = jnp.abs(overlaps) ** 2
-
-    # Zero out fidelity for zero-norm states
-    valid = (norms_base.squeeze() > 1e-10) & (norms_corr.squeeze() > 1e-10)
-    fidelities = jnp.where(valid, fidelities, 0.0)
-
-    return np.array(fidelities)
+    return np.concatenate(all_fidelities)
 
 
 def validate_and_clean_archive(
