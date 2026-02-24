@@ -239,6 +239,121 @@ def render_solution_details(row, result_obj, key_suffix=""):
 
             st.divider()
 
+            # --- Independent Verification Button ---
+            if st.button(
+                "🔬 Verify Independently (thewalrus + scipy)",
+                key=f"verify_btn_{genotype_idx}_{key_suffix}",
+            ):
+                with st.spinner(
+                    "Running independent verification (this may take a moment)..."
+                ):
+                    try:
+                        from frontend.independent_verifier import verify_circuit
+
+                        iv_result = verify_circuit(
+                            params, cutoff=sim_cutoff, pnr_max=pnr_max
+                        )
+                        iv_state = iv_result["state"]
+                        iv_prob = iv_result["probability"]
+                        iv_report = iv_result["report"]
+
+                        # Fidelity: |⟨ψ_jax|ψ_indep⟩|²
+                        overlap = np.abs(np.vdot(psi, iv_state)) ** 2
+                        # Phase-invariant fidelity
+                        fidelity = float(overlap)
+
+                        # Display metrics
+                        v_c1, v_c2, v_c3 = st.columns(3)
+                        v_c1.metric("Fidelity (|⟨JAX|Indep⟩|²)", f"{fidelity:.6f}")
+                        v_c2.metric("JAX Prob", f"{prob:.4e}")
+                        v_c3.metric("Independent Prob", f"{iv_prob:.4e}")
+
+                        if fidelity > 0.99:
+                            st.success(
+                                f"✅ Cross-check PASSED: Fidelity = {fidelity:.6f}"
+                            )
+                        elif fidelity > 0.90:
+                            st.warning(
+                                f"⚠️ Moderate agreement: Fidelity = {fidelity:.6f}"
+                            )
+                        else:
+                            st.error(
+                                f"❌ Significant discrepancy: Fidelity = {fidelity:.6f}"
+                            )
+
+                        # Side-by-side Wigner comparison
+                        iv_col1, iv_col2 = st.columns(2)
+                        with iv_col1:
+                            st.caption("JAX Backend")
+                            W_jax = utils.compute_wigner(psi, xvec, pvec)
+                            fig_jax = viz.plot_wigner_function(
+                                W_jax,
+                                xvec,
+                                pvec,
+                                title=f"JAX Result<br>Exp: {exp_val:.4f}",
+                            )
+                            st.plotly_chart(
+                                fig_jax,
+                                use_container_width=True,
+                                key=f"iv_jax_{genotype_idx}_{key_suffix}",
+                            )
+
+                        with iv_col2:
+                            st.caption("Independent (thewalrus + scipy)")
+                            W_iv = utils.compute_wigner(iv_state, xvec, pvec)
+                            fig_iv = viz.plot_wigner_function(
+                                W_iv,
+                                xvec,
+                                pvec,
+                                title=f"Independent Result<br>Prob: {iv_prob:.2e}",
+                            )
+                            st.plotly_chart(
+                                fig_iv,
+                                use_container_width=True,
+                                key=f"iv_indep_{genotype_idx}_{key_suffix}",
+                            )
+
+                        # Diagnostic report
+                        with st.expander("📋 Verification Diagnostics"):
+                            st.write("**Per-Leaf Results:**")
+                            for leaf in iv_report["leaves"]:
+                                status = "✅" if leaf["active"] else "🔴"
+                                st.text(
+                                    f"  Leaf {leaf['index']} [{status}]: "
+                                    f"norm={leaf['state_norm']:.6f}, "
+                                    f"prob={leaf['prob']:.4e}"
+                                    + (
+                                        f", PNR={leaf.get('pnr', [])}"
+                                        if leaf["active"]
+                                        else ""
+                                    )
+                                )
+
+                            st.write("**Mixing Nodes:**")
+                            for node in iv_report["mixing_nodes"]:
+                                st.text(
+                                    f"  Node {node['node']} (L{node['layer']}): "
+                                    f"BS(θ={node['theta']:.3f}, φ={node['phi']:.3f}), "
+                                    f"x={node['hx']:.3f}, "
+                                    f"p_hom={node['p_homodyne']:.4e}, "
+                                    f"out_norm={node['output_norm']:.6f}"
+                                )
+
+                            st.write(
+                                f"**Final state norm:** {iv_report['final_state_norm']:.6f}"
+                            )
+
+                            if iv_report["warnings"]:
+                                st.write("**Warnings:**")
+                                for w in iv_report["warnings"]:
+                                    st.warning(w)
+
+                    except Exception as e:
+                        import traceback
+
+                        st.error(f"Independent verification failed: {e}")
+                        st.code(traceback.format_exc())
+
             # Rank-Matched Plot Row
             if active_total_photons > 1:
                 st.subheader(

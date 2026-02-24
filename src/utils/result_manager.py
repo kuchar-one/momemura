@@ -160,7 +160,9 @@ class OptimizationResult:
 
         valid_fit = flat_fit[valid_mask]
         valid_desc = flat_desc[valid_mask]
-        valid_geno = flat_geno[valid_mask]
+        valid_geno = np.array(
+            flat_geno[valid_mask]
+        )  # Force numpy to avoid GPU OOM during aggregation
 
         # Create DataFrame
         df = pd.DataFrame(
@@ -439,32 +441,18 @@ class AggregatedOptimizationResult(OptimizationResult):
             max_d = max(g.shape[1] for g in all_genotypes)
             padded_genotypes = []
             for g in all_genotypes:
-                n, d = g.shape
+                g_np = np.array(g)  # Force numpy to avoid GPU OOM
+                n, d = g_np.shape
                 if d < max_d:
                     padding = ((0, 0), (0, max_d - d))
-                    if jnp is not None and isinstance(g, jnp.ndarray):
-                        g_pad = jnp.pad(g, padding, mode="constant")
-                    else:
-                        g_pad = np.pad(g, padding, mode="constant")
-                    padded_genotypes.append(g_pad)
-                else:
-                    padded_genotypes.append(g)
+                    g_np = np.pad(g_np, padding, mode="constant")
+                padded_genotypes.append(g_np)
 
-            # Concatenate
-            if jnp is not None:
-                # Convert all to JAX if needed
-                padded_genotypes = [
-                    jnp.array(g) if not isinstance(g, jnp.ndarray) else g
-                    for g in padded_genotypes
-                ]
-                self._cached_valid_genotypes = jnp.concatenate(padded_genotypes, axis=0)
-            else:
-                self._cached_valid_genotypes = np.concatenate(padded_genotypes, axis=0)
+            # Always use numpy for aggregated genotypes to avoid GPU OOM
+            # with large numbers of solutions across many runs.
+            self._cached_valid_genotypes = np.concatenate(padded_genotypes, axis=0)
         else:
-            if jnp is not None:
-                self._cached_valid_genotypes = jnp.array([])
-            else:
-                self._cached_valid_genotypes = np.array([])
+            self._cached_valid_genotypes = np.array([])
 
         # Post-Processing: Compute Global Dominance
         # Objectives: Expectation (min), LogProb (min)
