@@ -239,120 +239,181 @@ def render_solution_details(row, result_obj, key_suffix=""):
 
             st.divider()
 
-            # --- Independent Verification Button ---
-            if st.button(
-                "🔬 Verify Independently (thewalrus + scipy)",
-                key=f"verify_btn_{genotype_idx}_{key_suffix}",
-            ):
-                with st.spinner(
-                    "Running independent verification (this may take a moment)..."
+            # --- Independent Verification (Multi-Cutoff) ---
+            # Use session_state to persist results across Streamlit reruns
+            iv_key = f"iv_result_{genotype_idx}_{key_suffix}"
+
+            # Determine the three cutoffs
+            cutoff_opt = cutoff  # optimization cutoff
+            cutoff_ver = sim_cutoff  # verification cutoff (correction_cutoff)
+            cutoff_ext = sim_cutoff + 15  # extended cutoff
+            # Deduplicate (e.g. if no correction_cutoff, opt == ver)
+            cutoff_levels = list(dict.fromkeys([cutoff_opt, cutoff_ver, cutoff_ext]))
+            cutoff_labels = {
+                cutoff_opt: "Optimization",
+                cutoff_ver: "Verification",
+                cutoff_ext: "Extended (+5)",
+            }
+
+            btn_col1, btn_col2 = st.columns([3, 1])
+            with btn_col1:
+                if st.button(
+                    f"🔬 Verify at {len(cutoff_levels)} cutoffs: {cutoff_levels}",
+                    key=f"verify_btn_{genotype_idx}_{key_suffix}",
                 ):
-                    try:
-                        from frontend.independent_verifier import verify_circuit
+                    with st.spinner(
+                        "Running independent verification at multiple cutoffs..."
+                    ):
+                        try:
+                            from frontend.independent_verifier import verify_circuit
 
-                        iv_result = verify_circuit(
-                            params, cutoff=sim_cutoff, pnr_max=pnr_max
-                        )
-                        iv_state = iv_result["state"]
-                        iv_prob = iv_result["probability"]
-                        iv_report = iv_result["report"]
+                            results_per_cutoff = {}
+                            for c in cutoff_levels:
+                                label = cutoff_labels.get(c, f"c={c}")
+                                iv_result = verify_circuit(
+                                    params, cutoff=c, pnr_max=pnr_max
+                                )
+                                iv_state = iv_result["state"]
+                                psi_c, prob_c = utils.compute_heralded_state(
+                                    params, cutoff=c, pnr_max=pnr_max
+                                )
+                                overlap = float(np.abs(np.vdot(psi_c, iv_state)) ** 2)
+                                W_jax_c = utils.compute_wigner(psi_c, xvec, pvec)
+                                W_iv_c = utils.compute_wigner(iv_state, xvec, pvec)
 
-                        # Fidelity: |⟨ψ_jax|ψ_indep⟩|²
-                        overlap = np.abs(np.vdot(psi, iv_state)) ** 2
-                        # Phase-invariant fidelity
-                        fidelity = float(overlap)
+                                results_per_cutoff[c] = {
+                                    "label": label,
+                                    "fidelity": overlap,
+                                    "jax_prob": float(prob_c),
+                                    "iv_prob": iv_result["probability"],
+                                    "W_jax": W_jax_c,
+                                    "W_iv": W_iv_c,
+                                    "report": iv_result["report"],
+                                }
 
-                        # Display metrics
-                        v_c1, v_c2, v_c3 = st.columns(3)
-                        v_c1.metric("Fidelity (|⟨JAX|Indep⟩|²)", f"{fidelity:.6f}")
-                        v_c2.metric("JAX Prob", f"{prob:.4e}")
-                        v_c3.metric("Independent Prob", f"{iv_prob:.4e}")
+                            st.session_state[iv_key] = {
+                                "cutoffs": cutoff_levels,
+                                "results": results_per_cutoff,
+                                "exp_val": exp_val,
+                            }
+                        except Exception as e:
+                            import traceback
 
-                        if fidelity > 0.99:
-                            st.success(
-                                f"✅ Cross-check PASSED: Fidelity = {fidelity:.6f}"
-                            )
-                        elif fidelity > 0.90:
-                            st.warning(
-                                f"⚠️ Moderate agreement: Fidelity = {fidelity:.6f}"
-                            )
+                            st.session_state[iv_key] = {
+                                "error": str(e),
+                                "traceback": traceback.format_exc(),
+                            }
+
+            with btn_col2:
+                if iv_key in st.session_state and st.button(
+                    "✕ Clear",
+                    key=f"clear_iv_{genotype_idx}_{key_suffix}",
+                ):
+                    del st.session_state[iv_key]
+                    st.rerun()
+
+            # Display stored results
+            if iv_key in st.session_state:
+                iv_data = st.session_state[iv_key]
+
+                if "error" in iv_data:
+                    st.error(f"Independent verification failed: {iv_data['error']}")
+                    st.code(iv_data["traceback"])
+                else:
+                    cutoffs = iv_data["cutoffs"]
+                    res = iv_data["results"]
+
+                    # Summary metrics row
+                    st.subheader("Cutoff Convergence Summary")
+                    summary_cols = st.columns(len(cutoffs))
+                    for col, c in zip(summary_cols, cutoffs):
+                        r = res[c]
+                        fid = r["fidelity"]
+                        if fid > 0.99:
+                            fid_icon = "✅"
+                        elif fid > 0.90:
+                            fid_icon = "⚠️"
                         else:
-                            st.error(
-                                f"❌ Significant discrepancy: Fidelity = {fidelity:.6f}"
-                            )
+                            fid_icon = "❌"
+                        col.metric(
+                            f"{r['label']} (c={c})",
+                            f"{fid_icon} F={fid:.6f}",
+                        )
+                        col.caption(
+                            f"JAX: {r['jax_prob']:.3e} | IV: {r['iv_prob']:.3e}"
+                        )
 
-                        # Side-by-side Wigner comparison
-                        iv_col1, iv_col2 = st.columns(2)
-                        with iv_col1:
-                            st.caption("JAX Backend")
-                            W_jax = utils.compute_wigner(psi, xvec, pvec)
-                            fig_jax = viz.plot_wigner_function(
-                                W_jax,
-                                xvec,
-                                pvec,
-                                title=f"JAX Result<br>Exp: {exp_val:.4f}",
-                            )
-                            st.plotly_chart(
-                                fig_jax,
-                                use_container_width=True,
-                                key=f"iv_jax_{genotype_idx}_{key_suffix}",
-                            )
-
-                        with iv_col2:
-                            st.caption("Independent (thewalrus + scipy)")
-                            W_iv = utils.compute_wigner(iv_state, xvec, pvec)
-                            fig_iv = viz.plot_wigner_function(
-                                W_iv,
-                                xvec,
-                                pvec,
-                                title=f"Independent Result<br>Prob: {iv_prob:.2e}",
-                            )
-                            st.plotly_chart(
-                                fig_iv,
-                                use_container_width=True,
-                                key=f"iv_indep_{genotype_idx}_{key_suffix}",
-                            )
-
-                        # Diagnostic report
-                        with st.expander("📋 Verification Diagnostics"):
-                            st.write("**Per-Leaf Results:**")
-                            for leaf in iv_report["leaves"]:
-                                status = "✅" if leaf["active"] else "🔴"
-                                st.text(
-                                    f"  Leaf {leaf['index']} [{status}]: "
-                                    f"norm={leaf['state_norm']:.6f}, "
-                                    f"prob={leaf['prob']:.4e}"
-                                    + (
-                                        f", PNR={leaf.get('pnr', [])}"
-                                        if leaf["active"]
-                                        else ""
-                                    )
+                    # Per-cutoff Wigner comparisons in tabs
+                    wigner_tabs = st.tabs(
+                        [f"c={c} ({res[c]['label']})" for c in cutoffs]
+                    )
+                    for w_tab, c in zip(wigner_tabs, cutoffs):
+                        r = res[c]
+                        with w_tab:
+                            iv_col1, iv_col2 = st.columns(2)
+                            with iv_col1:
+                                st.caption(f"JAX (cutoff={c})")
+                                fig_jax = viz.plot_wigner_function(
+                                    r["W_jax"],
+                                    xvec,
+                                    pvec,
+                                    title=f"JAX c={c}<br>P={r['jax_prob']:.3e}",
+                                )
+                                st.plotly_chart(
+                                    fig_jax,
+                                    use_container_width=True,
+                                    key=f"iv_jax_{genotype_idx}_{c}_{key_suffix}",
+                                )
+                            with iv_col2:
+                                st.caption(f"Independent (cutoff={c})")
+                                fig_iv = viz.plot_wigner_function(
+                                    r["W_iv"],
+                                    xvec,
+                                    pvec,
+                                    title=f"Indep c={c}<br>P={r['iv_prob']:.3e}",
+                                )
+                                st.plotly_chart(
+                                    fig_iv,
+                                    use_container_width=True,
+                                    key=f"iv_indep_{genotype_idx}_{c}_{key_suffix}",
                                 )
 
-                            st.write("**Mixing Nodes:**")
-                            for node in iv_report["mixing_nodes"]:
-                                st.text(
-                                    f"  Node {node['node']} (L{node['layer']}): "
-                                    f"BS(θ={node['theta']:.3f}, φ={node['phi']:.3f}), "
-                                    f"x={node['hx']:.3f}, "
-                                    f"p_hom={node['p_homodyne']:.4e}, "
-                                    f"out_norm={node['output_norm']:.6f}"
+                    # Diagnostics for highest cutoff
+                    highest_c = cutoffs[-1]
+                    iv_report = res[highest_c]["report"]
+                    with st.expander(f"📋 Diagnostics (cutoff={highest_c})"):
+                        st.write("**Per-Leaf Results:**")
+                        for leaf in iv_report["leaves"]:
+                            status = "✅" if leaf["active"] else "🔴"
+                            st.text(
+                                f"  Leaf {leaf['index']} [{status}]: "
+                                f"norm={leaf['state_norm']:.6f}, "
+                                f"prob={leaf['prob']:.4e}"
+                                + (
+                                    f", PNR={leaf.get('pnr', [])}"
+                                    if leaf["active"]
+                                    else ""
                                 )
-
-                            st.write(
-                                f"**Final state norm:** {iv_report['final_state_norm']:.6f}"
                             )
 
-                            if iv_report["warnings"]:
-                                st.write("**Warnings:**")
-                                for w in iv_report["warnings"]:
-                                    st.warning(w)
+                        st.write("**Mixing Nodes:**")
+                        for node in iv_report["mixing_nodes"]:
+                            st.text(
+                                f"  Node {node['node']} (L{node['layer']}): "
+                                f"BS(θ={node['theta']:.3f}, φ={node['phi']:.3f}), "
+                                f"x={node['hx']:.3f}, "
+                                f"p_hom={node['p_homodyne']:.4e}, "
+                                f"out_norm={node['output_norm']:.6f}"
+                            )
 
-                    except Exception as e:
-                        import traceback
+                        st.write(
+                            f"**Final state norm:** {iv_report['final_state_norm']:.6f}"
+                        )
 
-                        st.error(f"Independent verification failed: {e}")
-                        st.code(traceback.format_exc())
+                        if iv_report["warnings"]:
+                            st.write("**Warnings:**")
+                            for w in iv_report["warnings"]:
+                                st.warning(w)
 
             # Rank-Matched Plot Row
             if active_total_photons > 1:
@@ -468,62 +529,32 @@ selected_points = pareto_selection.get("selection", {}).get("points", [])
 # 2. Cell Selection from Heatmap
 selected_cells = heat_selection.get("selection", {}).get("points", [])
 
+# Persist Plotly selection in session_state so button clicks don't lose it
 if selected_points:
+    # New scatter selection — store it (clears heatmap selection)
+    resolved = []
+    for p_data in selected_points:
+        gidx = utils.extract_genotype_index(p_data, df_len=len(df))
+        if gidx is not None:
+            resolved.append(gidx)
+    if resolved:
+        st.session_state["selected_genotype_indices"] = resolved
+elif selected_cells:
+    # Heatmap selection — clear scatter selection
+    st.session_state.pop("selected_genotype_indices", None)
+
+# Use persisted selection for scatter points
+active_indices = st.session_state.get("selected_genotype_indices", [])
+
+if active_indices:
     st.header("Selected Solution Details")
-    # Handle multiple selection - just take the first one or list them
-    # For simplicity, focus on the last selected point or list tabs
 
-    # We can use tabs for multiple points
-    # We can use tabs for multiple points
-    # Use pointIndex (Streamlit < 1.35) or point_index (Streamlit >= 1.35) or pointNumber (Plotly native)
-    # The selection state structure can vary.
-    # Let's inspect the keys if needed, but safe access is best.
+    tabs = st.tabs([f"Genotype {idx}" for idx in active_indices])
 
-    # Helper to get index
-    # def get_point_index(p):
-    #     return p.get("pointIndex", p.get("point_index", p.get("pointNumber")))
-
-    # tabs = st.tabs([f"Point {get_point_index(p)}" for p in selected_points])
-
-    # We need a label for each tab. extract_genotype_index returns the database index (genotype_idx),
-    # but for label we might prefer the plot point index if available, or just the db index.
-    # Let's use genotype_idx as the definitive label if possible, or fallback.
-
-    def get_tab_label(p):
-        idx = utils.extract_genotype_index(p, df_len=len(df))
-        if idx is not None:
-            return str(idx)  # Use genotype_idx as label
-        # Fallback to visual index for label if DB lookup fails (unlikely given extract logic)
-        return p.get("pointIndex", "?")
-
-    tabs = st.tabs([f"Genotype {get_tab_label(p)}" for p in selected_points])
-
-    for tab, p_data in zip(tabs, selected_points):
+    for tab_idx, (tab, genotype_idx) in enumerate(zip(tabs, active_indices)):
         with tab:
-            # Robust retrieval using shared utility
-            # customdata order matches hover_data in visualizations.py
-
-            genotype_idx = utils.extract_genotype_index(p_data, df_len=len(df))
-            row = None
-
-            if genotype_idx is not None:
-                row = df.iloc[genotype_idx]
-
-            if row is None:
-                st.error(f"Could not identify solution. Selection data: {p_data}")
-            # Verify consistency if possible
-            if (
-                genotype_idx is not None
-                and row is not None
-                and genotype_idx != int(row["genotype_idx"])
-            ):
-                st.warning(
-                    f"Index mismatch detected: {genotype_idx} vs {row['genotype_idx']}. Using data from customdata."
-                )
-
-            # Pass tab label as suffix to ensure uniqueness across tabs
-            render_solution_details(row, result, key_suffix=f"tab_{tab._index}")
-
+            row = df.iloc[genotype_idx]
+            render_solution_details(row, result, key_suffix=f"tab_{tab_idx}")
 
 elif selected_cells:
     st.header("Selected Cell Details")
@@ -586,6 +617,10 @@ with cols[0]:
     best_exp_row = df.loc[best_exp_idx]
     st.dataframe(best_exp_row.to_frame().T)
     if st.button("View Best Expectation Details"):
+        st.session_state["show_best_exp"] = not st.session_state.get(
+            "show_best_exp", False
+        )
+    if st.session_state.get("show_best_exp", False):
         render_solution_details(best_exp_row, result, key_suffix="btn_best_exp")
 
 with cols[1]:
@@ -593,4 +628,8 @@ with cols[1]:
     best_prob_row = df.loc[best_prob_idx]
     st.dataframe(best_prob_row.to_frame().T)
     if st.button("View Best Probability Details"):
+        st.session_state["show_best_prob"] = not st.session_state.get(
+            "show_best_prob", False
+        )
+    if st.session_state.get("show_best_prob", False):
         render_solution_details(best_prob_row, result, key_suffix="btn_best_prob")
