@@ -175,6 +175,7 @@ class HanamuraMOMEAdapter:
         genotype_name: str = "A",
         genotype_config: Dict[str, Any] = None,
         correction_cutoff: int = None,
+        gaussian_limit: float = 2.0 / 3.0,
     ):
         """
         Initialize the MOME Adapter.
@@ -201,6 +202,7 @@ class HanamuraMOMEAdapter:
         self.genotype_name = genotype_name
         self.genotype_config = genotype_config or {}
         self.correction_cutoff = correction_cutoff
+        self.gaussian_limit = gaussian_limit
         self.pnr_max = int(self.genotype_config.get("pnr_max", 3))
 
         # Instantiate decoder for local use
@@ -273,6 +275,7 @@ class HanamuraMOMEAdapter:
                 correction_cutoff=self.correction_cutoff,
                 pnr_max=self.pnr_max,
                 gs_eig=self.gs_exp,
+                gaussian_limit=self.gaussian_limit,
             )
 
             # Extract metrics
@@ -331,6 +334,7 @@ class HanamuraMOMEAdapter:
                     self.correction_cutoff,
                     pnr_max=self.pnr_max,
                     gs_eig=self.gs_exp,
+                    gaussian_limit=self.gaussian_limit,
                 )
                 fitnesses_jax.block_until_ready()
                 descriptors_jax.block_until_ready()
@@ -640,6 +644,14 @@ def run(
     topology = SuperblockTopology.build_layered(2)
 
     # Construct GKP operator
+    from src.utils.gkp_operator import (
+        get_u_vec_from_alpha_beta,
+        gaussian_limit as get_gaussian_limit,
+    )
+
+    ux, uy, uz = get_u_vec_from_alpha_beta(target_alpha, target_beta)
+    global_gaussian_limit = get_gaussian_limit(ux, uy, uz)
+
     operator = construct_gkp_operator(
         cutoff, target_alpha, target_beta, backend=backend
     )
@@ -649,11 +661,12 @@ def run(
         composer,
         topology,
         operator,
-        cutoff,
+        cutoff=cutoff,
         backend=backend,
         genotype_name=genotype,
         genotype_config=genotype_config,
         correction_cutoff=correction_cutoff,
+        gaussian_limit=global_gaussian_limit,
     )
 
     depth_val = 3
@@ -983,6 +996,7 @@ def run(
                     gs_eig=float(
                         jnp.linalg.eigvalsh(op_jax)[0]
                     ),  # Calculated here for QDax
+                    gaussian_limit=global_gaussian_limit,
                 )
 
             # QDax expects extra scores (gradients/etc).
@@ -1309,7 +1323,7 @@ def run(
         # -------------------------
         op_jax = jnp.array(operator)
         gs_eig = float(jnp.linalg.eigvalsh(op_jax)[0])
-        gaussian_limit = 2.0 / 3.0
+        gaussian_limit = global_gaussian_limit
 
         print(
             f"Starting optimization: {n_iters} iterations in {n_chunks} chunks (sizes={chunks}).\n"

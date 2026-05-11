@@ -1,12 +1,22 @@
+"""
+GKP operator construction for truncated Fock spaces.
+
+Constructs the GKP X, Y, Z, U operators and the combined "magic" operator
+for arbitrary target superpositions on the Bloch sphere.
+"""
+
 import os
 import numpy as np
 import qutip as qt
 from typing import Tuple, Union
+import jax
 import jax.numpy as jnp
 
 # Constants
 SQRT_PI = np.sqrt(np.pi)
-CACHE_DIR = "cache/operators"
+CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "cache", "operators"
+)
 
 
 def _ensure_cache_dir():
@@ -14,10 +24,9 @@ def _ensure_cache_dir():
     os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-def get_XYZU_paper(N: int) -> Tuple[qt.Qobj, qt.Qobj, qt.Qobj, qt.Qobj]:
+def get_O_operators(N: int) -> Tuple[qt.Qobj, qt.Qobj, qt.Qobj, qt.Qobj]:
     """
-    Generate X, Y, Z, U operators for GKP code as defined in the paper.
-    Uses QuTiP for construction.
+    Generate O_x, O_y, O_z, and O_1 operators for GKP code as defined in the paper.
     """
     _ensure_cache_dir()
 
@@ -28,55 +37,47 @@ def get_XYZU_paper(N: int) -> Tuple[qt.Qobj, qt.Qobj, qt.Qobj, qt.Qobj]:
                 arr = np.load(path)
                 return qt.Qobj(arr)
             except Exception:
-                print(f"Cache corrupted for {path}, regenerating...")
-
+                pass
         obj = gen_func()
-        try:
-            np.save(path, obj.full())
-        except Exception:
-            pass
+        np.save(path, obj.full())
         return obj
 
-    X = load_or_gen("X_paper", lambda: (qt.momentum(N) * SQRT_PI).cosm())
-    Z = load_or_gen("Z_paper", lambda: (qt.position(N) * SQRT_PI).cosm())
+    Ox = load_or_gen("Ox_paper", lambda: (qt.momentum(N) * SQRT_PI).cosm())
+    Oz = load_or_gen("Oz_paper", lambda: (qt.position(N) * SQRT_PI).cosm())
 
-    def gen_Y():
-        x_op = qt.position(N)
-        p_op = qt.momentum(N)
-        return ((x_op + p_op) * SQRT_PI).cosm()
+    def gen_Oy():
+        return ((qt.position(N) - qt.momentum(N)) * SQRT_PI).cosm()
+    Oy = load_or_gen("Oy_paper", gen_Oy)
 
-    Y = load_or_gen("Y_paper_v2", gen_Y)
-
-    def gen_U():
+    def gen_O1():
         x_op = qt.position(N)
         p_op = qt.momentum(N)
         term1 = (2 * p_op * SQRT_PI).cosm()
+        term2 = (2 * (x_op - p_op) * SQRT_PI).cosm()
         term3 = (2 * x_op * SQRT_PI).cosm()
-        return 2 * qt.qeye(N) - (term1 + term3) / 2.0
+        return qt.qeye(N) - (term1 + term2 + term3) / 3.0
+    O1 = load_or_gen("O1_paper", gen_O1)
 
-    U = load_or_gen("U_paper_v2", gen_U)
-
-    return X, Y, Z, U
+    return Ox, Oy, Oz, O1
 
 
-def high_dim_magic_generator_paper(cx: float, cy: float, cz: float) -> np.ndarray:
+def high_dim_magic_generator_paper(ux: float, uy: float, uz: float) -> np.ndarray:
     """
     Generate the high-dimensional GKP magic operator (N=1000).
     """
-    N = 1000  # Fixed dimension for high-dim generation
+    N = 1000
     filename = os.path.join(
-        CACHE_DIR, f"high_dim_magic_operator_paper_{cx}_{cy}_{cz}.npy"
+        CACHE_DIR, f"high_dim_O_GKP_{ux:.6g}_{uy:.6g}_{uz:.6g}.npy"
     )
 
     if os.path.isfile(filename):
         try:
             return np.load(filename)
         except Exception:
-            print(f"Cache corrupted for {filename}, regenerating...")
+            pass
 
-    print(f"Generating pre-truncation form of the GKP Operator (N={N})...")
-    X, Y, Z, U = get_XYZU_paper(N)
-    high_dim = cx * X + cy * Y + cz * Z + U
+    Ox, Oy, Oz, O1 = get_O_operators(N)
+    high_dim = O1 + qt.qeye(N) - (ux * Ox + uy * Oy + uz * Oz)
     arr = high_dim.full()
 
     _ensure_cache_dir()
@@ -84,19 +85,11 @@ def high_dim_magic_generator_paper(cx: float, cy: float, cz: float) -> np.ndarra
     return arr
 
 
-def bloch_from_ab(
+def get_u_vec(
     ab: Tuple[float, complex], normalize: bool = False, tol: float = 1e-9
 ) -> Tuple[float, float, float]:
     """
-    Convert (a,b) -> (c_x, c_y, c_z) for GKP Hamiltonian construction.
-
-    The returned coefficients are used to construct the operator:
-       H = c_x * X + c_y * Y + c_z * Z + U
-
-    Note: The GKP X operator behaves effectively as -X_Pauli in the logical subspace.
-    Therefore, this function flips the sign of c_x relative to the standard Bloch vector
-    representation of influence on the Hamiltonian, ensuring that the ground state
-    of the constructed operator matches the input state |psi> = a|0> + b|1>.
+    Convert (a,b) -> (u_x, u_y, u_z) for GKP Hamiltonian construction.
     """
     a, b = ab
     a = float(np.real(a))
@@ -112,25 +105,30 @@ def bloch_from_ab(
         else:
             scale = np.sqrt(max(0.0, 1.0 - a * a)) / np.abs(b)
             b *= scale
-    elif abs(norm_diff) > 1e-6:
-        import warnings
 
-        warnings.warn(
-            f"a^2 + |b|^2 = {a * a + abs(b) ** 2:.6g} != 1 (tol={tol}). "
-            "Check inputs or enable normalize=True."
-        )
+    uz = 2.0 * (a * a) - 1.0
+    ux_uy = 2.0 * a * b
 
-    cz = 1.0 - 2.0 * (a * a)
-    cx_cy = -2.0 * a * b
-    # Based on phase conventions X ~ +X_L, Y ~ -Y_L, Z ~ +Z_L
-    # To make target state the ground state of H = cx*X + cy*Y + cz*Z + U:
-    # Bloch vector: x = 2*Re(a*b), y = 2*Im(a*b), z = |a|²-|b|²
-    # cx_cy = -2*a*b, so cx_cy.real = -x, cx_cy.imag = -y
-    # Convention: cx = -x, cy = +y, cz = -z
-    cx = float(cx_cy.real)  # cx_cy.real = -x  →  cx = -x
-    cy = -float(cx_cy.imag)  # cx_cy.imag = -y  →  cy = +y
+    ux = float(ux_uy.real)
+    uy = float(ux_uy.imag)
 
-    return (cx, cy, cz)
+    return (ux, uy, uz)
+
+
+def get_u_vec_from_alpha_beta(alpha: complex, beta: complex) -> Tuple[float, float, float]:
+    """Helper to convert generic alpha, beta to (ux, uy, uz)"""
+    norm = np.sqrt(np.abs(alpha) ** 2 + np.abs(beta) ** 2)
+    if norm > 1e-9:
+        alpha = alpha / norm
+        beta = beta / norm
+    else:
+        raise ValueError("Zero vector passed as target state.")
+
+    phase = np.angle(alpha)
+    alpha_rot = alpha * np.exp(-1j * phase)
+    beta_rot = beta * np.exp(-1j * phase)
+
+    return get_u_vec((alpha_rot, beta_rot), normalize=True)
 
 
 def construct_gkp_operator(
@@ -152,25 +150,14 @@ def construct_gkp_operator(
     Returns:
         The truncated operator as a matrix.
     """
-    norm = np.sqrt(np.abs(alpha) ** 2 + np.abs(beta) ** 2)
-    if norm > 1e-9:
-        alpha = alpha / norm
-        beta = beta / norm
-    else:
-        raise ValueError("Zero vector passed as target state.")
+    ux, uy, uz = get_u_vec_from_alpha_beta(alpha, beta)
 
-    phase = np.angle(alpha)
-    alpha_rot = alpha * np.exp(-1j * phase)
-    beta_rot = beta * np.exp(-1j * phase)
-
-    cx, cy, cz = bloch_from_ab((alpha_rot, beta_rot), normalize=True)
-
-    high_dim_arr = high_dim_magic_generator_paper(cx, cy, cz)
+    high_dim_arr = high_dim_magic_generator_paper(ux, uy, uz)
 
     truncated = high_dim_arr[:N, :N]
 
     if gaussian_normalize:
-        truncated = truncated / gaussian_limit(cx, cy, cz)
+        truncated = truncated / gaussian_limit(ux, uy, uz)
 
     if backend == "jax":
         return jnp.array(truncated)
@@ -178,8 +165,8 @@ def construct_gkp_operator(
         return truncated
 
 
-def gaussian_limit(cx, cy, cz):
-    return 5 / 3 - np.max(np.abs([cx, cy, cz]))
+def gaussian_limit(ux, uy, uz):
+    return 5 / 3 - np.max(np.abs([ux, uy, uz]))
 
 
 def construct_gkp_operator_angle(
@@ -205,3 +192,39 @@ def construct_gkp_operator_angle(
     alpha = np.cos(theta)
     beta = np.sin(theta) * np.exp(1j * phi)
     return construct_gkp_operator(N, alpha, beta, backend, gaussian_normalize)
+
+
+def get_0L(N: int, backend: str = "jax") -> Union[np.ndarray, jnp.ndarray]:
+    """
+    Get the GKP |0>_L state as the ground state of O_GKP(0, 0, 1).
+    """
+    op = construct_gkp_operator(N, 1.0, 0.0, backend="thewalrus")
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        _op = jnp.array(op)
+        _, evecs = jnp.linalg.eigh(_op)
+        psi = evecs[:, 0]
+        idx = jnp.argmax(jnp.abs(psi))
+        phase = psi[idx] / jnp.abs(psi[idx])
+        psi = psi / phase
+    if backend == "jax":
+        return jnp.array(psi)
+    return np.array(psi)
+
+
+def get_1L(N: int, backend: str = "jax") -> Union[np.ndarray, jnp.ndarray]:
+    """
+    Get the GKP |1>_L state as the ground state of O_GKP(0, 0, -1).
+    """
+    op = construct_gkp_operator(N, 0.0, 1.0, backend="thewalrus")
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        _op = jnp.array(op)
+        _, evecs = jnp.linalg.eigh(_op)
+        psi = evecs[:, 0]
+        idx = jnp.argmax(jnp.abs(psi))
+        phase = psi[idx] / jnp.abs(psi[idx])
+        psi = psi / phase
+    if backend == "jax":
+        return jnp.array(psi)
+    return np.array(psi)

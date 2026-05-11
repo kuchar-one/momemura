@@ -237,6 +237,96 @@ def render_solution_details(row, result_obj, key_suffix=""):
                 except Exception as e:
                     st.error(f"Error computing target Wigner: {e}")
 
+            # --- Equivalent Gaussian Circuit ---
+            try:
+                import importlib
+                import frontend.gaussian_decomposition
+                importlib.reload(frontend.gaussian_decomposition)
+                from frontend.gaussian_decomposition import compute_equivalent_gaussian
+                
+                gauss_res = compute_equivalent_gaussian(params)
+                
+                st.divider()
+                st.subheader("Equivalent Gaussian Decomposition (GBS Equivalent)")
+                st.markdown(
+                    f"The active optical circuit exactly reduces to an equivalent **{gauss_res['num_final_modes']}-mode GBS circuit** applied to vacuum. "
+                    f"Follow the sequential steps below to reproduce the state:"
+                )
+                
+                # Step 1
+                st.markdown("### Step 1: Initial Squeezing")
+                st.markdown(f"Apply single-mode squeezers $S(r)$ to each of the {gauss_res['num_final_modes']} vacuum modes.")
+                
+                # Format squeezings in r and dB
+                squeezings_formatted = []
+                for r in gauss_res['squeezings_r']:
+                    r_db = r * 10 * np.log10(np.exp(2))
+                    squeezings_formatted.append(f"r={r:.3f} ({r_db:.2f} dB)")
+                    
+                st.info("**Required Squeezings:** " + ", ".join(squeezings_formatted))
+                
+                # Step 2
+                st.markdown("### Step 2: Passive Interferometer")
+                st.markdown("Apply the linear optical network defined by the unitary matrix $U$.")
+                with st.expander("View Unitary Matrix $U$ & Amplitudes Heatmap"):
+                    U = gauss_res["U_passive"]
+                    import pandas as pd
+                    formatted_U = []
+                    for i in range(U.shape[0]):
+                        row = []
+                        for j in range(U.shape[1]):
+                            z = U[i, j]
+                            r = 0.0 if abs(z.real) < 1e-10 else z.real
+                            i_val = 0.0 if abs(z.imag) < 1e-10 else z.imag
+                            if i_val >= 0:
+                                row.append(f"{r:.4f} + {i_val:.4f}j")
+                            else:
+                                row.append(f"{r:.4f} - {abs(i_val):.4f}j")
+                        formatted_U.append(row)
+                        
+                    df_U = pd.DataFrame(formatted_U, 
+                                        index=[f"Out {i}" for i in range(U.shape[0])],
+                                        columns=[f"In {j}" for j in range(U.shape[1])])
+                    st.dataframe(df_U, use_container_width=True)
+                    
+                    import plotly.express as px
+                    amplitudes = np.abs(U)
+                    fig_U = px.imshow(amplitudes, 
+                                      labels=dict(x="Input Mode (from Squeezers)", y="Output Mode", color="Amplitude |U|"),
+                                      x=[f"{j}" for j in range(U.shape[1])],
+                                      y=[f"{i}" for i in range(U.shape[0])],
+                                      color_continuous_scale="Blues",
+                                      title="Interferometer Amplitudes |U|")
+                    st.plotly_chart(fig_U, use_container_width=True)
+
+                # Step 3
+                st.markdown("### Step 3: Displacements")
+                st.markdown("Apply phase-space displacements to the output modes.")
+                with st.expander("View Displacements per Mode"):
+                    st.markdown("**Final Mode Displacements $(\\mu_x, \\mu_p)$:**")
+                    for i, (mx, mp) in enumerate(gauss_res['final_mu']):
+                        mode_info = gauss_res['modes'][i]
+                        st.text(f"Mode {i} ({mode_info['id']}): x={mx:.4f}, p={mp:.4f}")
+                        
+                # Step 4
+                st.markdown("### Step 4: PNR Measurements")
+                st.markdown("Perform Photon-Number Resolving (PNR) measurements on the control modes.")
+                signal_mode = None
+                for i, mode_info in enumerate(gauss_res['modes']):
+                    if mode_info['type'] == 'control':
+                        st.success(f"Mode {i} ({mode_info['id']}): Detect **{mode_info.get('pnr_val', '?')}** photons")
+                    else:
+                        signal_mode = f"Mode {i} ({mode_info['id']})"
+                        
+                # Output
+                st.markdown("### Output: Heralded State")
+                st.info(f"The remaining unmeasured mode is the output state: **{signal_mode}**")
+
+            except Exception as e:
+                import traceback
+                st.error(f"Error computing Gaussian decomposition: {e}")
+                st.code(traceback.format_exc())
+
             st.divider()
 
             # --- Independent Verification (Multi-Cutoff) ---
