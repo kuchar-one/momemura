@@ -302,7 +302,21 @@ def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
     final_mu_list = []
     for i in range(N_current):
         final_mu_list.append((float(mu_global[i]), float(mu_global[N_current + i])))
-        
+
+    # Identify the heralded signal mode and the PNR-measured control modes.
+    # V_global / mu_global use xp-ordering (x_0..x_{N-1}, p_0..p_{N-1}), hbar=2,
+    # with vacuum covariance = Identity (matches the Hanamura paper convention).
+    signal_idx = None
+    control_idx = []
+    pnr_outcomes = []
+    for i, m in enumerate(modes):
+        if m["type"] == "control":
+            control_idx.append(i)
+            pnr_outcomes.append(int(m.get("pnr_val", 0)))
+        else:
+            if signal_idx is None:
+                signal_idx = i
+
     return {
         "num_initial_modes": total_initial_modes,
         "num_homodyne_measurements": num_homodyne,
@@ -312,5 +326,11 @@ def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
         "max_squeezing_db": float(max_db),
         "final_mu": final_mu_list,
         "modes": modes,
-        "U_passive": U_passive
+        "U_passive": U_passive,
+        # Full pre-PNR Gaussian state (control-mode representation source):
+        "cov": V_global,
+        "mu": mu_global,
+        "signal_idx": signal_idx,
+        "control_idx": control_idx,
+        "pnr_outcomes": pnr_outcomes,
     }

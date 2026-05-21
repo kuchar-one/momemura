@@ -32,6 +32,145 @@ def load_data(path):
     return utils.load_run(path)
 
 
+def render_gbs_optimization(st, gauss_res, genotype_idx, key_suffix, go):
+    """Run and display the Hanamura (PRX 2026) two-step optimization of the
+    GBS generator equivalent to the selected solution."""
+    import numpy as np
+
+    st.divider()
+    st.subheader("Optimized GBS Architecture (Hanamura PRX 16, 021034)")
+    st.markdown(
+        "Treating the circuit above as a multimode non-Gaussian state generator "
+        "$(C,\\beta,n)$, we (1) **reduce the detected photon numbers** via wave-form "
+        "matching and (2) **maximize the success probability** via the damping "
+        "transform — both modifying only the *Gaussian* part while preserving the "
+        "heralded output state (up to a Gaussian unitary, absorbed by the final "
+        "Gaussian operation on the signal)."
+    )
+
+    cov = gauss_res.get("cov")
+    mu = gauss_res.get("mu")
+    control_idx = gauss_res.get("control_idx") or []
+    signal_idx = gauss_res.get("signal_idx")
+    pnr = gauss_res.get("pnr_outcomes") or []
+
+    if cov is None or signal_idx is None or len(control_idx) == 0:
+        st.warning("No control (PNR) modes available to optimize for this solution.")
+        return
+    if sum(int(x) for x in pnr) == 0:
+        st.info("All control modes detect 0 photons (Gaussian output) — nothing to reduce.")
+        return
+
+    factor = st.slider(
+        "Photon-reduction factor (target ≈ n / factor, parity preserved)",
+        min_value=1.5, max_value=5.0, value=3.0, step=0.5,
+        key=f"gbs_factor_{genotype_idx}_{key_suffix}",
+        help="Higher factor = more aggressive photon-number reduction. Output "
+             "fidelity typically drops and required squeezing rises as the "
+             "reduction becomes more aggressive.",
+    )
+
+    cache_key = f"gbs_opt_{genotype_idx}_{key_suffix}_{factor}"
+    if cache_key not in st.session_state:
+        with st.spinner("Optimizing GBS architecture (control-parameter method)…"):
+            st.session_state[cache_key] = go.optimize_gbs_architecture(
+                np.asarray(cov), np.asarray(mu), int(signal_idx),
+                list(control_idx), list(pnr),
+                reduction_factor=float(factor), verify=True,
+            )
+    res = st.session_state[cache_key]
+
+    # --- headline metrics --------------------------------------------------
+    ver = res.get("verification", {})
+    fid = ver.get("output_fidelity")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Detected photons", f"{res['total_photons_after']}",
+              delta=f"{res['total_photons_after'] - res['total_photons_before']} vs {res['total_photons_before']}")
+    gain = res["prob_gain"]
+    c2.metric("Success probability", f"{res['prob_after']:.2e}",
+              delta=f"×{gain:.3g}" if np.isfinite(gain) else "↑")
+    if fid is not None:
+        c3.metric("Output fidelity (up to Gaussian U)", f"{fid * 100:.2f}%")
+    else:
+        c3.metric("Output fidelity", "n/a")
+
+    st.caption(
+        f"Success probability: {res['prob_before']:.2e} → "
+        f"{res['prob_after_step1']:.2e} (after photon reduction) → "
+        f"{res['prob_after']:.2e} (after probability maximization)."
+    )
+
+    # --- non-Gaussian control parameters ----------------------------------
+    import pandas as pd
+    rows = []
+    for m in range(len(control_idx)):
+        pb = res["params_before"][m]
+        pa = res["params_after"][m]
+        rows.append({
+            "Control mode": gauss_res["modes"][control_idx[m]]["id"]
+            if control_idx[m] < len(gauss_res["modes"]) else f"mode {m}",
+            "n → n'": f"{res['n_before'][m]} → {res['n_after'][m]}",
+            "s₀ → s₀'": f"{pb['s0']:.3f} → {pa['s0']:.3f}",
+            "|δ₀| → |δ₀'|": f"{abs(pb['delta0']):.3f} → {abs(pa['delta0']):.3f}",
+        })
+    st.markdown("**Non-Gaussian control parameters** (per control mode)")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # --- optimized architecture -------------------------------------------
+    arch = res["architecture"]
+    st.markdown("**Optimized generator** — vacuum → squeezers → interferometer → "
+                "displacements → PNR")
+    sq_str = ", ".join(
+        f"r={r:.3f} ({db:.2f} dB)"
+        for r, db in zip(arch["squeezings_r"], arch["squeezings_db"])
+    )
+    st.info(f"**Required squeezings:** {sq_str}")
+    st.caption(
+        f"PNR detection pattern: {arch['pnr_outcomes']} "
+        f"(was {res['n_before']}). Max squeezing {arch['max_squeezing_db']:.2f} dB — "
+        "this is the experimental cost of the probability gain; lower the "
+        "reduction factor for a milder trade-off."
+    )
+
+    with st.expander("Interferometer & displacements of the optimized generator"):
+        U = arch["U_passive"]
+        try:
+            import plotly.express as px
+            fig_U = px.imshow(
+                np.abs(U),
+                labels=dict(x="Input (squeezer)", y="Output mode", color="|U|"),
+                color_continuous_scale="Blues",
+                title="Optimized interferometer amplitudes |U|",
+            )
+            st.plotly_chart(fig_U, use_container_width=True,
+                            key=f"gbs_U_{genotype_idx}_{key_suffix}_{factor}")
+        except Exception:
+            st.write(np.round(np.abs(U), 4))
+        st.markdown("**Displacements $(\\mu_x, \\mu_p)$ per mode:**")
+        for i, (mx, mp) in enumerate(arch["displacements"]):
+            role = "signal" if i in arch["signal_idx"] else "control"
+            st.text(f"Mode {i} ({role}): x={mx:.4f}, p={mp:.4f}")
+
+    # --- verification ------------------------------------------------------
+    with st.expander("Verification", expanded=True):
+        if fid is not None:
+            ok = fid > 0.99
+            (st.success if ok else st.warning)(
+                f"Heralded output state preserved with fidelity **{fid*100:.3f}%** "
+                f"(up to a Gaussian unitary), simulated at Fock cutoff "
+                f"{ver.get('herald_cutoff')}."
+            )
+        elif ver.get("fidelity_skipped"):
+            st.info("Exact output-fidelity simulation skipped (too many modes): "
+                    + ver["fidelity_skipped"])
+        st.markdown(
+            f"- Step 2 output invariance: {ver.get('step2_output_invariant')}\n"
+            f"- Optimized generator is a valid Gaussian state "
+            f"(C ≥ iΩ): **{ver.get('optimized_generator_valid')}**\n"
+            f"- Damping parameters t = {np.round(res['damping']['t'], 3).tolist()}"
+        )
+
+
 def render_solution_details(row, result_obj, key_suffix=""):
     genotype_idx = int(row["genotype_idx"])
 
@@ -321,6 +460,20 @@ def render_solution_details(row, result_obj, key_suffix=""):
                 # Output
                 st.markdown("### Output: Heralded State")
                 st.info(f"The remaining unmeasured mode is the output state: **{signal_mode}**")
+
+                # --- Optimized GBS Architecture (Hanamura PRX 2026) ---
+                try:
+                    import frontend.gbs_optimizer as gbs_optimizer
+                    importlib.reload(gbs_optimizer)
+                    render_gbs_optimization(
+                        st, gauss_res, genotype_idx, key_suffix, gbs_optimizer
+                    )
+                except Exception as opt_err:
+                    import traceback
+                    st.divider()
+                    st.subheader("Optimized GBS Architecture (Hanamura)")
+                    st.error(f"Could not optimize GBS architecture: {opt_err}")
+                    st.code(traceback.format_exc())
 
             except Exception as e:
                 import traceback
