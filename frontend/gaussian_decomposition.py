@@ -20,11 +20,18 @@ def get_bs_symplectic(theta: float, phi: float, N_modes: int, modeA: int, modeB:
     U = np.eye(N_modes, dtype=complex)
     t = np.cos(theta)
     r = np.sin(theta)
-    
-    # Standard BS unitary (matching independent_verifier._build_clements_unitary)
+
+    # Mode (Heisenberg) transformation a_out = U @ a implemented by the
+    # Fock-space beam splitter U_BS = exp(theta (e^{iphi} a^dag b - e^{-iphi} a b^dag))
+    # used by the JAX breeding sim and independent_verifier. That generator gives
+    #   a_out_A =  t a_A + e^{ iphi} r a_B
+    #   a_out_B = -e^{-iphi} r a_A + t a_B
+    # (The previous version stored the TRANSPOSE of this matrix, i.e. it flipped
+    #  the reflection direction of the beam splitter, which is not a single-mode
+    #  unitary and made the moment-space path disagree with the Fock-space paths.)
     U[modeA, modeA] = t
-    U[modeA, modeB] = -np.exp(-1j * phi) * r
-    U[modeB, modeA] = np.exp(1j * phi) * r
+    U[modeA, modeB] = np.exp(1j * phi) * r
+    U[modeB, modeA] = -np.exp(-1j * phi) * r
     U[modeB, modeB] = t
     
     S = np.block([

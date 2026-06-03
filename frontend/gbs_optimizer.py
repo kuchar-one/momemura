@@ -211,8 +211,16 @@ def damping_transform_control(C: np.ndarray, beta: np.ndarray,
     return Cp, bp
 
 
-def is_valid_covariance(C: np.ndarray, tol: float = 1e-6) -> bool:
-    """C >= i Omega: all symplectic eigenvalues real and >= 1."""
+# a generous numerical-safety squeezing ceiling used in "uncapped" mode: beyond
+# this the covariance becomes ill-conditioned and is experimentally meaningless.
+SAFETY_SQUEEZING_DB = 40.0
+_DB_PER_NAT = 10 * np.log10(np.e ** 2)   # ~8.6859
+
+
+def is_valid_covariance(C: np.ndarray, tol: float = 1e-6,
+                        max_symplectic: float = 1e6) -> bool:
+    """C >= i Omega: all symplectic eigenvalues real, >= 1 and bounded (the
+    upper bound rejects numerically ill-conditioned boundary covariances)."""
     from thewalrus.decompositions import symplectic_eigenvals
     try:
         se = np.asarray(symplectic_eigenvals(C))
@@ -220,24 +228,37 @@ def is_valid_covariance(C: np.ndarray, tol: float = 1e-6) -> bool:
         return False
     if np.any(np.abs(se.imag) > 1e-6):
         return False
-    return bool(np.min(se.real) >= 1.0 - tol)
+    se = se.real
+    return bool(np.min(se) >= 1.0 - tol and np.max(se) <= max_symplectic)
 
 
 def generator_max_squeezing_db(C: np.ndarray, beta: np.ndarray) -> float:
     """Max squeezing (dB) of the physical generator realizing control moments
-    (C, beta), via canonical purification + Bloch-Messiah."""
-    Vf, muf, _, _ = purify_control(C, beta)
-    return decompose_architecture(Vf, muf)["max_squeezing_db"]
+    (C, beta).  Robust covariance-eigenvalue route; returns +inf if the moments
+    are too ill-conditioned to realize."""
+    try:
+        Vf, _, _, _ = purify_control(C, beta)
+        r = pure_state_squeezings(Vf)
+        return float(r[0] * _DB_PER_NAT) if len(r) else 0.0
+    except Exception:
+        return float("inf")
 
 
-def _damping_prob(C, beta, t, n) -> Tuple[float, bool]:
+def _damping_prob(C, beta, t, n):
+    """Returns (prob, valid, Cp, bp)."""
     try:
         Cp, bp = damping_transform_control(C, beta, t)
-    except np.linalg.LinAlgError:
-        return 0.0, False
+    except (np.linalg.LinAlgError, ValueError):
+        return 0.0, False, None, None
     if not is_valid_covariance(Cp):
-        return 0.0, False
-    return success_probability(Cp, bp, n), True
+        return 0.0, False, Cp, bp
+    try:
+        p = success_probability(Cp, bp, n)
+    except Exception:
+        return 0.0, False, Cp, bp
+    if not np.isfinite(p) or p <= 0:
+        return 0.0, False, Cp, bp
+    return p, True, Cp, bp
 
 
 def optimize_damping(C: np.ndarray, beta: np.ndarray, n: Sequence[int],
@@ -248,10 +269,10 @@ def optimize_damping(C: np.ndarray, beta: np.ndarray, n: Sequence[int],
     attenuation branch (t > 1) and lambda < 0 the amplification branch
     (t I < -C); lambda -> 0 is the identity (no damping).
 
-    If ``max_squeezing_db`` is given, the maximization is constrained so the
-    optimized generator's largest squeezing stays at or below that cap; this
-    trades a little probability for experimental feasibility.  ``None`` gives
-    the uncapped optimum (faithful to the paper).
+    ``max_squeezing_db`` constrains the optimized generator's largest squeezing
+    to stay at/below the cap (experimental-feasibility mode).  ``None`` is the
+    paper-faithful "uncapped" mode, which still applies a generous numerical
+    safety ceiling (``SAFETY_SQUEEZING_DB``) so the result stays realizable.
 
     Returns the optimal t, the maximized probability, lambda, the no-damping
     probability, the generator's max squeezing (dB) and whether the cap was met.
@@ -259,64 +280,54 @@ def optimize_damping(C: np.ndarray, beta: np.ndarray, n: Sequence[int],
     from scipy.optimize import minimize
 
     k = C.shape[0] // 2
+    eff_cap = SAFETY_SQUEEZING_DB if max_squeezing_db is None else min(max_squeezing_db, SAFETY_SQUEEZING_DB)
 
     def coth(lam):
         return 1.0 / np.tanh(lam)
 
-    p_id, _ = _damping_prob(C, beta, coth(np.full(k, 1e3)), n)
-
-    def sq_db_for(lam):
-        Cp, bp = damping_transform_control(C, beta, coth(lam))
-        return generator_max_squeezing_db(Cp, bp)
+    p_id, _, _, _ = _damping_prob(C, beta, coth(np.full(k, 1e3)), n)
+    sq_id = generator_max_squeezing_db(C, beta)
 
     def objective(lam):
         lam = np.where(np.abs(lam) < 1e-3, np.sign(lam + 1e-12) * 1e-3, lam)
-        p, valid = _damping_prob(C, beta, coth(lam), n)
-        if not valid or p <= 0:
-            return 80.0 + float(np.sum(lam ** 2))
+        p, valid, Cp, bp = _damping_prob(C, beta, coth(lam), n)
+        if not valid:
+            return 120.0 + float(np.sum(lam ** 2))
         val = -np.log(p)
-        if max_squeezing_db is not None:
-            try:
-                sq = sq_db_for(lam)
-            except Exception:
-                return 80.0 + float(np.sum(lam ** 2))
-            if sq > max_squeezing_db:                # soft cap penalty (per dB)
-                val += 6.0 * (sq - max_squeezing_db)
+        sq = generator_max_squeezing_db(Cp, bp)
+        if not np.isfinite(sq):
+            return 120.0 + float(np.sum(lam ** 2))
+        if sq > eff_cap:                              # soft cap penalty (per dB)
+            val += 5.0 * (sq - eff_cap)
         return val
 
     best = None
-    starts = [np.full(k, -0.3), np.full(k, -0.6), np.full(k, -0.15),
-              np.full(k, -0.45), np.full(k, 0.3)]
+    starts = [np.full(k, -0.3), np.full(k, -0.5), np.full(k, -0.15), np.full(k, 0.3)]
     if max_squeezing_db is not None:
         starts += [np.full(k, -0.05), np.full(k, -0.1)]
     for lam0 in starts:
         res = minimize(objective, lam0, method="Nelder-Mead",
-                       options=dict(xatol=1e-5, fatol=1e-8, maxiter=4000))
+                       options=dict(xatol=1e-4, fatol=1e-7, maxiter=2500))
         if best is None or res.fun < best.fun:
             best = res
 
     lam_star = best.x
     t_star = coth(lam_star)
-    p_star, valid = _damping_prob(C, beta, t_star, n)
-
-    # squeezing of the chosen generator
-    Cs, bs = damping_transform_control(C, beta, t_star) if valid else (C, beta)
+    p_star, valid, Cs, bs = _damping_prob(C, beta, t_star, n)
     sq_star = generator_max_squeezing_db(Cs, bs) if valid else float("inf")
-    cap_met = (max_squeezing_db is None) or (sq_star <= max_squeezing_db + 1e-3)
+    cap_met = (sq_star <= eff_cap + 1e-3)
 
     # fall back to no damping if the optimum is invalid, worse than identity,
-    # or (in capped mode) still violates the cap while identity satisfies it
-    sq_id = generator_max_squeezing_db(C, beta)
-    use_identity = (not valid) or (p_star < p_id)
-    if max_squeezing_db is not None and not cap_met and sq_id <= max_squeezing_db + 1e-3:
-        use_identity = True
+    # or violates the (effective) cap while identity satisfies it
+    use_identity = (not valid) or (p_star < p_id) or (sq_star > eff_cap + 1e-3 and sq_id <= eff_cap + 1e-3)
     if use_identity:
         t_star = coth(np.full(k, 1e3))
         lam_star = np.full(k, 1e3)
         p_star = p_id
         sq_star = sq_id
-        cap_met = (max_squeezing_db is None) or (sq_star <= max_squeezing_db + 1e-3)
+        cap_met = (sq_star <= eff_cap + 1e-3)
 
+    cap_met = (max_squeezing_db is None) or (sq_star <= max_squeezing_db + 1e-3)
     return dict(t=t_star, prob=p_star, lam=lam_star, prob_no_damping=p_id,
                 max_squeezing_db=sq_star, cap_met=cap_met,
                 max_squeezing_cap=max_squeezing_db)
@@ -478,21 +489,40 @@ def fidelity_up_to_gaussian(psi0: np.ndarray, psi1: np.ndarray, cutoff: int,
 # =============================================================================
 # Architecture decomposition of a pure Gaussian state
 # =============================================================================
-def decompose_architecture(cov: np.ndarray, mu: np.ndarray) -> Dict[str, Any]:
-    """Williamson + Bloch-Messiah of a pure Gaussian state -> squeezers (r, dB),
-    passive interferometer U, and per-mode displacements (mu_x, mu_p)."""
-    from thewalrus.decompositions import williamson, blochmessiah
-
+def pure_state_squeezings(cov: np.ndarray) -> np.ndarray:
+    """Squeezing magnitudes r_i (descending) of a *pure* Gaussian state.
+    For vacuum covariance = I, cov = S Sᵀ, so the eigenvalues of cov are
+    {e^{±2 r_i}} and r_i = 1/2 |log lambda_i|.  This is numerically robust and
+    needs no symplectic decomposition (avoids blochmessiah's strict check)."""
     N = cov.shape[0] // 2
-    D_W, S_W = williamson(cov)
-    O1, D_sq, O2 = blochmessiah(S_W)
-    r_all = -np.log(np.diag(D_sq)[:N])
-    order = np.argsort(np.abs(r_all))[::-1]
-    r_sorted = np.abs(r_all[order])
-    X = O1[:N, :N]; Y = O1[N:, :N]
-    U = (X + 1j * Y)[:, order]
+    ev = np.linalg.eigvalsh(0.5 * (cov + cov.T))
+    ev = np.clip(np.sort(ev)[::-1], 1e-15, None)
+    r = 0.5 * np.log(ev[:N])
+    return np.sort(np.abs(r))[::-1]
+
+
+def decompose_architecture(cov: np.ndarray, mu: np.ndarray) -> Dict[str, Any]:
+    """Decompose a pure Gaussian state into squeezers (r, dB), the passive
+    interferometer U, and per-mode displacements (mu_x, mu_p).
+
+    Squeezings are computed robustly from the covariance eigenvalues; the
+    interferometer is obtained from Bloch-Messiah when numerically well
+    conditioned, otherwise left as ``None`` (display-only)."""
+    N = cov.shape[0] // 2
+    r_sorted = pure_state_squeezings(cov)
     db = r_sorted * 10 * np.log10(np.exp(2))
     disp = [(float(mu[i]), float(mu[N + i])) for i in range(N)]
+    U = None
+    try:
+        from thewalrus.decompositions import williamson, blochmessiah
+        _, S_W = williamson(0.5 * (cov + cov.T))
+        O1, D_sq, _ = blochmessiah(S_W)
+        r_all = -np.log(np.diag(D_sq)[:N])
+        order = np.argsort(np.abs(r_all))[::-1]
+        X = O1[:N, :N]; Y = O1[N:, :N]
+        U = (X + 1j * Y)[:, order]
+    except Exception:
+        U = None
     return dict(squeezings_r=r_sorted.tolist(), squeezings_db=db.tolist(),
                 U_passive=U, displacements=disp,
                 max_squeezing_db=float(db[0]) if len(db) else 0.0)
@@ -517,10 +547,28 @@ def default_targets(n: Sequence[int], factor: float = 3.0) -> List[int]:
 # =============================================================================
 # Top-level optimization
 # =============================================================================
+# maximum total detected photons for which p_n is computed directly (loop
+# hafnian of size 2*sum(n) -> keep this tractable)
+_MAX_PHOTONS_FOR_PROB = 16
+
+
+def _safe_success_probability(C, beta, n) -> Optional[float]:
+    """success_probability, or None if the total photon count would make the
+    loop hafnian intractable."""
+    if sum(int(x) for x in n) > _MAX_PHOTONS_FOR_PROB:
+        return None
+    try:
+        return success_probability(C, beta, n)
+    except Exception:
+        return None
+
+
 def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
                               control_idx: Sequence[int], pnr_outcomes: Sequence[int],
                               targets: Optional[Sequence[int]] = None,
                               reduction_factor: float = 3.0,
+                              max_squeezing_db: Optional[float] = None,
+                              original_probability: Optional[float] = None,
                               verify: bool = True,
                               herald_cutoff: Optional[int] = None) -> Dict[str, Any]:
     """Run the Hanamura two-step optimization on a GBS generator.
@@ -533,8 +581,14 @@ def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
     pnr_outcomes : detected photon number on each control mode.
     targets : optional explicit reduced photon numbers (one per control mode);
               if None, a default ~``reduction_factor`` reduction is used.
-    verify : if True, compute the heralded output states before/after and the
-             fidelity-up-to-Gaussian-unitary (always-on verification).
+    max_squeezing_db : if given, the probability maximization is constrained so
+              the optimized generator's largest squeezing stays at/below this
+              cap (experimental-feasibility mode); None = uncapped (paper-faithful).
+    original_probability : the known success probability of the original
+              generator (e.g. from the breeding simulation / stored LogProb).
+              Used instead of recomputing when the original photon count is too
+              high for a direct loop-hafnian evaluation.
+    verify : if True, run the always-on verification (Wigner / fidelity).
 
     Returns a dict with the original and optimized control parameters, photon
     numbers, success probabilities, the optimized GBS architecture, and (if
@@ -569,13 +623,16 @@ def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
                         k=1.0, d=0.0, nu=params_before[m]["nu"], n=n0[m], nprime=n0[m])
         step1_info.append(info)
     n1 = list(targets)
-    p0 = success_probability(C0, b0, n0)
-    p1 = success_probability(C1, b1, n1)
+
+    # original probability: prefer the supplied value (high photon counts make
+    # a direct loop-hafnian evaluation intractable)
+    p0 = original_probability if original_probability is not None else _safe_success_probability(C0, b0, n0)
+    p1 = _safe_success_probability(C1, b1, n1)
 
     # --- Step 2: success-probability maximization --------------------------
-    damp = optimize_damping(C1, b1, n1)
+    damp = optimize_damping(C1, b1, n1, max_squeezing_db=max_squeezing_db)
     C2, b2 = damping_transform_control(C1, b1, damp["t"])
-    p2 = success_probability(C2, b2, n1)
+    p2 = _safe_success_probability(C2, b2, n1)
 
     params_after = []
     for m in range(k):
@@ -583,18 +640,28 @@ def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
         params_after.append(control_parameters(C2[np.ix_(idx, idx)], b2[idx]))
 
     # --- Realize the optimized generator as a physical architecture --------
-    Vopt, muopt, ctrl_opt, sig_opt = purify_control(C2, b2)
-    arch = decompose_architecture(Vopt, muopt)
-    arch["signal_idx"] = sig_opt
-    arch["control_idx"] = ctrl_opt
-    arch["pnr_outcomes"] = n1
+    try:
+        Vopt, muopt, ctrl_opt, sig_opt = purify_control(C2, b2)
+        arch = decompose_architecture(Vopt, muopt)
+        arch["signal_idx"] = sig_opt
+        arch["control_idx"] = ctrl_opt
+        arch["pnr_outcomes"] = n1
+    except Exception as exc:                       # pragma: no cover - defensive
+        arch = dict(squeezings_r=[], squeezings_db=[], U_passive=None,
+                    displacements=[], max_squeezing_db=float("nan"),
+                    signal_idx=[], control_idx=[], pnr_outcomes=n1,
+                    error=f"architecture decomposition failed: {exc}")
+
+    def _gain(num, den):
+        if num is None or den is None or den <= 0:
+            return None
+        return num / den
 
     result = dict(
         n_before=n0, n_after=n1,
         total_photons_before=int(sum(n0)), total_photons_after=int(sum(n1)),
         prob_before=p0, prob_after_step1=p1, prob_after=p2,
-        prob_gain=(p2 / p0 if p0 > 0 else float("inf")),
-        prob_gain_step1=(p1 / p0 if p0 > 0 else float("inf")),
+        prob_gain=_gain(p2, p0), prob_gain_step1=_gain(p1, p0),
         params_before=params_before, params_after=params_after,
         step1_info=step1_info, damping=damp,
         architecture=arch,
@@ -608,59 +675,112 @@ def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
     return result
 
 
+# total detected photons up to which a heralded output state is simulated
+# (loop-hafnian cost grows with the photon count, not the mode count)
+_MAX_PHOTONS_FOR_HERALD_BEFORE = 18
+_MAX_PHOTONS_FOR_HERALD_AFTER = 26
+
+
+def align_states(psi_ref: np.ndarray, psi: np.ndarray, cutoff: int,
+                 guess=(0, 0, 0, 0, 0), align_cut: Optional[int] = None
+                 ) -> Tuple[float, np.ndarray]:
+    """Find the single-mode Gaussian unitary U maximizing |<psi_ref|U|psi>|^2
+    and return (fidelity, U|psi>) at full cutoff.  Used to align the optimized
+    output to the original for Wigner comparison (the architecture's final
+    Gaussian operation realizes this U)."""
+    import scipy.linalg as sla
+    from scipy.optimize import minimize
+
+    cut = min(align_cut or cutoff, len(psi), len(psi_ref))
+    a_s = np.diag(np.sqrt(np.arange(1, cut)), k=1); ad_s = a_s.T
+    nv_s = np.arange(cut)
+    r0 = psi_ref[:cut] / (np.linalg.norm(psi_ref[:cut]) + 1e-300)
+    p1 = psi[:cut] / (np.linalg.norm(psi[:cut]) + 1e-300)
+
+    def negf(p):
+        dr, di, r, phi, varphi = p
+        v = sla.expm(0.5 * (r * np.exp(-2j * phi) * a_s @ a_s
+                            - r * np.exp(2j * phi) * ad_s @ ad_s)) @ p1
+        v = np.exp(1j * nv_s * varphi) * v
+        disp = dr + 1j * di
+        v = sla.expm(disp * ad_s - np.conj(disp) * a_s) @ v
+        return -abs(np.vdot(r0, v)) ** 2
+
+    best = None
+    for start in (guess, (0, 0, 0, 0, 0), (0, 0, 0.4, 0, 0), (0, 0, -0.4, 0, 0)):
+        res = minimize(negf, np.array(start, dtype=float), method="Nelder-Mead",
+                       options=dict(xatol=1e-4, fatol=1e-7, maxiter=1500))
+        if best is None or res.fun < best.fun:
+            best = res
+    fid = float(-best.fun)
+
+    # apply the best U at full cutoff
+    n = len(psi)
+    a = np.diag(np.sqrt(np.arange(1, n)), k=1); ad = a.T
+    dr, di, r, phi, varphi = best.x
+    v = sla.expm(0.5 * (r * np.exp(-2j * phi) * a @ a - r * np.exp(2j * phi) * ad @ ad)) @ psi
+    v = np.exp(1j * np.arange(n) * varphi) * v
+    disp = dr + 1j * di
+    v = sla.expm(disp * ad - np.conj(disp) * a) @ v
+    v = v / (np.linalg.norm(v) + 1e-300)
+    return fid, v
+
+
 def verify_optimization(cov, mu, signal_idx, control_idx, n0, C1, b1, n1, C2, b2,
                         step1_info, herald_cutoff: Optional[int] = None) -> Dict[str, Any]:
     """Always-on verification of the optimization.
 
-    Checks:
-      * fidelity (up to Gaussian unitary) between the original output state and
-        the optimized output state.  Step 2 preserves the output exactly
-        (Theorem 10), so this equals the original-vs-Step-1 fidelity, evaluated
-        from the moderate-squeezing Step-1 generator (numerically robust);
-      * that the damping transform produced a physically valid generator;
-      * the success-probability change;
-      * (cheap) that the damping leaves the success probability's underlying
-        output invariant by re-deriving the control parameters.
+    Moment-space checks (always): generator validity and the exact (Theorem 10)
+    output invariance of Step 2.
+
+    State-level check (Wigner / fidelity): the optimized output equals the
+    Step-1 output exactly (Step 2 invariant), so we herald the Step-1 generator
+    (reduced photons -> cheap, scalable in the number of modes) to obtain the
+    optimized output, and the original generator when its photon count is small
+    enough.  Heralding cost grows with the total photon number, not the mode
+    count.  Returns the heralded output state vectors so the caller can plot the
+    before/after Wigner functions and report their fidelity.
     """
     report: Dict[str, Any] = {}
-
-    # --- scalable, moment-space checks (always run) ------------------------
     report["optimized_generator_valid"] = is_valid_covariance(C2)
     report["step1_generator_valid"] = is_valid_covariance(C1)
     report["step2_output_invariant"] = "exact (Theorem 10): damping preserves the output state"
 
-    # cutoff sized to the (moderate-squeezing) Step-1 generator
-    V1, mu1, c1, s1 = purify_control(C1, b1)
-    arch1 = decompose_architecture(V1, mu1)
-    rmax = max(arch1["squeezings_r"], default=0.0)
-    sq_photons = int(np.sinh(rmax) ** 2)
-    cutoff = herald_cutoff or int(min(70, max(36, max(max(n0), max(n1)) + 3 * sq_photons + 10)))
-
-    # --- exact output fidelity (only when the Fock tensor is tractable) ----
-    #     heralding an M-mode state costs ~ cutoff**M; guard against blow-up.
-    n_modes_orig = 1 + len(control_idx)
-    n_modes_step1 = len(c1) + len(s1)
-    cost = cutoff ** max(n_modes_orig, n_modes_step1)
+    cutoff = int(herald_cutoff or 40)
     report["herald_cutoff"] = cutoff
-    if cost > 5e6:
-        report["output_fidelity"] = None
-        report["fidelity_skipped"] = (
-            f"exact output simulation skipped: {max(n_modes_orig, n_modes_step1)} modes "
-            f"x cutoff {cutoff} is too large (~{cost:.1e} amplitudes). "
-            "Moment-space checks above remain valid; reduce the problem to verify directly."
-        )
-        return report
+    report["psi_after"] = None
+    report["psi_before"] = None
+    report["output_fidelity"] = None
 
+    # optimized (= Step-1, since Step 2 is exact) output state
     try:
-        psi0, prob0 = heralded_output(cov, mu, signal_idx, control_idx, n0, cutoff=cutoff)
-        psi1, prob1 = heralded_output(V1, mu1, s1[0], c1, n1, cutoff=cutoff)
-        k_guess = step1_info[0]["k"] if step1_info else 1.0
-        fid = fidelity_up_to_gaussian(psi0, psi1, cutoff,
+        if sum(n1) <= _MAX_PHOTONS_FOR_HERALD_AFTER:
+            V1, mu1, c1, s1 = purify_control(C1, b1)
+            psi_after, _ = heralded_output(V1, mu1, s1[0], c1, n1, cutoff=cutoff)
+            report["psi_after"] = psi_after
+        else:
+            report["after_skipped"] = (
+                f"optimized output not simulated: {sum(n1)} detected photons "
+                "exceed the direct-simulation budget.")
+    except Exception as exc:                       # pragma: no cover - defensive
+        report["after_error"] = f"after-output herald failed: {exc}"
+
+    # original output state (only when its photon count is small enough)
+    try:
+        if sum(n0) <= _MAX_PHOTONS_FOR_HERALD_BEFORE:
+            psi_before, _ = heralded_output(cov, mu, signal_idx, control_idx, n0, cutoff=cutoff)
+            report["psi_before"] = psi_before
+            if report["psi_after"] is not None:
+                k_guess = step1_info[0]["k"] if step1_info else 1.0
+                fid, _ = align_states(psi_before, report["psi_after"], cutoff,
                                       guess=(0, 0, -np.log(max(k_guess, 1e-6)), 0, 0),
-                                      align_cut=min(cutoff, 40))
-        report["output_fidelity"] = fid
-        report["herald_prob_original"] = prob0
-    except Exception as exc:                   # pragma: no cover - defensive
-        report["output_fidelity"] = None
-        report["error"] = f"fidelity check failed: {exc}"
+                                      align_cut=min(cutoff, 36))
+                report["output_fidelity"] = fid
+        else:
+            report["before_note"] = (
+                f"original output ({sum(n0)} photons) not simulated here; supply it "
+                "from the breeding simulation to compare Wigner functions.")
+    except Exception as exc:                       # pragma: no cover - defensive
+        report["before_error"] = f"before-output herald failed: {exc}"
+
     return report

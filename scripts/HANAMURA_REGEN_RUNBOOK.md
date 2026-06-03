@@ -1,0 +1,67 @@
+# Hanamura figure/table regeneration — runbook
+
+Regenerates the Hanamura **before/after** data and the `tab:hanamura` numbers for
+the canonical trio {|+>, |H>, |T>} with the **bug-fixed** heralding code, then
+feeds the existing thesis plotter. Split into a GPU step (cluster) and a CPU step
+(plot + LaTeX) because the figure data needs JAX + thewalrus.
+
+## Why this was needed
+- `wigner_pareto_pairs.npz` and `tab:hanamura` predate the `compute_equivalent_gaussian`
+  fix (transposed BS / parity), so their squeezings + Hanamura gains came from buggy moments.
+- The old "before" states were rebuilt via `heralded_output` on the moment-reduced
+  Gaussian ("path-3"), which collapses high-energy displaced-squeezed states onto their
+  even-parity core (visible in the cache: `T_1` before piled at Fock 20–23).
+- Fix: **before** = trusted path-1 breeding sim (`utils.compute_heralded_state`);
+  **after** = the architecture rule (apply the Step-1 reduction symplectic to the FULL
+  equivalent-GBS covariance, then herald — no `purify_control` over-purification).
+- The Pareto **selection** is preserved exactly: each row of the existing
+  `wigner_pareto_data.json` is pinned to its genotype by full-precision probability,
+  so `tab:breeding_pareto` and the Pareto figure are unaffected.
+
+## Data the script needs
+- `experiments/` repertoires — **gitignored and huge, NOT in this commit**; they already live on
+  the cluster. Run from a checkout that sits next to (or symlinks) `experiments/`.
+- The Pareto **selection spec** is bundled in this commit at
+  `scripts/data/hanamura_selection_spec.json` (a copy of the thesis `wigner_pareto_data.json`),
+  so the script pins the same genotypes without needing the `mgr` repo. Override with
+  `--select-from <path>` or ignore it with `--reselect`.
+
+## Step 1 — on the A5000 node (needs jax + thewalrus + the repertoires)
+```bash
+cd <repo-root>                       # the momemura repo
+python scripts/gen_hanamura_data.py --out outputs       # or --out ../mgr/scripts if mgr is a sibling
+```
+Writes into `../mgr/scripts` (where `gen_wigner_pareto.py` reads them):
+- `chosen_genotypes.npz` (+ `chosen_genotypes_meta.json`) — the pinned genotypes (this is the
+  cache that was missing; keep it).
+- `wigner_pareto_data.json` — per-target rows with **refreshed** `gbs_sq_db` + Hanamura columns.
+- `wigner_pareto_pairs.npz` / `wigner_pareto_pairs_meta.json` — before/after state vectors.
+- `hanamura_table.csv` — the `tab:hanamura` numbers (Nc→Nc′, P→P′, gain, r_max→r_max′).
+
+Flags: `--reselect` re-derives the front from scratch (only if you *want* to change the
+selection — the front has grown since the figure was made); `--reduction-factor` (default 3.0);
+`--herald-cap` (default 48).
+
+Sanity checks to eyeball in the log:
+- each target prints `reused 5/5 existing Pareto rows`;
+- "before" states for the magic states should **not** be parity-collapsed (compare even/odd mass);
+- Hanamura may report degraded gain (`x<1`) or invalid (`han_ok=False`) on asymmetric
+  magic configs — that is expected and should be reflected honestly in the table/text.
+
+## Step 2 — plot + LaTeX (CPU; numpy/scipy/matplotlib only)
+```bash
+python ../mgr/scripts/gen_wigner_pareto.py     # -> figures/wigner_hanamura.pdf (+ wigner_pareto.pdf)
+```
+Then update `parts/4chapter.tex`:
+- replace the `tab:hanamura` body from `hanamura_table.csv`;
+- re-check the Hanamura subsection prose against the new gains (note any degraded/invalid magic cases).
+
+I (Claude) can do Step 2 and the tex edits here once the six files are synced back into
+`mgr/scripts`.
+
+## Note on the figure's row selection
+`gen_wigner_pareto.py` currently shows, per target, the highest-gain pair with `prob_gain >= 1.5`.
+With bug-free numbers the magic states may have no row above that threshold (gain can degrade),
+which would blank their figure row. If that happens, switch the selection to "largest valid
+Nc reduction with a valid before+after pair" so all three rows render — decide this after seeing
+the regenerated `wigner_pareto_pairs_meta.json`.

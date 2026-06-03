@@ -32,7 +32,9 @@ def load_data(path):
     return utils.load_run(path)
 
 
-def render_gbs_optimization(st, gauss_res, genotype_idx, key_suffix, go):
+def render_gbs_optimization(st, gauss_res, genotype_idx, key_suffix, go,
+                            params=None, original_probability=None,
+                            xvec=None, pvec=None):
     """Run and display the Hanamura (PRX 2026) two-step optimization of the
     GBS generator equivalent to the selected solution."""
     import numpy as np
@@ -61,51 +63,104 @@ def render_gbs_optimization(st, gauss_res, genotype_idx, key_suffix, go):
         st.info("All control modes detect 0 photons (Gaussian output) — nothing to reduce.")
         return
 
-    factor = st.slider(
-        "Photon-reduction factor (target ≈ n / factor, parity preserved)",
-        min_value=1.5, max_value=5.0, value=3.0, step=0.5,
-        key=f"gbs_factor_{genotype_idx}_{key_suffix}",
-        help="Higher factor = more aggressive photon-number reduction. Output "
-             "fidelity typically drops and required squeezing rises as the "
-             "reduction becomes more aggressive.",
-    )
+    ctrl_col, mode_col = st.columns([1, 1])
+    with ctrl_col:
+        factor = st.slider(
+            "Photon-reduction factor (target ≈ n / factor, parity preserved)",
+            min_value=1.5, max_value=5.0, value=3.0, step=0.5,
+            key=f"gbs_factor_{genotype_idx}_{key_suffix}",
+            help="Higher factor = more aggressive photon-number reduction.",
+        )
+    with mode_col:
+        mode = st.radio(
+            "Probability-maximization mode",
+            ["Cap squeezing", "Uncapped (faithful to paper)"],
+            key=f"gbs_mode_{genotype_idx}_{key_suffix}",
+            help="The uncapped optimum maximizes success probability but may "
+                 "demand high squeezing. Capping trades a little probability "
+                 "for an experimentally feasible squeezing level.",
+        )
+    cap_db = None
+    if mode == "Cap squeezing":
+        cap_db = st.slider(
+            "Max squeezing of the optimized generator (dB)",
+            min_value=6.0, max_value=20.0, value=12.0, step=0.5,
+            key=f"gbs_cap_{genotype_idx}_{key_suffix}",
+        )
 
-    cache_key = f"gbs_opt_{genotype_idx}_{key_suffix}_{factor}"
+    cache_key = f"gbs_opt_{genotype_idx}_{key_suffix}_{factor}_{cap_db}"
     if cache_key not in st.session_state:
         with st.spinner("Optimizing GBS architecture (control-parameter method)…"):
             st.session_state[cache_key] = go.optimize_gbs_architecture(
                 np.asarray(cov), np.asarray(mu), int(signal_idx),
                 list(control_idx), list(pnr),
-                reduction_factor=float(factor), verify=True,
+                reduction_factor=float(factor), max_squeezing_db=cap_db,
+                original_probability=original_probability, verify=True,
             )
     res = st.session_state[cache_key]
+    ver = res.get("verification", {})
+
+    # --- Wigner-function verification (before vs after) --------------------
+    cutoff_h = int(ver.get("herald_cutoff", 40))
+    psi_after = ver.get("psi_after")
+    psi_before = ver.get("psi_before")
+    if psi_before is None and params is not None:
+        try:                                  # efficient breeding simulation
+            psi_before, _ = utils.compute_heralded_state(params, cutoff=cutoff_h)
+            if psi_before is not None and np.sum(np.abs(psi_before) ** 2) < 1e-12:
+                psi_before = None
+        except Exception:
+            psi_before = None
+
+    wigner_fid = None
+    if psi_after is not None and psi_before is not None and xvec is not None:
+        try:
+            psi_after = np.asarray(psi_after)
+            psi_before = np.asarray(psi_before)
+            L = min(len(psi_after), len(psi_before))
+            wigner_fid, aligned_after = go.align_states(
+                psi_before[:L], psi_after[:L], L, align_cut=min(L, 36))
+            W_b = utils.compute_wigner(psi_before[:L], xvec, pvec)
+            W_a = utils.compute_wigner(aligned_after, xvec, pvec)
+            st.markdown("**Output Wigner functions — before vs. after optimization** "
+                        "(after-state aligned by the residual Gaussian unitary)")
+            wc1, wc2 = st.columns(2)
+            wc1.plotly_chart(
+                viz.plot_wigner_function(W_b, xvec, pvec, title="Before optimization"),
+                use_container_width=True, key=f"gbs_wig_b_{genotype_idx}_{key_suffix}_{cache_key}")
+            wc2.plotly_chart(
+                viz.plot_wigner_function(W_a, xvec, pvec, title="After optimization (aligned)"),
+                use_container_width=True, key=f"gbs_wig_a_{genotype_idx}_{key_suffix}_{cache_key}")
+        except Exception as werr:
+            st.caption(f"Wigner comparison unavailable: {werr}")
+
+    fid = ver.get("output_fidelity")
+    if fid is None:
+        fid = wigner_fid
 
     # --- headline metrics --------------------------------------------------
-    ver = res.get("verification", {})
-    fid = ver.get("output_fidelity")
     c1, c2, c3 = st.columns(3)
     c1.metric("Detected photons", f"{res['total_photons_after']}",
               delta=f"{res['total_photons_after'] - res['total_photons_before']} vs {res['total_photons_before']}")
-    gain = res["prob_gain"]
-    c2.metric("Success probability", f"{res['prob_after']:.2e}",
-              delta=f"×{gain:.3g}" if np.isfinite(gain) else "↑")
-    if fid is not None:
-        c3.metric("Output fidelity (up to Gaussian U)", f"{fid * 100:.2f}%")
-    else:
-        c3.metric("Output fidelity", "n/a")
+    gain = res.get("prob_gain")
+    p_after = res.get("prob_after")
+    c2.metric("Success probability",
+              f"{p_after:.2e}" if p_after is not None else "n/a",
+              delta=(f"×{gain:.3g}" if (gain is not None and np.isfinite(gain)) else None))
+    c3.metric("Output fidelity (Wigner, up to Gaussian U)",
+              f"{fid * 100:.2f}%" if fid is not None else "n/a")
 
-    st.caption(
-        f"Success probability: {res['prob_before']:.2e} → "
-        f"{res['prob_after_step1']:.2e} (after photon reduction) → "
-        f"{res['prob_after']:.2e} (after probability maximization)."
-    )
+    pb_str = f"{res['prob_before']:.2e}" if res.get("prob_before") is not None else "?"
+    p1_str = f"{res['prob_after_step1']:.2e}" if res.get("prob_after_step1") is not None else "?"
+    p2_str = f"{p_after:.2e}" if p_after is not None else "?"
+    st.caption(f"Success probability: {pb_str} → {p1_str} (after photon reduction) "
+               f"→ {p2_str} (after probability maximization).")
 
     # --- non-Gaussian control parameters ----------------------------------
     import pandas as pd
     rows = []
     for m in range(len(control_idx)):
-        pb = res["params_before"][m]
-        pa = res["params_after"][m]
+        pb = res["params_before"][m]; pa = res["params_after"][m]
         rows.append({
             "Control mode": gauss_res["modes"][control_idx[m]]["id"]
             if control_idx[m] < len(gauss_res["modes"]) else f"mode {m}",
@@ -120,54 +175,58 @@ def render_gbs_optimization(st, gauss_res, genotype_idx, key_suffix, go):
     arch = res["architecture"]
     st.markdown("**Optimized generator** — vacuum → squeezers → interferometer → "
                 "displacements → PNR")
-    sq_str = ", ".join(
-        f"r={r:.3f} ({db:.2f} dB)"
-        for r, db in zip(arch["squeezings_r"], arch["squeezings_db"])
-    )
-    st.info(f"**Required squeezings:** {sq_str}")
+    if arch.get("squeezings_db"):
+        sq_str = ", ".join(f"r={r:.3f} ({db:.2f} dB)"
+                           for r, db in zip(arch["squeezings_r"], arch["squeezings_db"]))
+        st.info(f"**Required squeezings:** {sq_str}")
+    damp = res["damping"]
+    cap_note = ("uncapped (paper-faithful)" if cap_db is None
+                else f"cap {cap_db:.1f} dB — {'met' if damp.get('cap_met') else 'NOT met'}")
     st.caption(
-        f"PNR detection pattern: {arch['pnr_outcomes']} "
-        f"(was {res['n_before']}). Max squeezing {arch['max_squeezing_db']:.2f} dB — "
-        "this is the experimental cost of the probability gain; lower the "
-        "reduction factor for a milder trade-off."
+        f"PNR detection pattern: {arch.get('pnr_outcomes')} (was {res['n_before']}). "
+        f"Max squeezing {arch.get('max_squeezing_db', float('nan')):.2f} dB [{cap_note}]. "
+        "Higher probability generally requires more squeezing — use the cap to trade off."
     )
 
     with st.expander("Interferometer & displacements of the optimized generator"):
-        U = arch["U_passive"]
-        try:
-            import plotly.express as px
-            fig_U = px.imshow(
-                np.abs(U),
-                labels=dict(x="Input (squeezer)", y="Output mode", color="|U|"),
-                color_continuous_scale="Blues",
-                title="Optimized interferometer amplitudes |U|",
-            )
-            st.plotly_chart(fig_U, use_container_width=True,
-                            key=f"gbs_U_{genotype_idx}_{key_suffix}_{factor}")
-        except Exception:
-            st.write(np.round(np.abs(U), 4))
+        U = arch.get("U_passive")
+        if U is not None:
+            try:
+                import plotly.express as px
+                st.plotly_chart(
+                    px.imshow(np.abs(U),
+                              labels=dict(x="Input (squeezer)", y="Output mode", color="|U|"),
+                              color_continuous_scale="Blues",
+                              title="Optimized interferometer amplitudes |U|"),
+                    use_container_width=True,
+                    key=f"gbs_U_{genotype_idx}_{key_suffix}_{cache_key}")
+            except Exception:
+                st.write(np.round(np.abs(U), 4))
+        else:
+            st.caption("Interferometer omitted (numerically ill-conditioned at this "
+                       "squeezing level).")
         st.markdown("**Displacements $(\\mu_x, \\mu_p)$ per mode:**")
-        for i, (mx, mp) in enumerate(arch["displacements"]):
-            role = "signal" if i in arch["signal_idx"] else "control"
+        for i, (mx, mp) in enumerate(arch.get("displacements", [])):
+            role = "signal" if i in arch.get("signal_idx", []) else "control"
             st.text(f"Mode {i} ({role}): x={mx:.4f}, p={mp:.4f}")
 
-    # --- verification ------------------------------------------------------
+    # --- verification summary ---------------------------------------------
     with st.expander("Verification", expanded=True):
         if fid is not None:
-            ok = fid > 0.99
-            (st.success if ok else st.warning)(
-                f"Heralded output state preserved with fidelity **{fid*100:.3f}%** "
-                f"(up to a Gaussian unitary), simulated at Fock cutoff "
-                f"{ver.get('herald_cutoff')}."
+            (st.success if fid > 0.99 else st.warning)(
+                f"Heralded output state preserved with **{fid*100:.3f}%** fidelity "
+                f"(up to a Gaussian unitary) — confirmed by the Wigner comparison "
+                f"above at Fock cutoff {cutoff_h}."
             )
-        elif ver.get("fidelity_skipped"):
-            st.info("Exact output-fidelity simulation skipped (too many modes): "
-                    + ver["fidelity_skipped"])
+        else:
+            note = ver.get("before_note") or ver.get("after_skipped") or \
+                "output state not simulated (photon count too high and no breeding-sim state available)."
+            st.info("Wigner/fidelity check unavailable: " + note +
+                    " Moment-space checks below remain valid.")
         st.markdown(
             f"- Step 2 output invariance: {ver.get('step2_output_invariant')}\n"
-            f"- Optimized generator is a valid Gaussian state "
-            f"(C ≥ iΩ): **{ver.get('optimized_generator_valid')}**\n"
-            f"- Damping parameters t = {np.round(res['damping']['t'], 3).tolist()}"
+            f"- Optimized generator valid (C ≥ iΩ): **{ver.get('optimized_generator_valid')}**\n"
+            f"- Damping t = {np.round(np.atleast_1d(res['damping']['t']), 3).tolist()}"
         )
 
 
@@ -465,8 +524,14 @@ def render_solution_details(row, result_obj, key_suffix=""):
                 try:
                     import frontend.gbs_optimizer as gbs_optimizer
                     importlib.reload(gbs_optimizer)
+                    try:
+                        _orig_prob = float(10.0 ** (-utils.to_scalar(row["LogProb"])))
+                    except Exception:
+                        _orig_prob = None
                     render_gbs_optimization(
-                        st, gauss_res, genotype_idx, key_suffix, gbs_optimizer
+                        st, gauss_res, genotype_idx, key_suffix, gbs_optimizer,
+                        params=params, original_probability=_orig_prob,
+                        xvec=xvec, pvec=pvec,
                     )
                 except Exception as opt_err:
                     import traceback

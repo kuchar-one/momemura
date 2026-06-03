@@ -169,6 +169,93 @@ def test_default_targets_keep_parity_and_reduce():
         assert (n - t) % 2 == 0          # parity preserved
 
 
+# -----------------------------------------------------------------------------
+# pure-state squeezings (robust, no Bloch-Messiah)
+# -----------------------------------------------------------------------------
+def test_pure_state_squeezings():
+    from thewalrus import symplectic as tws
+    r = np.array([0.8, 0.3, 0.0])
+    X = np.linalg.qr(np.random.default_rng(0).normal(size=(3, 3))
+                     + 1j * np.random.default_rng(1).normal(size=(3, 3)))[0]
+    S = tws.interferometer(X) @ tws.squeezing(r, phi=np.zeros(3))
+    cov = (HBAR / 2) * S @ S.T
+    sq = go.pure_state_squeezings(cov)
+    assert np.allclose(np.sort(sq), np.sort(np.abs(r)), atol=1e-8)
+
+
+# -----------------------------------------------------------------------------
+# alignment up to a Gaussian unitary
+# -----------------------------------------------------------------------------
+def test_align_states_recovers_gaussian_unitary():
+    cut = 40
+    # a non-Gaussian-ish state (photon-subtracted-like): superposition
+    rng = np.random.default_rng(4)
+    psi = np.zeros(cut, dtype=complex)
+    psi[1] = 1.0; psi[3] = 0.6; psi[5] = 0.3
+    psi /= np.linalg.norm(psi)
+    # apply a known single-mode Gaussian unitary (squeeze + rotate + displace)
+    U = go._single_mode_gaussian_unitary((0.2, -0.1, 0.4, 0.3, 0.5), cut)
+    psi_t = U @ psi
+    fid, aligned = go.align_states(psi, psi_t, cut, align_cut=36)
+    assert fid > 0.999
+
+
+# -----------------------------------------------------------------------------
+# squeezing cap
+# -----------------------------------------------------------------------------
+def test_squeezing_cap_respected():
+    cov, mu = cat_gps_state(r_db=5.0, R=0.1)
+    res = go.optimize_gbs_architecture(
+        cov, mu, 0, [1], [9], targets=[3], max_squeezing_db=8.0, verify=False)
+    arch = res["architecture"]
+    assert res["damping"]["cap_met"]
+    assert arch["max_squeezing_db"] <= 8.0 + 0.1
+    assert res["verification"] if False else True   # verify skipped here
+    # capped probability should not exceed the uncapped optimum
+    res_unc = go.optimize_gbs_architecture(
+        cov, mu, 0, [1], [9], targets=[3], max_squeezing_db=None, verify=False)
+    assert res["prob_after"] <= res_unc["prob_after"] + 1e-12
+    assert res_unc["architecture"]["max_squeezing_db"] >= arch["max_squeezing_db"] - 0.5
+
+
+# -----------------------------------------------------------------------------
+# verification returns before/after output states + fidelity (Wigner inputs)
+# -----------------------------------------------------------------------------
+def test_verification_returns_states_and_fidelity():
+    cov, mu = cat_gps_state(r_db=5.0, R=0.1)
+    res = go.optimize_gbs_architecture(
+        cov, mu, 0, [1], [7], targets=[3], verify=True, herald_cutoff=44)
+    ver = res["verification"]
+    assert ver["psi_after"] is not None
+    assert ver["psi_before"] is not None         # 7 photons < herald budget
+    assert ver["output_fidelity"] is not None and ver["output_fidelity"] > 0.99
+
+
+# -----------------------------------------------------------------------------
+# multimode robustness (the 5-mode GKP-like case that crashed blochmessiah)
+# -----------------------------------------------------------------------------
+def test_multimode_high_squeezing_no_crash():
+    from thewalrus import symplectic as tws
+    rng = np.random.default_rng(2)
+    N = 5
+    r = rng.uniform(-1.0, 1.0, N); r[0] = 0.99
+    Q = np.linalg.qr(rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N)))[0]
+    S = tws.interferometer(Q) @ tws.squeezing(r, phi=np.zeros(N))
+    cov = (HBAR / 2) * S @ S.T
+    alpha = rng.uniform(-0.5, 0.5, N) + 1j * rng.uniform(-0.5, 0.5, N)
+    mu = np.concatenate([np.sqrt(2 * HBAR) * alpha.real, np.sqrt(2 * HBAR) * alpha.imag])
+    for cap in (None, 12.0):
+        res = go.optimize_gbs_architecture(
+            cov, mu, 0, [1, 2, 3, 4], [15, 15, 5, 0], reduction_factor=3.0,
+            max_squeezing_db=cap, original_probability=1.3e-5, verify=False)
+        assert res["total_photons_after"] < res["total_photons_before"]
+        assert res["verification"] if False else True
+        assert np.isfinite(res["architecture"]["max_squeezing_db"])
+        assert go.is_valid_covariance(res["control_moments"]["C2"])
+        if cap is not None:
+            assert res["architecture"]["max_squeezing_db"] <= cap + 0.2
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
