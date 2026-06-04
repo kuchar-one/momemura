@@ -119,6 +119,23 @@ def reduced_full_state(eq, n0, n1, cutoff):
     return np.asarray(psi).ravel(), float(prob)
 
 
+def core_state(s0, delta0, n, cutoff):
+    """Hanamura core state  |psi> ~ (a^dag + s0 a + delta0)^n |0>  in the Fock
+    basis (PRX 16, 021034, Eq. for the particle picture; thesis eq:hanamura-particle).
+    This is the heralded output of a single-control-mode generator UP TO a Gaussian
+    unitary, built directly from the control parameters -- no heralding, so it is
+    well-conditioned even when the physical generator is highly squeezed."""
+    c = int(cutoff)
+    a = np.diag(np.sqrt(np.arange(1, c)), k=1)          # annihilation
+    ad = a.conj().T                                     # creation
+    O = ad + complex(s0) * a + complex(delta0) * np.eye(c)
+    psi = np.zeros(c, dtype=complex); psi[0] = 1.0
+    for _ in range(int(n)):
+        psi = O @ psi
+    nrm = np.linalg.norm(psi)
+    return (psi / nrm) if nrm > 0 else psi
+
+
 def _norm_ok(v, max_len=80):
     v = np.asarray(v).ravel()
     return v is not None and 0 < len(v) <= max_len and np.isfinite(v).all() \
@@ -242,20 +259,23 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
         han = dict(han_ok=False, han_Nc=Nc_before, han_prob=None, han_gain=None,
                    han_sq_db=None, han_error="")
         n1 = list(n0)
+        han_res = None
+        k_ctrl = len(eq["control_idx"])
         try:
-            r = go.optimize_gbs_architecture(
+            han_res = go.optimize_gbs_architecture(
                 eq["cov"], eq["mu"], eq["signal_idx"], eq["control_idx"], n0,
                 reduction_factor=reduction_factor, original_probability=p["prob"],
                 verify=False, herald_cutoff=herald_cutoff)
-            n1 = [int(x) for x in r["n_after"]]
-            valid = bool(r.get("damping", {}).get("max_squeezing_db", np.inf) < 1e3) \
-                and r.get("prob_after") is not None
+            n1 = [int(x) for x in han_res["n_after"]]
+            valid = bool(han_res.get("damping", {}).get("max_squeezing_db", np.inf) < 1e3) \
+                and han_res.get("prob_after") is not None \
+                and np.isfinite(han_res.get("prob_after") or np.nan)
             han.update(
                 han_ok=valid,
-                han_Nc=int(r["total_photons_after"]),
-                han_prob=(float(r["prob_after"]) if r["prob_after"] is not None else None),
-                han_gain=(float(r["prob_gain"]) if r["prob_gain"] is not None else None),
-                han_sq_db=round(float(r["architecture"].get("max_squeezing_db", float("nan"))), 2),
+                han_Nc=int(han_res["total_photons_after"]),
+                han_prob=(float(han_res["prob_after"]) if han_res["prob_after"] is not None else None),
+                han_gain=(float(han_res["prob_gain"]) if han_res["prob_gain"] is not None else None),
+                han_sq_db=round(float(han_res["architecture"].get("max_squeezing_db", float("nan"))), 2),
             )
         except Exception as e:
             han["han_error"] = repr(e)[:160]
@@ -270,14 +290,45 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
         except Exception as e:
             print(f"    [{i}] before (path-1) failed: {e!r}")
 
-        # ---- AFTER state: architecture rule on the FULL covariance ----------
+        # ---- core-state reconstruction (paper-faithful, well-conditioned) ----
+        # The heralded output of a single-control-mode generator is, up to a
+        # Gaussian unitary, the core state (a^dag + s0 a + delta0)^n |0>.  We build
+        # it directly from the control parameters -- no thewalrus herald -- so it is
+        # immune to the high-squeezing ill-conditioning.  We validate it against the
+        # trusted path-1 "before"; the same construction with the reduced/damped
+        # parameters gives the "after".
+        psi_before_core = psi_after_core = None
+        core_fid = None
+        s0_b = d0_b = s0_a = d0_a = None
+        if han_res is not None and k_ctrl == 1:
+            pb0 = han_res["params_before"][0]
+            pa0 = han_res["params_after"][0]   # post Step1+Step2; damping preserves (s0,delta0)
+            s0_b, d0_b = float(pb0["s0"]), complex(pb0["delta0"])
+            s0_a, d0_a = float(pa0["s0"]), complex(pa0["delta0"])
+            psi_before_core = core_state(s0_b, d0_b, n0[0], herald_cutoff)
+            psi_after_core = core_state(s0_a, d0_a, n1[0], herald_cutoff)
+            if psi_before is not None:
+                try:
+                    core_fid, _ = go.align_states(psi_before, psi_before_core,
+                                                  herald_cutoff, align_cut=min(herald_cutoff, 36))
+                except Exception:
+                    core_fid = None
+
+        # ---- AFTER state for the figure --------------------------------------
+        # Prefer the core-state reconstruction (k=1); fall back to the
+        # architecture-rule herald otherwise (flagged via core_ok in meta).
         psi_after = None
-        try:
-            pa, _ = reduced_full_state(eq, n0, n1, cutoff=herald_cutoff)
-            if _norm_ok(pa):
-                psi_after = pa
-        except Exception as e:
-            print(f"    [{i}] after (architecture rule) failed: {e!r}")
+        core_ok = (psi_after_core is not None
+                   and (core_fid is None or core_fid > 0.9))
+        if core_ok:
+            psi_after = psi_after_core
+        else:
+            try:
+                pa, _ = reduced_full_state(eq, n0, n1, cutoff=herald_cutoff)
+                if _norm_ok(pa):
+                    psi_after = pa
+            except Exception as e:
+                print(f"    [{i}] after (architecture-rule fallback) failed: {e!r}")
 
         # ---- store --------------------------------------------------------- #
         row = dict(nls_db=round(p["nls_db"], 2), O=round(p["exp"], 4),
@@ -292,12 +343,18 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
             pairs[f"{key}_psi_before"] = _pad(psi_before, L)
         if psi_after is not None:
             pairs[f"{key}_psi_after"] = _pad(psi_after, L)
+        if psi_before_core is not None:
+            pairs[f"{key}_psi_before_core"] = _pad(psi_before_core, L)
         meta[key] = dict(
             Nc=int(round(p["photons"])), nls_db=round(p["nls_db"], 2),
             prob=float(p["prob"]), gname=p["gname"],
             Nc_before=Nc_before, Nc_after=int(han["han_Nc"]),
             prob_gain=han["han_gain"],
             gbs_sq_db=gbs_sq_db, han_sq_db=han["han_sq_db"], han_ok=han["han_ok"],
+            k_control=k_ctrl, after_source=("core" if core_ok else "herald_fallback"),
+            core_validation_fid=(round(core_fid, 4) if core_fid is not None else None),
+            s0_before=s0_b, delta0_before=(abs(d0_b) if d0_b is not None else None),
+            s0_after=s0_a, delta0_after=(abs(d0_a) if d0_a is not None else None),
             psi_before_len=int(len(psi_before)) if psi_before is not None else 0,
             psi_after_len=int(len(psi_after)) if psi_after is not None else 0,
         )
@@ -305,11 +362,13 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
                            gname=p["gname"], config=c, run=p["run"],
                            Nc=int(round(p["photons"])), nls_db=round(p["nls_db"], 2),
                            prob=float(p["prob"])))
+        cf = f"{core_fid:.3f}" if core_fid is not None else "--"
         print(f"    [{i}] xi={row['nls_db']:.2f}dB Nc={row['Nc']} P={row['prob']:.2e} "
-              f"sq={gbs_sq_db:.1f}dB | Hanamura Nc {Nc_before}->{han['han_Nc']} "
+              f"sq={gbs_sq_db:.1f}dB k={k_ctrl} | Hanamura Nc {Nc_before}->{han['han_Nc']} "
               f"gain={('x%.2f'%han['han_gain']) if han['han_gain'] else '--'} "
               f"sq'={han['han_sq_db']} | before={'Y' if psi_before is not None else '-'} "
-              f"after={'Y' if psi_after is not None else '-'}")
+              f"after={'Y(%s)'%('core' if core_ok else 'fb') if psi_after is not None else '-'} "
+              f"core_fid={cf}")
 
     return dict(u=list(u), B_G=float(B), rows=rows), pairs, meta, chosen
 

@@ -11,9 +11,18 @@ feeds the existing thesis plotter. Split into a GPU step (cluster) and a CPU ste
 - The old "before" states were rebuilt via `heralded_output` on the moment-reduced
   Gaussian ("path-3"), which collapses high-energy displaced-squeezed states onto their
   even-parity core (visible in the cache: `T_1` before piled at Fock 20–23).
-- Fix: **before** = trusted path-1 breeding sim (`utils.compute_heralded_state`);
-  **after** = the architecture rule (apply the Step-1 reduction symplectic to the FULL
-  equivalent-GBS covariance, then herald — no `purify_control` over-purification).
+- Fix: **before** = trusted path-1 breeding sim (`utils.compute_heralded_state`).
+  **after** = the **Hanamura core state** `(a^dag + s0' a + delta0')^{n'}|0>` built directly
+  from the reduced/damped control parameters (well-conditioned, no thewalrus herald). This
+  replaced the earlier `heralded_output` route, which still mis-reconstructed the highly-squeezed
+  (11–12 dB) generators — even no-reduction rows aligned at only ~0.7 instead of ~1.0, the tell
+  that the herald (not the photon count) was the ill-conditioned step. The core form is exact only
+  for **single-control-mode** generators (`k_control == 1`); for `k>1` rows the script falls back
+  to the architecture-rule herald and flags it (`after_source = "herald_fallback"`).
+- Built-in check: the script aligns the core "before" against the trusted path-1 "before" and
+  records `core_validation_fid` per row. Near 1.0 confirms the core reconstruction is faithful
+  (so the core "after" is trustworthy); a low value flags a generator that isn't single-mode and
+  needs the multimode treatment.
 - The Pareto **selection** is preserved exactly: each row of the existing
   `wigner_pareto_data.json` is pinned to its genotype by full-precision probability,
   so `tab:breeding_pareto` and the Pareto figure are unaffected.
