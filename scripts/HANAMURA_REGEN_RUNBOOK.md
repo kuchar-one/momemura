@@ -16,9 +16,13 @@ feeds the existing thesis plotter. Split into a GPU step (cluster) and a CPU ste
   from the reduced/damped control parameters (well-conditioned, no thewalrus herald). This
   replaced the earlier `heralded_output` route, which still mis-reconstructed the highly-squeezed
   (11–12 dB) generators — even no-reduction rows aligned at only ~0.7 instead of ~1.0, the tell
-  that the herald (not the photon count) was the ill-conditioned step. The core form is exact only
-  for **single-control-mode** generators (`k_control == 1`); for `k>1` rows the script falls back
-  to the architecture-rule herald and flags it (`after_source = "herald_fallback"`).
+  that the herald (not the photon count) was the ill-conditioned step. Per Sec. V (single signal
+  mode => control Schmidt rank r=1; Theorem 9), a control mode detecting `n_m=0` contributes only a
+  Gaussian filter (absorbed by alignment), so the core form is **exact whenever exactly one control
+  mode fires** (`k_eff = #{m : n_m>=1} == 1`), regardless of how many vacuum-detection modes inflate
+  `k_control`. The script keys on `k_eff` (recorded per row, with per-mode `n0`/`n1`). For `k_eff>1`
+  the multimode output has no closed form (Theorem 11 is recursive), so the script falls back to the
+  architecture-rule herald and flags it (`after_source = "herald_fallback"`).
 - Built-in check: the script aligns the core "before" against the trusted path-1 "before" and
   records `core_validation_fid` per row. Near 1.0 confirms the core reconstruction is faithful
   (so the core "after" is trustworthy); a low value flags a generator that isn't single-mode and

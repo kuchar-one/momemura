@@ -291,22 +291,28 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
             print(f"    [{i}] before (path-1) failed: {e!r}")
 
         # ---- core-state reconstruction (paper-faithful, well-conditioned) ----
-        # The heralded output of a single-control-mode generator is, up to a
-        # Gaussian unitary, the core state (a^dag + s0 a + delta0)^n |0>.  We build
-        # it directly from the control parameters -- no thewalrus herald -- so it is
-        # immune to the high-squeezing ill-conditioning.  We validate it against the
-        # trusted path-1 "before"; the same construction with the reduced/damped
-        # parameters gives the "after".
+        # Hanamura Theorem 5: the output of a generator is, up to a Gaussian
+        # unitary, the core state (a^dag + s0 a + delta0)^n|0>.  In the multimode
+        # case (Theorem 9: single signal mode => Schmidt rank r=1) every control
+        # mode detecting n_m=0 contributes only a Gaussian filter (wave form,
+        # Theorem 6), which the alignment absorbs.  Hence the output depends, up to
+        # a Gaussian unitary, ONLY on the control modes with n_m>=1.  When exactly
+        # one mode fires (k_eff==1) the single-mode core state is EXACT, regardless
+        # of how many vacuum-detection modes inflate k_control.  We build it
+        # directly from that mode's control parameters -- no thewalrus herald --
+        # so it is immune to the high-squeezing ill-conditioning, and validate it
+        # against the trusted path-1 "before".
+        k_eff_before = int(sum(1 for x in n0 if int(x) >= 1))
+        k_eff_after = int(sum(1 for x in n1 if int(x) >= 1))
         psi_before_core = psi_after_core = None
         core_fid = None
         s0_b = d0_b = s0_a = d0_a = None
-        if han_res is not None and k_ctrl == 1:
-            pb0 = han_res["params_before"][0]
-            pa0 = han_res["params_after"][0]   # post Step1+Step2; damping preserves (s0,delta0)
-            s0_b, d0_b = float(pb0["s0"]), complex(pb0["delta0"])
-            s0_a, d0_a = float(pa0["s0"]), complex(pa0["delta0"])
-            psi_before_core = core_state(s0_b, d0_b, n0[0], herald_cutoff)
-            psi_after_core = core_state(s0_a, d0_a, n1[0], herald_cutoff)
+
+        if han_res is not None and k_eff_before == 1:
+            mb = next(j for j, x in enumerate(n0) if int(x) >= 1)
+            pbm = han_res["params_before"][mb]
+            s0_b, d0_b = float(pbm["s0"]), complex(pbm["delta0"])
+            psi_before_core = core_state(s0_b, d0_b, int(n0[mb]), herald_cutoff)
             if psi_before is not None:
                 try:
                     core_fid, _ = go.align_states(psi_before, psi_before_core,
@@ -314,12 +320,18 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
                 except Exception:
                     core_fid = None
 
+        if han_res is not None and k_eff_after == 1:
+            ma = next(j for j, x in enumerate(n1) if int(x) >= 1)
+            pam = han_res["params_after"][ma]      # post Step1+Step2 (damping preserves s0,delta0)
+            s0_a, d0_a = float(pam["s0"]), complex(pam["delta0"])
+            psi_after_core = core_state(s0_a, d0_a, int(n1[ma]), herald_cutoff)
+
         # ---- AFTER state for the figure --------------------------------------
-        # Prefer the core-state reconstruction (k=1); fall back to the
-        # architecture-rule herald otherwise (flagged via core_ok in meta).
+        # Use the exact core reconstruction when one mode fires (k_eff_after==1);
+        # otherwise the multimode output has no closed form (Theorem 11 is
+        # recursive) -> fall back to the architecture-rule herald, flagged.
         psi_after = None
-        core_ok = (psi_after_core is not None
-                   and (core_fid is None or core_fid > 0.9))
+        core_ok = psi_after_core is not None
         if core_ok:
             psi_after = psi_after_core
         else:
@@ -351,7 +363,9 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
             Nc_before=Nc_before, Nc_after=int(han["han_Nc"]),
             prob_gain=han["han_gain"],
             gbs_sq_db=gbs_sq_db, han_sq_db=han["han_sq_db"], han_ok=han["han_ok"],
-            k_control=k_ctrl, after_source=("core" if core_ok else "herald_fallback"),
+            k_control=k_ctrl, k_eff_before=k_eff_before, k_eff_after=k_eff_after,
+            n0=[int(x) for x in n0], n1=[int(x) for x in n1],
+            after_source=("core" if core_ok else "herald_fallback"),
             core_validation_fid=(round(core_fid, 4) if core_fid is not None else None),
             s0_before=s0_b, delta0_before=(abs(d0_b) if d0_b is not None else None),
             s0_after=s0_a, delta0_after=(abs(d0_a) if d0_a is not None else None),
@@ -364,7 +378,8 @@ def process_target(tgt, cfg_t, root, n_rep, reduction_factor, herald_cap, select
                            prob=float(p["prob"])))
         cf = f"{core_fid:.3f}" if core_fid is not None else "--"
         print(f"    [{i}] xi={row['nls_db']:.2f}dB Nc={row['Nc']} P={row['prob']:.2e} "
-              f"sq={gbs_sq_db:.1f}dB k={k_ctrl} | Hanamura Nc {Nc_before}->{han['han_Nc']} "
+              f"sq={gbs_sq_db:.1f}dB k={k_ctrl}(eff {k_eff_before}->{k_eff_after}) | "
+              f"Hanamura Nc {Nc_before}->{han['han_Nc']} "
               f"gain={('x%.2f'%han['han_gain']) if han['han_gain'] else '--'} "
               f"sq'={han['han_sq_db']} | before={'Y' if psi_before is not None else '-'} "
               f"after={'Y(%s)'%('core' if core_ok else 'fb') if psi_after is not None else '-'} "
