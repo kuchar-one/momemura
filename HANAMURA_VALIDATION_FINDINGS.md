@@ -113,3 +113,62 @@ Scanning all 15 chosen rows for fired-mode coupling
 JAX_ENABLE_X64=1 python scripts/validate_convergence.py --out outputs/convergence
 # optional A==B spot check (slow):  --check-b
 ```
+
+---
+
+# Addendum (2026-06-10, same day): rescoring + exploit fix
+
+**Cluster confirmation came in:** F(A_L, exact) for plus_0 = 0.732@40, 0.877@56,
+0.973@72, **0.994@96** — monotone convergence to the exact moment-space herald.
+Verdict closed. (L=128 OOMs the tree sim; irrelevant.)
+
+## New finding: the scored probability never included homodyne acceptance
+
+`jax_superblock` DISCARDS each mixing node's `p_measure` (the `_` in its
+unpack): the optimizer's `joint_probability` is the product of LEAF herald
+probabilities only. Verified numerically: prod of exact leaf probs = 0.166 vs
+sim joint 0.170 for plus_0 (residual = leaf truncation). The physical
+acceptance — density(x_i)·window per homodyne node — is ~1e-8 for plus_0, i.e.
+the experimentally meaningful success probability is ~8 orders of magnitude
+below the quoted one. Flag this in the thesis when quoting P. The rescorer
+reports both conventions (`P_leaf` exact-old-convention, `P_phys` physical).
+
+## New tooling
+
+- **`scripts/rescore_repertoires.py`** — exact, cutoff-free re-scoring of whole
+  repertoires in moment space: `exp` on the reduced_herald state (final-state
+  cutoff 100, cheap), exact `P_leaf` + `P_phys`, effective photons `n_eff`
+  (fired-mode coupling audit, `--coupling-eps`). Writes a seedable mirror tree
+  (`results.pkl` + `config.json` per run, SimpleRepertoire format readable by
+  `scan_results_for_seeds` and `pareto_report`) + `rescore_summary.csv`.
+  Sandbox spot-check found e.g. a point with scored exp 0.566 whose true exp is
+  0.977 (worse than the 0.667 Gaussian bound) — pure truncation artifact — and
+  points whose *every* detected photon is a dud.
+- **`compute_equivalent_gaussian(..., light=True)`** — skips Bloch-Messiah for
+  bulk rescoring; also now returns `homodyne_densities` (exact per-node
+  Gaussian density p(x=hx), same hbar=2 x-units as the Fock sim's phi_n).
+- **Dud-photon guard in the scorer** (`src/simulation/jax/runner.py`):
+  `_leaf_effective_pnr` weights each leaf detection by a smooth gate
+  w = c²/(c²+eps²) on the control mode's covariance coupling to the rest of its
+  leaf (built at the leaf's TRUE mode count — the Clements layout depends on
+  it). Effective totals replace `leaf_total_pnrs`/`leaf_max_pnrs` before the
+  superblock, so the photons descriptor, the photon fitness AND the
+  sub-Gaussian artifact guard all see only contributing photons. Differentiable;
+  default ON, opt out with config `"effective_photons": false`, threshold via
+  `"coupling_eps"` (default 0.05). Verified: plus_0 raw Nc=1 → eff 0.001 (now
+  trips the artifact guard); plus_2 4→4.0; T_2 14→14.0; H_2 35→30.0 (the n=5
+  dud removed). Tests: `tests/test_effective_photons.py`.
+
+## Updated runbook (cluster)
+
+```bash
+# 1. exact re-scoring of everything (honest fronts + seeds):
+JAX_ENABLE_X64=1 python scripts/rescore_repertoires.py \
+    --root experiments --out experiments_rescored
+# rescored trees are drop-in for seeding (scan_results_for_seeds-compatible);
+# swap/point the seed scan at experiments_rescored as desired.
+
+# 2. re-run optimization (dud-photon guard is now default-on):
+#    use your usual run_mome invocation with --seed-scan against the rescored
+#    tree; add '"effective_photons": false' to a config to reproduce old runs.
+```

@@ -114,11 +114,17 @@ def apply_final_gaussian_symplectic(V: np.ndarray, mu: np.ndarray, final_gauss: 
     
     return V_new, mu_new
 
-def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
+def compute_equivalent_gaussian(params: Dict[str, Any], light: bool = False) -> Dict[str, Any]:
     """
     Decompose the optimization result into an equivalent pure Gaussian state
     pre-PNR measurements.
-    
+
+    Args:
+        light: skip the Williamson/Bloch-Messiah architecture extraction
+               (squeezings, U_passive) -- returns only the moments and mode
+               bookkeeping.  Use for bulk re-scoring where only cov/mu/
+               signal_idx/control_idx/pnr_outcomes/homodyne_densities matter.
+
     Returns:
         Dict with:
             - num_initial_modes: int
@@ -204,7 +210,8 @@ def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
     modes = list(initial_modes)
     N_current = total_initial_modes
     num_homodyne = 0
-    
+    homodyne_densities = []   # Gaussian density p(x=hx) of each homodyne node
+
     # Get signal mode indices from the list of modes
     def get_signal_index(leaf_idx):
         for i, m in enumerate(modes):
@@ -253,7 +260,14 @@ def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
                 V_global = S @ V_global @ S.T
                 mu_global = S @ mu_global
                 
-                # Measure mode B (idxB) via Homodyne
+                # Measure mode B (idxB) via Homodyne.  Record the Gaussian
+                # density p(x=hx) first -- the moment-space counterpart of the
+                # Fock sim's p_x_density (same hbar=2 x-units); needed to
+                # reconstruct the joint success probability exactly.
+                _B11 = V_global[idxB, idxB]
+                homodyne_densities.append(float(
+                    np.exp(-0.5 * (hx - mu_global[idxB]) ** 2 / _B11)
+                    / np.sqrt(2.0 * np.pi * _B11)))
                 V_global, mu_global = measure_homodyne(V_global, mu_global, idxB, N_current, hx)
                 modes.pop(idxB)
                 N_current -= 1
@@ -277,34 +291,44 @@ def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
         root_idx = get_signal_index(final_sig_leaf)
         V_global, mu_global = apply_final_gaussian_symplectic(V_global, mu_global, params["final_gauss"], root_idx, N_current)
         
-    # Extract squeezing values and passive unitary via Williamson + Bloch-Messiah
-    from thewalrus.decompositions import williamson, blochmessiah
-    
-    # Williamson decomposition: V = S_W * D * S_W^T
-    # For a pure state, D is proportional to Identity, so S_W is the exact symplectic matrix generating the state.
-    D_W, S_W = williamson(V_global)
-    
-    # Bloch-Messiah: S_W = O1 * D_sq * O2
-    O1, D_sq, O2 = blochmessiah(S_W)
-    
-    # D_sq is a diagonal matrix: diag(exp(-r1), ..., exp(-rN), exp(r1), ..., exp(rN))
-    # We extract r values from the first N_current diagonal elements
-    r_all = -np.log(np.diag(D_sq)[:N_current])
-    
-    # Sort descending
-    sort_idx = np.argsort(np.abs(r_all))[::-1]
-    r_squeezings = np.abs(r_all[sort_idx]).tolist()
-    
-    max_r = r_squeezings[0] if r_squeezings else 0.0
-    max_db = max_r * 10 * np.log10(np.exp(2))
-    
-    # The passive network is described by the orthogonal symplectic matrix O1
-    X = O1[:N_current, :N_current]
-    Y = O1[N_current:, :N_current]
-    U_passive = X + 1j * Y
-    
-    # Reorder columns of U to match the sorted squeezings
-    U_passive = U_passive[:, sort_idx]
+    if light:
+        # cheap squeezing estimate from covariance eigenvalues (pure state:
+        # eigvals = e^{±2r}); skip Bloch-Messiah entirely
+        ev = np.clip(np.sort(np.linalg.eigvalsh(0.5 * (V_global + V_global.T)))[::-1],
+                     1e-15, None)
+        r_squeezings = np.sort(np.abs(0.5 * np.log(ev[:N_current])))[::-1].tolist()
+        max_r = r_squeezings[0] if r_squeezings else 0.0
+        max_db = max_r * 10 * np.log10(np.exp(2))
+        U_passive = None
+    else:
+        # Extract squeezing values and passive unitary via Williamson + Bloch-Messiah
+        from thewalrus.decompositions import williamson, blochmessiah
+
+        # Williamson decomposition: V = S_W * D * S_W^T
+        # For a pure state, D is proportional to Identity, so S_W is the exact symplectic matrix generating the state.
+        D_W, S_W = williamson(V_global)
+
+        # Bloch-Messiah: S_W = O1 * D_sq * O2
+        O1, D_sq, O2 = blochmessiah(S_W)
+
+        # D_sq is a diagonal matrix: diag(exp(-r1), ..., exp(-rN), exp(r1), ..., exp(rN))
+        # We extract r values from the first N_current diagonal elements
+        r_all = -np.log(np.diag(D_sq)[:N_current])
+
+        # Sort descending
+        sort_idx = np.argsort(np.abs(r_all))[::-1]
+        r_squeezings = np.abs(r_all[sort_idx]).tolist()
+
+        max_r = r_squeezings[0] if r_squeezings else 0.0
+        max_db = max_r * 10 * np.log10(np.exp(2))
+
+        # The passive network is described by the orthogonal symplectic matrix O1
+        X = O1[:N_current, :N_current]
+        Y = O1[N_current:, :N_current]
+        U_passive = X + 1j * Y
+
+        # Reorder columns of U to match the sorted squeezings
+        U_passive = U_passive[:, sort_idx]
     
     final_mu_list = []
     for i in range(N_current):
@@ -340,4 +364,5 @@ def compute_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
         "signal_idx": signal_idx,
         "control_idx": control_idx,
         "pnr_outcomes": pnr_outcomes,
+        "homodyne_densities": homodyne_densities,
     }

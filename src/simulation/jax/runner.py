@@ -323,6 +323,74 @@ def jax_get_heralded_state(
     )
 
 
+def _leaf_effective_pnr(leaf_p: Dict[str, jnp.ndarray], eps: float = 0.05
+                        ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Effective (physically contributing) PNR photons of one leaf.
+
+    A detected photon only contributes non-Gaussianity if its control mode is
+    CORRELATED with the rest of the leaf (the leaf signal carries it into the
+    mixing tree).  A control mode whose leaf-interferometer coupling decodes to
+    ~identity (e.g. Clements theta ~ pi) is a physically inert "dud" detection:
+    it changes nothing about the output state but inflates the photons
+    descriptor and bypasses the sub-Gaussian artifact guard (see
+    HANAMURA_VALIDATION_FINDINGS.md -- the plus_0 exploit).
+
+    Each control mode's detected count is weighted by the smooth gate
+        w = c^2 / (c^2 + eps^2),
+    where c is the Frobenius norm of the covariance cross-block between that
+    mode and all other leaf modes.  Decoupled leaves (c ~ 1e-3) get w ~ 1e-3;
+    genuinely coupled ones (c >~ 0.2) get w ~ 1.  Smooth => differentiable.
+
+    Returns (effective_total_pnr, effective_max_pnr) as float32 scalars.
+    """
+    from src.simulation.jax.herald import passive_unitary_to_symplectic, vacuum_covariance
+
+    MAX_MODES = 3
+    r_vec = leaf_p["r"]
+    phases_vec = leaf_p["phases"]
+    pnr_vec = leaf_p["pnr"]
+    n_ctrl = leaf_p["n_ctrl"]
+
+    pad = MAX_MODES - r_vec.shape[0]
+    if pad > 0:
+        r_vec = jnp.pad(r_vec, (0, pad))
+    pad_ph = (MAX_MODES * MAX_MODES) - phases_vec.shape[0]
+    if pad_ph > 0:
+        phases_vec = jnp.pad(phases_vec, (0, pad_ph))
+    pad_pnr = (MAX_MODES - 1) - pnr_vec.shape[0]
+    if pad_pnr > 0:
+        pnr_vec = jnp.pad(pnr_vec, (0, pad_pnr))
+
+    def _eff_for_N(N_modes):
+        """(eff_total, eff_max) for an N_modes-mode leaf.  The Clements layout
+        depends on the mode count, so the covariance MUST be built at the
+        leaf's true N_modes -- exactly mirroring jax_get_heralded_state."""
+        N = N_modes
+        S_sq = jnp.diag(jnp.concatenate([jnp.exp(-r_vec[:N]), jnp.exp(r_vec[:N])]))
+        U_pass = jax_clements_unitary(phases_vec[: N * N], N)
+        S = passive_unitary_to_symplectic(U_pass) @ S_sq
+        cov = S @ vacuum_covariance(N, 2.0) @ S.T
+
+        eff_total = jnp.array(0.0, dtype=jnp.float32)
+        eff_max = jnp.array(0.0, dtype=jnp.float32)
+        for mode in range(1, N):                             # ctrl modes are 1..
+            rows = jnp.stack([cov[mode], cov[N + mode]])     # (2, 2N)
+            mask = jnp.ones(2 * N).at[jnp.array([mode, N + mode])].set(0.0)
+            c = jnp.sqrt(jnp.sum((rows * mask[None, :]) ** 2))
+            w = (c ** 2) / (c ** 2 + eps ** 2)
+            n_eff = pnr_vec[mode - 1].astype(jnp.float32) * w.astype(jnp.float32)
+            eff_total = eff_total + n_eff
+            eff_max = jnp.maximum(eff_max, n_eff)
+        return eff_total, eff_max
+
+    def _n0(_):
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)
+
+    return jax.lax.switch(jnp.clip(n_ctrl.astype(jnp.int32), 0, 2),
+                          [_n0, lambda _: _eff_for_N(2), lambda _: _eff_for_N(3)],
+                          None)
+
+
 @partial(
     jax.jit,
     static_argnames=(
@@ -412,6 +480,26 @@ def _score_batch_shard(
         leaf_vecs, leaf_probs, _, leaf_max_pnrs, leaf_total_pnrs, leaf_modes = jax.vmap(
             conditional_herald
         )(params["leaf_params"], leaf_active)
+
+        # --- Effective-photon guard (dud-photon exploit fix) ---
+        # Count only detections on control modes that are actually COUPLED to
+        # the leaf (smooth gate, differentiable).  This feeds the photons
+        # descriptor, the photon-count fitness and the sub-Gaussian artifact
+        # guard, closing the niche-filling exploit where decoupled PNR
+        # detections move solutions across MAP-Elites cells for free.
+        # Opt out with config {"effective_photons": false}.
+        use_effective_photons = True
+        coupling_eps = 0.05
+        if config_dict is not None:
+            use_effective_photons = bool(config_dict.get("effective_photons", True))
+            coupling_eps = float(config_dict.get("coupling_eps", 0.05))
+        if use_effective_photons:
+            eff_tot, eff_max = jax.vmap(
+                lambda lp: _leaf_effective_pnr(lp, coupling_eps)
+            )(params["leaf_params"])
+            active_f = leaf_active.astype(jnp.float32)
+            leaf_total_pnrs = (eff_tot * active_f).astype(leaf_total_pnrs.dtype)
+            leaf_max_pnrs = (eff_max * active_f).astype(leaf_max_pnrs.dtype)
 
         # --- Leaf Upper-Mass Penalty ---
         # Check leaf states at BASE cutoff (not sim_cutoff) for truncation issues
