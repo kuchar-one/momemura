@@ -430,7 +430,13 @@ def reduce_control_mode(C: np.ndarray, beta: np.ndarray, m_local: int,
 def heralded_output(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
                     control_idx: Sequence[int], n: Sequence[int],
                     cutoff: int = 40) -> Tuple[np.ndarray, float]:
-    """Heralded single-mode signal state and herald probability."""
+    """Heralded single-mode signal state and herald probability.
+
+    WARNING: ``state_vector(post_select=...)`` evaluates one loop hafnian per
+    signal amplitude on the FULL generator; the cost grows ~factorially with
+    ``cutoff`` and it is numerically ill-conditioned for high-squeezing
+    generators.  Prefer :func:`reduced_herald` (analytically conditions the
+    n=0 modes, then uses the stable Hermite recurrence -- exact and fast)."""
     from thewalrus.quantum import state_vector
     post = {int(m): int(nv) for m, nv in zip(control_idx, n)}
     sv = np.asarray(state_vector(mu, cov, post_select=post, cutoff=cutoff,
@@ -439,6 +445,68 @@ def heralded_output(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
     if prob > 0:
         sv = sv / np.sqrt(prob)
     return sv, prob
+
+
+def reduced_herald(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
+                   control_idx: Sequence[int], n: Sequence[int],
+                   cutoff: int = 40) -> Tuple[np.ndarray, float]:
+    """Heralded signal state via analytic vacuum conditioning -- the stable,
+    fast replacement for :func:`heralded_output`.
+
+    Three exact steps:
+      1. Every control mode detecting ``n_m = 0`` is conditioned analytically in
+         moment space (a vacuum projection is Gaussian: Schur complement with
+         measurement covariance = I).
+      2. The remaining small (signal + fired modes) pure Gaussian state vector
+         is built with thewalrus' multidimensional-Hermite recurrence
+         (``state_vector`` WITHOUT post-selection -- no loop hafnians, cost
+         O(prod cutoffs), numerically stable).
+      3. The fired modes' Fock indices are sliced out.
+
+    Returns (normalized signal state, herald probability).  The probability
+    includes the vacuum-conditioning factor, so it matches
+    ``heralded_output``'s convention.
+    """
+    from thewalrus.quantum import state_vector
+    cov = np.asarray(cov, float)
+    mu = np.asarray(mu, float)
+    N = cov.shape[0] // 2
+    fired = [(int(c), int(nv)) for c, nv in zip(control_idx, n) if int(nv) >= 1]
+    vac = [int(c) for c, nv in zip(control_idx, n) if int(nv) == 0]
+    keep = [int(signal_idx)] + [c for c, _ in fired]
+
+    if vac:
+        ki = keep + [k + N for k in keep]
+        vi = vac + [v + N for v in vac]
+        Vk = cov[np.ix_(ki, ki)]
+        Vv = cov[np.ix_(vi, vi)]
+        Vkv = cov[np.ix_(ki, vi)]
+        M = Vv + np.eye(len(vi))            # vacuum covariance = I (hbar=2)
+        sol = np.linalg.solve(M, np.column_stack([Vkv.T, mu[vi]]))
+        cov_r = Vk - Vkv @ sol[:, :-1]
+        cov_r = 0.5 * (cov_r + cov_r.T)
+        mu_r = mu[ki] - Vkv @ sol[:, -1]
+        # P(all-vacuum) = 2^k_vac / sqrt(det(Vv+I)) * exp(-mu_v (Vv+I)^-1 mu_v / 2)
+        # (hbar=2, xp-ordering, vacuum covariance = I; verified against
+        #  heralded_output's post_select probabilities)
+        p_vac = float(2.0 ** len(vac) / np.sqrt(np.linalg.det(M))
+                      * np.exp(-0.5 * mu[vi] @ np.linalg.solve(M, mu[vi])))
+    else:
+        ki = keep + [k + N for k in keep]
+        cov_r = cov[np.ix_(ki, ki)]
+        mu_r = mu[ki]
+        p_vac = 1.0
+
+    cut = max(int(cutoff), max((nv for _, nv in fired), default=0) + 1)
+    psi = np.asarray(state_vector(mu_r, cov_r, cutoff=cut, hbar=HBAR,
+                                  normalize=False, check_purity=False))
+    sl = tuple([slice(0, int(cutoff))] + [nv for _, nv in fired])
+    v = np.asarray(psi[sl]).ravel()
+    p_fock = float(np.sum(np.abs(v) ** 2))
+    prob = p_vac * p_fock
+    if p_fock > 0:
+        v = v / np.sqrt(p_fock)
+    return v, prob
 
 
 def _single_mode_gaussian_unitary(params, cutoff):

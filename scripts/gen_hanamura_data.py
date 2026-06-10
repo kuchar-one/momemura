@@ -84,7 +84,7 @@ def reduced_full_state(eq, n0, n1, cutoff):
     """Return (psi_after, prob_after) heralded from the reduced FULL generator."""
     from frontend.gbs_optimizer import (
         control_parameters, _reduced_params, block_from_params,
-        _embed_single_mode_symplectic, heralded_output,
+        _embed_single_mode_symplectic, reduced_herald,
     )
     cov = np.asarray(eq["cov"], float).copy()
     mu = np.asarray(eq["mu"], float).copy()
@@ -115,7 +115,7 @@ def reduced_full_state(eq, n0, n1, cutoff):
         mu[ci] += beta_target[0] - mu[ci]
         mu[ci + N] += beta_target[1] - mu[ci + N]
 
-    psi, prob = heralded_output(cov, mu, signal_idx, control_idx, n1, cutoff=cutoff)
+    psi, prob = reduced_herald(cov, mu, signal_idx, control_idx, n1, cutoff=cutoff)
     return np.asarray(psi).ravel(), float(prob)
 
 

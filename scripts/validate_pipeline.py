@@ -34,6 +34,10 @@ from __future__ import annotations
 import os, sys, json, math, argparse
 import numpy as np
 
+# float64 in the breeding sim is REQUIRED for trustworthy reconstructions
+# (the cluster default is float32 and silently truncates complex128).
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
@@ -194,7 +198,9 @@ def main():
                     default=os.path.join(REPO, "scripts", "data", "hanamura_selection_spec.json"))
     ap.add_argument("-n", "--num", type=int, default=5)
     ap.add_argument("--cutoff", type=int, default=40)
-    ap.add_argument("--cutoff2", type=int, default=60, help="second cutoff (conditioning probe)")
+    ap.add_argument("--skip-c", action="store_true", help="skip path C entirely")
+    ap.add_argument("--cutoff2", type=int, default=0,
+                    help="second path-C cutoff (conditioning probe); 0 = disabled")
     ap.add_argument("--max-nc", type=int, default=16,
                     help="skip rows with detected photons above this (herald intractable)")
     ap.add_argument("--all", action="store_true", help="include all rows regardless of N_c")
@@ -255,14 +261,21 @@ def main():
                 psiB = np.asarray(vb["state"]).ravel()
             except Exception as e:
                 rec["B_error"] = repr(e)[:120]
-            # (C) collapsed GBS herald
+            # (C) collapsed GBS herald via reduced_herald: vacuum modes are
+            # conditioned analytically and the small remaining system is built
+            # with the stable Hermite recurrence -- exact, fast, well-conditioned
+            # (the old heralded_output at cutoff 40/60 cost one loop hafnian per
+            # amplitude and never terminated on 11-12 dB generators).
             psiC = None
-            try:
-                pc, _ = go.heralded_output(eq["cov"], eq["mu"], eq["signal_idx"],
-                                           eq["control_idx"], n0, cutoff=L)
-                psiC = np.asarray(pc).ravel()
-            except Exception as e:
-                rec["C_error"] = repr(e)[:120]
+            if args.skip_c:
+                rec["C_skipped"] = "--skip-c"
+            else:
+                try:
+                    pc, _ = go.reduced_herald(eq["cov"], eq["mu"], eq["signal_idx"],
+                                              eq["control_idx"], n0, cutoff=L)
+                    psiC = np.asarray(pc).ravel()
+                except Exception as e:
+                    rec["C_error"] = repr(e)[:120]
             # (D) Hanamura reduced
             psiD = None
             n1 = list(n0)
@@ -293,12 +306,15 @@ def main():
                 A_B=fid_gauss(psiA, psiB), A_C=fid_gauss(psiA, psiC),
                 A_D=fid_gauss(psiA, psiD), C_D=fid_gauss(psiC, psiD))
 
-            # conditioning probe: A vs C at a second, larger cutoff
-            if args.cutoff2 and args.cutoff2 != L:
+            # conditioning probe: A vs C at a second cutoff (A's convergence to
+            # the exact reduced_herald reference is the REAL diagnostic: the
+            # breeding sim is badly truncated at the config cutoff for
+            # high-squeezing solutions -- see HANAMURA_VALIDATION_FINDINGS.md)
+            if args.cutoff2 and not args.skip_c and args.cutoff2 != L:
                 try:
                     pa2, _ = futils.compute_heralded_state(params, cutoff=args.cutoff2)
-                    pc2, _ = go.heralded_output(eq["cov"], eq["mu"], eq["signal_idx"],
-                                                eq["control_idx"], n0, cutoff=args.cutoff2)
+                    pc2, _ = go.reduced_herald(eq["cov"], eq["mu"], eq["signal_idx"],
+                                               eq["control_idx"], n0, cutoff=args.cutoff2)
                     rec["fid_up_to_gauss"]["A_C_cutoff2"] = fid_gauss(pa2, pc2)
                     rec["cutoff2"] = args.cutoff2
                 except Exception as e:
