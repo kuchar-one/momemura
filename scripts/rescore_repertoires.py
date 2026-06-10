@@ -40,6 +40,10 @@ import os, sys, json, glob, time, shutil, argparse, pickle
 import numpy as np
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+# Rescoring only uses JAX for genotype DECODING (milliseconds, tiny arrays).
+# Keep it off the GPUs: a GPU backend preallocates ~75% of every visible
+# card's VRAM per process for nothing.  Override with JAX_PLATFORMS=cuda.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -147,6 +151,82 @@ def rescore_genotype(g, decoder, cfg, O, L, coupling_eps):
 
 
 # --------------------------------------------------------------------------- #
+_OP_CACHE = {}   # per-process operator cache
+
+
+def process_run(cfgf: str, opts: dict):
+    """Rescore one run directory.  Returns (label, n_ok, n_valid, n_dud,
+    summary_lines) or (label, None, msg, None, [])."""
+    from src.utils.result_manager import SimpleRepertoire
+    from src.genotypes.genotypes import get_genotype_decoder
+
+    rundir = os.path.dirname(cfgf)
+    run = os.path.basename(rundir)
+    group = os.path.basename(os.path.dirname(rundir))
+    label = f"{group}/{run}"
+    pkl = os.path.join(rundir, "results.pkl")
+    if not os.path.exists(pkl):
+        return label, None, "no results.pkl", None, []
+    cfg = json.load(open(cfgf))
+    try:
+        rep = pr.load_repertoire(pkl)
+    except Exception as e:
+        return label, None, f"load failed: {e!r}", None, []
+    if rep is None:
+        return label, None, "unreadable repertoire", None, []
+
+    fit = np.asarray(rep.fitnesses, np.float64).reshape(-1, np.asarray(rep.fitnesses).shape[-1])
+    des = np.asarray(rep.descriptors, np.float64).reshape(-1, np.asarray(rep.descriptors).shape[-1])
+    gen = np.asarray(rep.genotypes, np.float64).reshape(-1, np.asarray(rep.genotypes).shape[-1])
+    valid = np.where(np.isfinite(fit[:, 0]) & (fit[:, 0] > -1e9))[0]
+    if opts["limit"]:
+        valid = valid[:opts["limit"]]
+
+    ab = (cfg.get("target_alpha"), cfg.get("target_beta"))
+    key = str(ab)
+    if key not in _OP_CACHE:
+        _OP_CACHE[key] = gkp_operator(opts["cutoff"],
+                                      complex(str(ab[0]).replace("i", "j")),
+                                      pr.parse_complex(str(ab[1])))
+    O, _u = _OP_CACHE[key]
+    decoder = get_genotype_decoder(cfg.get("genotype"),
+                                   depth=int(cfg.get("depth") or 3), config=cfg)
+
+    new_fit = np.full_like(fit, -np.inf)
+    new_des = des.copy()
+    lines = []
+    n_ok = n_dud = 0
+    for k in valid:
+        try:
+            r = rescore_genotype(gen[k], decoder, cfg, O, opts["cutoff"],
+                                 opts["coupling_eps"])
+        except Exception:
+            r = None
+        if r is None:
+            continue
+        P = r["P_leaf"] if opts["prob"] == "leaf" else r["P_phys"]
+        logP = float(np.log10(max(P, 1e-300)))
+        new_fit[k] = [-r["exp"], logP, fit[k, 2], -float(r["n_eff"])]
+        new_des[k] = [des[k, 0], float(r["max_pnr_eff"]), float(r["n_eff"])] \
+            if des.shape[1] >= 3 else des[k]
+        n_ok += 1
+        if r["n_eff"] < r["n_det"]:
+            n_dud += 1
+        lines.append(f"{group},{run},{k},{-fit[k,0]:.6g},{r['exp']:.6g},"
+                     f"{fit[k,1]:.4f},{np.log10(max(r['P_leaf'],1e-300)):.4f},"
+                     f"{np.log10(max(r['P_phys'],1e-300)):.4f},"
+                     f"{-fit[k,3]:.0f},{r['n_eff']},{r['max_pnr_eff']},"
+                     f"{r['gbs_sq_db']},\"{r['couplings']}\"\n")
+
+    outdir = os.path.join(opts["out"], group, run)
+    os.makedirs(outdir, exist_ok=True)
+    new_rep = SimpleRepertoire(gen.astype(np.float32), new_fit, new_des)
+    with open(os.path.join(outdir, "results.pkl"), "wb") as f:
+        pickle.dump({"repertoire": new_rep, "config": cfg}, f)
+    shutil.copy(cfgf, os.path.join(outdir, "config.json"))
+    return label, n_ok, len(valid), n_dud, lines
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -164,10 +244,9 @@ def main():
                     help="comma-separated group-dir name filter (substring)")
     ap.add_argument("--limit", type=int, default=0,
                     help="max genotypes per run (0 = all; use for smoke tests)")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 8) // 2),
+                    help="parallel worker processes over run dirs (CPU-bound)")
     args = ap.parse_args()
-
-    from src.utils.result_manager import SimpleRepertoire
-    from src.genotypes.genotypes import get_genotype_decoder
 
     run_dirs = sorted(glob.glob(os.path.join(args.root, "*", "*", "config.json")))
     if args.groups:
@@ -180,76 +259,35 @@ def main():
     summary = open(os.path.join(args.out, "rescore_summary.csv"), "w")
     summary.write("group,run,idx,exp_old,exp_new,logP_old,logP_leaf_new,logP_phys,"
                   "photons_old,n_eff,max_pnr_eff,gbs_sq_db,couplings\n")
+    opts = dict(out=args.out, cutoff=args.cutoff, coupling_eps=args.coupling_eps,
+                prob=args.prob, limit=args.limit)
 
-    op_cache = {}
-    for cfgf in run_dirs:
-        rundir = os.path.dirname(cfgf)
-        run = os.path.basename(rundir)
-        group = os.path.basename(os.path.dirname(rundir))
-        pkl = os.path.join(rundir, "results.pkl")
-        if not os.path.exists(pkl):
-            continue
-        cfg = json.load(open(cfgf))
-        try:
-            rep = pr.load_repertoire(pkl)
-        except Exception as e:
-            print(f"[!] {group}/{run}: repertoire load failed ({e!r}) -- skipped")
-            continue
-        if rep is None:
-            print(f"[!] {group}/{run}: unreadable repertoire -- skipped"); continue
-        fit = np.asarray(rep.fitnesses, np.float64).reshape(-1, np.asarray(rep.fitnesses).shape[-1])
-        des = np.asarray(rep.descriptors, np.float64).reshape(-1, np.asarray(rep.descriptors).shape[-1])
-        gen = np.asarray(rep.genotypes, np.float64).reshape(-1, np.asarray(rep.genotypes).shape[-1])
-        valid = np.where(np.isfinite(fit[:, 0]) & (fit[:, 0] > -1e9))[0]
-        if args.limit:
-            valid = valid[:args.limit]
+    t_all = time.time()
 
-        ab = (cfg.get("target_alpha"), cfg.get("target_beta"))
-        key = str(ab)
-        if key not in op_cache:
-            op_cache[key] = gkp_operator(args.cutoff, complex(str(ab[0]).replace("i", "j")),
-                                         pr.parse_complex(str(ab[1])))
-        O, _u = op_cache[key]
-        decoder = get_genotype_decoder(cfg.get("genotype"),
-                                       depth=int(cfg.get("depth") or 3), config=cfg)
-
-        new_fit = np.full_like(fit, -np.inf)
-        new_des = des.copy()
-        t0 = time.time(); n_ok = 0; n_dud = 0
-        for k in valid:
-            try:
-                r = rescore_genotype(gen[k], decoder, cfg, O, args.cutoff,
-                                     args.coupling_eps)
-            except Exception:
-                r = None
-            if r is None:
-                continue
-            P = r["P_leaf"] if args.prob == "leaf" else r["P_phys"]
-            logP = float(np.log10(max(P, 1e-300)))
-            new_fit[k] = [-r["exp"], logP, fit[k, 2], -float(r["n_eff"])]
-            new_des[k] = [des[k, 0], float(r["max_pnr_eff"]), float(r["n_eff"])] \
-                if des.shape[1] >= 3 else des[k]
-            n_ok += 1
-            if r["n_eff"] < r["n_det"]:
-                n_dud += 1
-            summary.write(f"{group},{run},{k},{-fit[k,0]:.6g},{r['exp']:.6g},"
-                          f"{fit[k,1]:.4f},{np.log10(max(r['P_leaf'],1e-300)):.4f},"
-                          f"{np.log10(max(r['P_phys'],1e-300)):.4f},"
-                          f"{-fit[k,3]:.0f},{r['n_eff']},{r['max_pnr_eff']},"
-                          f"{r['gbs_sq_db']},\"{r['couplings']}\"\n")
+    def report(res):
+        label, n_ok, n_valid, n_dud, lines = res
+        if n_ok is None:
+            print(f"[!] {label}: {n_valid} -- skipped")
+            return
+        for ln in lines:
+            summary.write(ln)
         summary.flush()
+        print(f"[+] {label}: rescored {n_ok}/{n_valid} ({n_dud} with dud photons)",
+              flush=True)
 
-        outdir = os.path.join(args.out, group, run)
-        os.makedirs(outdir, exist_ok=True)
-        new_rep = SimpleRepertoire(gen.astype(np.float32), new_fit, new_des)
-        with open(os.path.join(outdir, "results.pkl"), "wb") as f:
-            pickle.dump({"repertoire": new_rep, "config": cfg}, f)
-        shutil.copy(cfgf, os.path.join(outdir, "config.json"))
-        print(f"[+] {group}/{run}: rescored {n_ok}/{len(valid)} "
-              f"({n_dud} with dud photons) in {time.time()-t0:.1f}s")
+    if args.workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            for res in ex.map(process_run, run_dirs,
+                              [opts] * len(run_dirs)):
+                report(res)
+    else:
+        for cfgf in run_dirs:
+            report(process_run(cfgf, opts))
 
     summary.close()
-    print(f"\n[+] wrote {args.out} (mirror tree + rescore_summary.csv)")
+    print(f"\n[+] wrote {args.out} (mirror tree + rescore_summary.csv) "
+          f"in {time.time()-t_all:.0f}s")
 
 
 if __name__ == "__main__":

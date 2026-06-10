@@ -172,3 +172,19 @@ JAX_ENABLE_X64=1 python scripts/rescore_repertoires.py \
 #    use your usual run_mome invocation with --seed-scan against the rescored
 #    tree; add '"effective_photons": false' to a config to reproduce old runs.
 ```
+
+## Post-launch fixes (first cluster attempt OOM'd at >100 GB RAM)
+
+Root cause: thewalrus `state_vector` only takes a SCALAR cutoff, so a solution
+with k fired control modes allocated `cutoff^(k+1)` amplitudes (100^4 = 1.6 GB,
+100^5 = 160 GB). Fixed by implementing the renormalized multidimensional-
+Hermite recurrence with PER-MODE cutoffs inside `reduced_herald`
+(`_gaussian_amplitudes`): tensor is now `cutoff x prod(n_j+1)` — the worst
+real case (signal + fired (15,15,5) @ L=100) is 153k amplitudes / 27 ms.
+Verified bit-exact against `state_vector` (max diff 3e-17) and all 13
+exactness tests. A memory budget (2e8 amplitudes) shrinks the signal axis
+rather than OOM-ing on pathological PNR patterns.
+
+Also: the rescorer now sets `JAX_PLATFORMS=cpu` (JAX is only used for decoding;
+a GPU backend pointlessly preallocates ~75% of every card) and runs run-dirs in
+parallel (`--workers`, default half the cores).

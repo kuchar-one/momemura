@@ -497,16 +497,101 @@ def reduced_herald(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
         mu_r = mu[ki]
         p_vac = 1.0
 
-    cut = max(int(cutoff), max((nv for _, nv in fired), default=0) + 1)
-    psi = np.asarray(state_vector(mu_r, cov_r, cutoff=cut, hbar=HBAR,
-                                  normalize=False, check_purity=False))
-    sl = tuple([slice(0, int(cutoff))] + [nv for _, nv in fired])
-    v = np.asarray(psi[sl]).ravel()
+    # Per-mode cutoffs: the signal axis needs `cutoff` Fock levels but each
+    # fired axis only n_j+1 (we slice exactly n_j).  thewalrus' state_vector
+    # only takes a scalar cutoff -- with k fired modes that allocates
+    # cutoff^(k+1) amplitudes (100^4 = 1.6 GB, 100^5 = 160 GB!), so we run the
+    # same renormalized multidimensional-Hermite recurrence ourselves on the
+    # minimal (cutoff, n_1+1, ..., n_k+1) tensor.
+    cuts = [int(cutoff)] + [nv + 1 for _, nv in fired]
+    # memory budget: shrink the signal axis (never below 32) rather than OOM
+    _BUDGET = int(2e8)
+    other = int(np.prod(cuts[1:])) if len(cuts) > 1 else 1
+    if other > _BUDGET // 32:
+        raise ValueError(
+            f"reduced_herald: fired-mode tensor {cuts[1:]} alone exceeds the "
+            f"memory budget ({other} > {_BUDGET // 32} amplitudes)")
+    cuts[0] = min(cuts[0], max(32, _BUDGET // other))   # shrink only, never grow
+    v = _gaussian_amplitudes(cov_r, mu_r, cuts)[
+        tuple([slice(None)] + [nv for _, nv in fired])].ravel()
     p_fock = float(np.sum(np.abs(v) ** 2))
     prob = p_vac * p_fock
     if p_fock > 0:
         v = v / np.sqrt(p_fock)
     return v, prob
+
+
+def _gaussian_amplitudes(cov: np.ndarray, mu: np.ndarray,
+                         cuts: Sequence[int]) -> np.ndarray:
+    """Fock amplitudes <n|psi> of a PURE M-mode Gaussian state on a tensor with
+    PER-MODE cutoffs ``cuts`` (thewalrus' state_vector only supports a scalar
+    cutoff, which is prohibitive when one axis is large and the others small).
+
+    Uses the renormalized multidimensional-Hermite recurrence (the same maths
+    as thewalrus ``hafnian_batched(B*, cutoff, mu=gamma*, renorm=True)``):
+
+        R[0] = 1
+        R[n + e_i] = ( mu_i R[n] + sum_j A_ij sqrt(n_j) R[n - e_j] ) / sqrt(n_i+1)
+
+    with A = conj(B), mu = conj(gamma), and the state_vector prefactor.  The
+    recurrence is filled slab-by-slab along axis 0 (vectorized over the other
+    axes), so the cost/memory is O(prod(cuts)).
+    """
+    from thewalrus.quantum import Amat, Qmat, complex_to_real_displacements
+    cov = np.asarray(cov, float)
+    mu = np.asarray(mu, float)
+    M = cov.shape[0] // 2
+    assert len(cuts) == M
+
+    beta = complex_to_real_displacements(mu, hbar=HBAR)
+    B = Amat(cov, hbar=HBAR)[:M, :M]
+    alpha = beta[:M]
+    gamma = np.conj(alpha) - B @ alpha
+    pref = np.exp((-0.5 * (np.linalg.norm(alpha) ** 2 - alpha @ B @ alpha)).conj())
+    denom = np.sqrt(np.sqrt(np.linalg.det(Qmat(cov, hbar=HBAR)).real))
+    A = B.conj()
+    m_vec = gamma.conj()
+
+    shape = tuple(int(c) for c in cuts)
+    R = np.zeros(shape, dtype=np.complex128)
+
+    # ---- base slab (axis-0 index 0): recurse within the small fired axes ---- #
+    sub = shape[1:]
+    R[(0,) * M] = 1.0
+    if M > 1:
+        from itertools import product as _prod
+        for idx in _prod(*[range(s) for s in sub]):
+            if all(i == 0 for i in idx):
+                continue
+            i = next(j for j, x in enumerate(idx) if x > 0)       # fired axis i
+            ai = i + 1                                            # global axis
+            n = list(idx); n[i] -= 1                              # n = idx - e_i
+            full_n = (0,) + tuple(n)
+            acc = m_vec[ai] * R[full_n]
+            for j in range(M):
+                nj = full_n[j]
+                if nj > 0:
+                    nm = list(full_n); nm[j] -= 1
+                    acc += A[ai, j] * np.sqrt(nj) * R[tuple(nm)]
+            R[(0,) + tuple(idx)] = acc / np.sqrt(idx[i])
+
+    # ---- slabs m >= 1 along axis 0 (vectorized over fired axes) ------------ #
+    sqrt_k = [np.sqrt(np.arange(s)) for s in sub]
+    for m in range(1, shape[0]):
+        slab = m_vec[0] * R[m - 1]
+        if m >= 2:
+            slab = slab + A[0, 0] * np.sqrt(m - 1) * R[m - 2]
+        for j in range(1, M):
+            # A_0j * sqrt(k_j) * R[m-1, k - e_j]  (shift along fired axis j-1)
+            shifted = np.zeros(sub, dtype=np.complex128)
+            sl_to = [slice(None)] * (M - 1); sl_to[j - 1] = slice(1, None)
+            sl_from = [slice(None)] * (M - 1); sl_from[j - 1] = slice(0, sub[j - 1] - 1)
+            shifted[tuple(sl_to)] = R[m - 1][tuple(sl_from)]
+            w = sqrt_k[j - 1].reshape([-1 if a == j - 1 else 1 for a in range(M - 1)])
+            slab = slab + A[0, j] * w * shifted
+        R[m] = slab / np.sqrt(m)
+
+    return pref * R / denom
 
 
 def _single_mode_gaussian_unitary(params, cutoff):
