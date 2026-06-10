@@ -447,6 +447,11 @@ def heralded_output(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
     return sv, prob
 
 
+# Max amplitudes in reduced_herald's joint tensor: bounds memory AND time.
+# 2e7 ~ 320 MB / a few seconds of recurrence.  Tune per use case if needed.
+REDUCED_HERALD_BUDGET = int(2e7)
+
+
 def reduced_herald(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
                    control_idx: Sequence[int], n: Sequence[int],
                    cutoff: int = 40) -> Tuple[np.ndarray, float]:
@@ -504,14 +509,18 @@ def reduced_herald(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
     # same renormalized multidimensional-Hermite recurrence ourselves on the
     # minimal (cutoff, n_1+1, ..., n_k+1) tensor.
     cuts = [int(cutoff)] + [nv + 1 for _, nv in fired]
-    # memory budget: shrink the signal axis (never below 32) rather than OOM
-    _BUDGET = int(2e8)
+    # tensor budget: bounds BOTH memory and (single-threaded recurrence) TIME.
+    # 2e7 amplitudes ~ 320 MB and a couple of seconds; genotypes with many
+    # mid-n fired modes would otherwise sit just under a memory-only cap and
+    # take minutes each.  Shrink the signal axis (never below 32) first, skip
+    # the genotype if the fired axes alone blow the budget.
+    budget = int(REDUCED_HERALD_BUDGET)
     other = int(np.prod(cuts[1:])) if len(cuts) > 1 else 1
-    if other > _BUDGET // 32:
+    if other > budget // 32:
         raise ValueError(
             f"reduced_herald: fired-mode tensor {cuts[1:]} alone exceeds the "
-            f"memory budget ({other} > {_BUDGET // 32} amplitudes)")
-    cuts[0] = min(cuts[0], max(32, _BUDGET // other))   # shrink only, never grow
+            f"budget ({other} > {budget // 32} amplitudes)")
+    cuts[0] = min(cuts[0], max(32, budget // other))   # shrink only, never grow
     v = _gaussian_amplitudes(cov_r, mu_r, cuts)[
         tuple([slice(None)] + [nv for _, nv in fired])].ravel()
     p_fock = float(np.sum(np.abs(v) ** 2))

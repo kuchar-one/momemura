@@ -149,7 +149,9 @@ def rescore_genotype(g, decoder, cfg, O, L, coupling_eps):
     psi, p_pnr = reduced_herald(cov, mu, sig, ctrl, n0, cutoff=L)
     if not np.isfinite(psi).all() or np.linalg.norm(psi) < 0.5:
         return None
-    exp_exact = float(np.real(np.vdot(psi, O @ psi)))
+    L_eff = len(psi)          # < L when the tensor budget shrank the signal axis
+    Oe = O[:L_eff, :L_eff]
+    exp_exact = float(np.real(np.vdot(psi, Oe @ psi)))
 
     window = float(params.get("homodyne_window") or 0.0)
     dens = [float(d) for d in eq.get("homodyne_densities", [])]
@@ -159,7 +161,7 @@ def rescore_genotype(g, decoder, cfg, O, L, coupling_eps):
 
     return dict(exp=exp_exact, P_leaf=P_leaf, P_phys=P_phys, p_pnr=float(p_pnr),
                 n_det=int(sum(n0)), n_eff=int(n_eff), max_pnr_eff=int(max_pnr_eff),
-                couplings=couplings,
+                couplings=couplings, L_eff=L_eff,
                 gbs_sq_db=round(float(eq["max_squeezing_db"]), 2))
 
 
@@ -229,7 +231,7 @@ def process_run(cfgf: str, opts: dict):
                      f"{fit[k,1]:.4f},{np.log10(max(r['P_leaf'],1e-300)):.4f},"
                      f"{np.log10(max(r['P_phys'],1e-300)):.4f},"
                      f"{-fit[k,3]:.0f},{r['n_eff']},{r['max_pnr_eff']},"
-                     f"{r['gbs_sq_db']},\"{r['couplings']}\"\n")
+                     f"{r['gbs_sq_db']},{r['L_eff']},\"{r['couplings']}\"\n")
 
     outdir = os.path.join(opts["out"], group, run)
     os.makedirs(outdir, exist_ok=True)
@@ -271,29 +273,35 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     summary = open(os.path.join(args.out, "rescore_summary.csv"), "w")
     summary.write("group,run,idx,exp_old,exp_new,logP_old,logP_leaf_new,logP_phys,"
-                  "photons_old,n_eff,max_pnr_eff,gbs_sq_db,couplings\n")
+                  "photons_old,n_eff,max_pnr_eff,gbs_sq_db,L_eff,couplings\n")
     opts = dict(out=args.out, cutoff=args.cutoff, coupling_eps=args.coupling_eps,
                 prob=args.prob, limit=args.limit)
 
     t_all = time.time()
+    done = [0]
+    total = len(run_dirs)
 
     def report(res):
         label, n_ok, n_valid, n_dud, lines = res
+        done[0] += 1
         if n_ok is None:
-            print(f"[!] {label}: {n_valid} -- skipped")
+            print(f"[{done[0]}/{total}] [!] {label}: {n_valid} -- skipped", flush=True)
             return
         for ln in lines:
             summary.write(ln)
         summary.flush()
-        print(f"[+] {label}: rescored {n_ok}/{n_valid} ({n_dud} with dud photons)",
+        print(f"[{done[0]}/{total}] {label}: rescored {n_ok}/{n_valid} "
+              f"({n_dud} with dud photons, {time.time()-t_all:.0f}s elapsed)",
               flush=True)
 
     if args.workers > 1:
-        from concurrent.futures import ProcessPoolExecutor
+        # as_completed: report in COMPLETION order -- ex.map would block the
+        # visible progress behind the slowest in-order run.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            for res in ex.map(process_run, run_dirs,
-                              [opts] * len(run_dirs)):
-                report(res)
+            futs = [ex.submit(process_run, cfgf, opts) for cfgf in run_dirs]
+            for fut in as_completed(futs):
+                report(fut.result())
     else:
         for cfgf in run_dirs:
             report(process_run(cfgf, opts))
