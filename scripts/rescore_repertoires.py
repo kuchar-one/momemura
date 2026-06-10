@@ -37,13 +37,26 @@ Run on the cluster:
 """
 from __future__ import annotations
 import os, sys, json, glob, time, shutil, argparse, pickle
-import numpy as np
+
+# ---- threading discipline: MUST run before numpy/jax are imported ---------- #
+# Every worker process would otherwise spawn a BLAS pool with one thread per
+# CORE (32 workers x 64 OpenBLAS threads -> load average in the hundreds).
+# All the per-genotype linear algebra here is on tiny (<=32x32) matrices --
+# one thread per worker is optimal; parallelism comes from --workers.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ[_v] = "1"
+os.environ.setdefault(
+    "XLA_FLAGS",
+    "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1")
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Rescoring only uses JAX for genotype DECODING (milliseconds, tiny arrays).
 # Keep it off the GPUs: a GPU backend preallocates ~75% of every visible
 # card's VRAM per process for nothing.  Override with JAX_PLATFORMS=cuda.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
