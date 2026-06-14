@@ -1058,22 +1058,28 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
         psi, _prob_pnr = jax_reduced_herald_static(cov17, mu17, eff_pnr, L)
         Lp = psi.shape[0]
         raw_exp = jnp.real(jnp.vdot(psi, operator_L[:Lp, :Lp] @ psi))
+        # the herald is valid only if it produced a normalised state; a zero-norm
+        # psi (impossible PNR pattern, or numerical underflow) must be INVALID,
+        # not scored as <O>=0 (which would masquerade as the global best).
+        herald_norm = jnp.sum(jnp.abs(psi) ** 2)
         P_leaf = _leaf_prob_product_static(params, L)
         joint_prob = jnp.real(P_leaf)
+        valid = (joint_prob > 1e-40) & (herald_norm > 0.5)
         n_eff, max_eff = _effective_photons_static(cov17, eff_pnr, coupling_eps)
         active_modes = jnp.sum(jnp.asarray(params["leaf_active"]).astype(jnp.float64))
-        exp_val = jnp.where(joint_prob > 1e-40, raw_exp, 0.0)
+        exp_val = jnp.where(valid, raw_exp, 0.0)            # grad-safe placeholder
         prob_capped = jnp.minimum(jnp.maximum(joint_prob, 1e-45), 1.0)
         log_prob = -jnp.log10(prob_capped)
         log_prob = log_prob + jnp.where(jnp.maximum(joint_prob - 1.0, 0.0) > 1e-4, jnp.inf, 0.0)
         is_artifact = jnp.logical_and(exp_val < gaussian_limit, n_eff < 0.5)
         art = jnp.where(is_artifact, jnp.inf, 0.0)
-        exp_val = exp_val + art; log_prob = log_prob + art
+        invalid_pen = jnp.where(valid, 0.0, jnp.inf)        # mark invalid herald
+        exp_val = exp_val + art; log_prob = log_prob + art + invalid_pen
         eps0 = 0.01
         d_e = w_exp * jnp.abs(exp_val - (gs_eig - eps0))
         d_p = w_prob * jnp.abs(log_prob - (-eps0))
         loss_val = jnp.maximum(d_e, d_p) + 0.01 * (d_e + d_p)
-        final_exp = jnp.where(joint_prob > 1e-40, raw_exp, jnp.inf) + art
+        final_exp = jnp.where(valid, raw_exp, jnp.inf) + art
         aux = dict(final_exp=final_exp, log_prob=log_prob, active=active_modes,
                    max_pnr=max_eff, photons=n_eff, raw_exp=raw_exp, joint_prob=joint_prob)
         return jnp.real(loss_val), aux

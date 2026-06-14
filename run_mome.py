@@ -72,8 +72,9 @@ try:
     import jax
 
     # JAX Config
-    # Use float32 for speed (User request)
-    jax.config.update("jax_enable_x64", False)
+    # float32 by default for speed (user policy); the moment scorer is exact only
+    # in 64-bit, so enable x64 when --scorer moment is requested.
+    jax.config.update("jax_enable_x64", "moment" in sys.argv)
 
     # Memory optimization: don't preallocate all GPU memory
     # This helps with multi-GPU workloads and reduces fragmentation
