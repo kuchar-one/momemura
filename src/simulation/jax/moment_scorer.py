@@ -633,7 +633,7 @@ def _flat_amplitudes(cov, mu, radii, L, MAXF=MOMENT_MAXF, BF=MOMENT_BF):
     rev = jnp.concatenate([jnp.ones((1,), jnp.int32), jnp.cumprod(r[::-1])[:-1]])
     stride = rev[::-1]                                # (MAXF,)
     prodf = stride[0] * r[0]
-    det_flat = jnp.sum((r - 1) * stride)
+    det_flat = jnp.clip(jnp.sum((r - 1) * stride), 0, BF - 1)   # clamp (over-budget safety)
 
     q = jnp.arange(BF)
     kjq = (q[None, :] // stride[:, None]) % r[:, None]    # (MAXF, BF) k_j(q)
@@ -1064,7 +1064,14 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
         herald_norm = jnp.sum(jnp.abs(psi) ** 2)
         P_leaf = _leaf_prob_product_static(params, L)
         joint_prob = jnp.real(P_leaf)
-        valid = (joint_prob > 1e-40) & (herald_norm > 0.5)
+        # over-budget detection IN-GRAPH (no eager pre-pass): kf>MAXF (fired modes
+        # dropped) or prod(n_j+1)>BF (flat buffer overflow) => not representable
+        # here -> mark invalid (the rare extreme-Sigma-n tail).
+        fired_mask = eff_pnr >= 1
+        kf = jnp.sum(fired_mask.astype(jnp.float64))
+        logprod = jnp.sum(jnp.where(fired_mask, jnp.log(eff_pnr + 1.0), 0.0))
+        in_budget = (kf <= MOMENT_MAXF) & (logprod <= jnp.log(float(MOMENT_BF)) + 1e-6)
+        valid = (joint_prob > 1e-40) & (herald_norm > 0.5) & in_budget
         n_eff, max_eff = _effective_photons_static(cov17, eff_pnr, coupling_eps)
         active_modes = jnp.sum(jnp.asarray(params["leaf_active"]).astype(jnp.float64))
         exp_val = jnp.where(valid, raw_exp, 0.0)            # grad-safe placeholder
@@ -1103,39 +1110,24 @@ def moment_score_population_static(genotypes, operator_L, genotype_name,
     w_prob = float(cfg.get("alpha_probability", 0.0))
     coupling_eps = float(cfg.get("coupling_eps", 0.05))
     floats = (float(gs_eig), float(gaussian_limit), w_exp, w_prob, coupling_eps)
-    g_np = np.asarray(genotypes)
-    Npop, D = g_np.shape
-    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
-                                   config=cfg)
+    Npop = np.asarray(genotypes).shape[0]
 
-    # eager over-budget detection (kf>MAXF or prod>BF)
-    over = []
-    for i in range(Npop):
-        st = extract_structure(decoder.decode(jnp.asarray(g_np[i]), base_cutoff))
-        kf = sum(1 for leaf in st[2] for p in leaf if p >= 1)
-        if kf > MOMENT_MAXF or _struct_fired_product(st) > MOMENT_BF:
-            over.append(i)
-
+    # Single jit dispatch -- no eager per-genotype pre-pass.  Over-budget
+    # genotypes (kf>MAXF or prod(n_j+1)>BF, the rare extreme-Sigma-n tail) are
+    # detected in-graph and marked invalid (dropped from the archive).
     f, d, gr, re, jp = _score_pop_static_jit(
-        jnp.asarray(g_np), operator_L, genotype_name, config_hashable,
+        jnp.asarray(genotypes), operator_L, genotype_name, config_hashable,
         int(base_cutoff), int(L), floats)
-    fit = np.asarray(f); desc = np.asarray(d); grads = np.asarray(gr)
-    rawe = np.asarray(re); jprob = np.asarray(jp)
-
-    if over:
-        _score_over_budget_numpy(over, g_np, decoder, cfg, np.asarray(operator_L),
-                                 base_cutoff, L, w_prob, fit, desc, rawe, jprob)
-        grads[over] = 0.0
 
     extras = {
-        "gradients": jnp.asarray(grads),
-        "raw_expectation": jnp.asarray(rawe),
-        "joint_probability": jnp.asarray(jprob),
+        "gradients": gr,
+        "raw_expectation": re,
+        "joint_probability": jp,
         "leakage": jnp.zeros(Npop),
-        "pnr_cost": jnp.asarray(desc[:, 2]),
+        "pnr_cost": d[:, 2],
         "final_state": jnp.zeros((Npop, base_cutoff), dtype=jnp.complex128),
     }
-    return jnp.asarray(fit), jnp.asarray(desc), extras
+    return f, d, extras
 
 
 def _numpy_leaf_prob_product(params, L):
