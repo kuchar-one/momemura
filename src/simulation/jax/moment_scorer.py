@@ -246,3 +246,188 @@ def jax_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
         "pnr_outcomes": pnr_outcomes,
         "homodyne_densities": homodyne_densities,
     }
+
+
+# =========================================================================== #
+# Piece 2b: jax_reduced_herald -- analytic vacuum conditioning + multidim
+# Hermite recurrence.  Bit-exact JAX mirror of gbs_optimizer.reduced_herald /
+# _gaussian_amplitudes (SAME convention, not just up-to-conjugation).
+#
+# Budget is on tensor amplitudes prod(n_j+1)*L, never on mode count: the box
+# uses each fired mode's ACTUAL n_j+1, so many fired modes with modest photons
+# are cheap.  Discrete fired-shape is static (per-bucket trace).
+# =========================================================================== #
+from src.simulation.jax.herald import Amat as _Amat, Qmat as _Qmat, \
+    complex_to_real_displacements as _c2r
+
+
+def _base_slab_tables(sub: Tuple[int, ...]):
+    """Precompute (numpy, trace-time) the gather/coefficient tables that fill the
+    fired-mode box at signal index 0, in C-order. ``sub`` = (n_1+1,...,n_kf+1).
+
+    For box index ``idx`` with first nonzero axis ``i`` (global axis ai=i+1):
+        full = idx - e_i  (the 'main' predecessor);  R0[idx] =
+          ( m_vec[ai]*R0[full] + Σ_a A[ai,a+1]*sqrt(full[a])*R0[full-e_a] )
+          / sqrt(idx[i])
+    """
+    kf = len(sub)
+    P = int(np.prod(sub)) if kf else 1
+    ai = np.zeros(P, np.int32)
+    inv = np.zeros(P, np.float64)
+    main_pred = np.zeros(P, np.int32)
+    predA = np.zeros((P, max(kf, 1)), np.int32)
+    sqrtA = np.zeros((P, max(kf, 1)), np.float64)
+    if kf == 0:
+        return ai, inv, main_pred, predA, sqrtA, P
+    idxs = list(np.ndindex(*sub))
+    for q, idx in enumerate(idxs):
+        if all(v == 0 for v in idx):
+            continue
+        i = next(a for a, v in enumerate(idx) if v > 0)
+        ai[q] = i + 1
+        inv[q] = 1.0 / np.sqrt(idx[i])
+        full = list(idx); full[i] -= 1
+        main_pred[q] = int(np.ravel_multi_index(tuple(full), sub))
+        for a in range(kf):
+            if full[a] > 0:
+                nm = list(full); nm[a] -= 1
+                predA[q, a] = int(np.ravel_multi_index(tuple(nm), sub))
+                sqrtA[q, a] = np.sqrt(full[a])
+    return ai, inv, main_pred, predA, sqrtA, P
+
+
+def _gaussian_amplitudes_jax(cov: jnp.ndarray, mu: jnp.ndarray,
+                             cuts: Tuple[int, ...]) -> jnp.ndarray:
+    """<n|psi> of a pure M-mode Gaussian on a tensor with per-mode cutoffs
+    ``cuts`` (static).  axis 0 = signal (length L), axes 1.. = fired modes.
+    Differentiable in (cov, mu).  Mirrors numpy _gaussian_amplitudes exactly."""
+    M = len(cuts)
+    L = int(cuts[0])
+    sub = tuple(int(c) for c in cuts[1:])
+    cdt = jnp.complex128
+
+    beta = _c2r(mu, HBAR)
+    B = _Amat(cov, HBAR)[:M, :M]
+    alpha = beta[:M]
+    gamma = jnp.conj(alpha) - B @ alpha
+    pref = jnp.exp(jnp.conj(-0.5 * (jnp.sum(jnp.abs(alpha) ** 2) - alpha @ B @ alpha)))
+    detQ = jnp.real(jnp.linalg.det(_Qmat(cov, HBAR)))
+    denom = jnp.sqrt(jnp.sqrt(detQ))
+    A = jnp.conj(B).astype(cdt)
+    m_vec = jnp.conj(gamma).astype(cdt)
+
+    # ---- base slab (signal index 0): fill the fired box -------------------- #
+    ai, inv, main_pred, predA, sqrtA, P = _base_slab_tables(sub)
+    R0 = jnp.zeros(P, dtype=cdt).at[0].set(1.0 + 0j)
+    if P > 1:
+        ai_j = jnp.asarray(ai); inv_j = jnp.asarray(inv).astype(cdt)
+        mp_j = jnp.asarray(main_pred)
+        pA_j = jnp.asarray(predA); sA_j = jnp.asarray(sqrtA).astype(cdt)
+        cols = jnp.arange(len(sub)) + 1
+
+        def body(q, R):
+            a_i = ai_j[q]
+            acc = m_vec[a_i] * R[mp_j[q]]
+            row = A[a_i][cols]                       # A[ai, fired-axis globals]
+            acc = acc + jnp.sum(row * sA_j[q] * R[pA_j[q]])
+            return R.at[q].set(acc * inv_j[q])
+
+        R0 = jax.lax.fori_loop(1, P, body, R0)
+
+    box0 = R0.reshape(sub) if sub else R0.reshape(())
+
+    # ---- signal axis (m >= 1): lax.scan over L ----------------------------- #
+    def shift_up(arr, axis):
+        sl_to = [slice(None)] * len(sub); sl_to[axis] = slice(1, None)
+        sl_from = [slice(None)] * len(sub); sl_from[axis] = slice(0, -1)
+        return jnp.zeros_like(arr).at[tuple(sl_to)].set(arr[tuple(sl_from)])
+
+    sqrtk = []
+    for axis in range(len(sub)):
+        w = jnp.sqrt(jnp.arange(sub[axis])).astype(cdt)
+        shape = [sub[axis] if a == axis else 1 for a in range(len(sub))]
+        sqrtk.append(w.reshape(shape))
+
+    def step(carry, m):
+        prev1, prev2 = carry
+        slab = m_vec[0] * prev1
+        slab = slab + jnp.where(m >= 2, A[0, 0] * jnp.sqrt(jnp.maximum(m - 1, 0.0)), 0.0) * prev2
+        for axis in range(len(sub)):
+            slab = slab + A[0, axis + 1] * sqrtk[axis] * shift_up(prev1, axis)
+        slab = slab / jnp.sqrt(m.astype(jnp.float64))
+        return (slab, prev1), slab
+
+    if L > 1:
+        ms = jnp.arange(1, L)
+        _, slabs = jax.lax.scan(step, (box0, jnp.zeros_like(box0)), ms)
+        R = jnp.concatenate([box0[None], slabs], axis=0)
+    else:
+        R = box0[None]
+    return pref * R / denom
+
+
+def _vacuum_condition(cov: jnp.ndarray, mu: jnp.ndarray,
+                      keep: List[int], vac: List[int]
+                      ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Analytically condition the n=0 (vacuum-detected) modes ``vac`` out of a
+    pure Gaussian state (Schur complement, measurement covariance = I, hbar=2),
+    keeping modes ``keep``.  Returns (cov_r, mu_r, p_vac).  Mirrors the vacuum
+    block of gbs_optimizer.reduced_herald exactly."""
+    N = cov.shape[0] // 2
+    if not vac:
+        ki = jnp.asarray([k for k in keep] + [k + N for k in keep])
+        return cov[jnp.ix_(ki, ki)], mu[ki], jnp.array(1.0)
+    ki = jnp.asarray([k for k in keep] + [k + N for k in keep])
+    vi = jnp.asarray([v for v in vac] + [v + N for v in vac])
+    Vk = cov[jnp.ix_(ki, ki)]
+    Vv = cov[jnp.ix_(vi, vi)]
+    Vkv = cov[jnp.ix_(ki, vi)]
+    Mm = Vv + jnp.eye(vi.shape[0])
+    rhs = jnp.column_stack([Vkv.T, mu[vi]])
+    sol = jnp.linalg.solve(Mm, rhs)
+    cov_r = Vk - Vkv @ sol[:, :-1]
+    cov_r = 0.5 * (cov_r + cov_r.T)
+    mu_r = mu[ki] - Vkv @ sol[:, -1]
+    p_vac = (2.0 ** len(vac) / jnp.sqrt(jnp.linalg.det(Mm))
+             * jnp.exp(-0.5 * mu[vi] @ jnp.linalg.solve(Mm, mu[vi])))
+    return cov_r, mu_r, p_vac
+
+
+# Max fired-box amplitudes prod(n_j+1) handled in-loop. The base-slab fill is
+# O(prod) sequential (lax.fori_loop), so this also bounds TIME, not just memory.
+# Fired patterns above this (the high-Sigma-n extreme tail, ~1-8% of genotypes,
+# vanishing probability) are routed to the exact CPU reduced_herald fallback by
+# the caller (MOMENT_SCORER_PLAN.md Sec. 2b).  prod is data-independent within a
+# structure bucket, so this is a static, per-bucket decision.
+REDUCED_HERALD_PROD_BUDGET = 1 << 14   # 16384
+
+
+def fired_product(n: Tuple[int, ...]) -> int:
+    """prod(n_j+1) over fired (n>=1) control modes -- the fired-box size."""
+    p = 1
+    for nv in n:
+        if int(nv) >= 1:
+            p *= int(nv) + 1
+    return p
+
+
+def jax_reduced_herald(cov: jnp.ndarray, mu: jnp.ndarray, signal_idx: int,
+                       control_idx: Tuple[int, ...], n: Tuple[int, ...],
+                       cutoff: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Heralded signal state + herald probability, exact at any squeezing.
+    JAX mirror of gbs_optimizer.reduced_herald.  ``control_idx`` and ``n`` are
+    static (per-bucket); ``cov``/``mu`` traced.  Returns (psi[cutoff], prob)."""
+    N = cov.shape[0] // 2
+    fired = [(int(c), int(nv)) for c, nv in zip(control_idx, n) if int(nv) >= 1]
+    vac = [int(c) for c, nv in zip(control_idx, n) if int(nv) == 0]
+    keep = [int(signal_idx)] + [c for c, _ in fired]
+
+    cov_r, mu_r, p_vac = _vacuum_condition(cov, mu, keep, vac)
+    cuts = tuple([int(cutoff)] + [nv + 1 for _, nv in fired])
+    box = _gaussian_amplitudes_jax(cov_r, mu_r, cuts)
+    sl = (slice(None),) + tuple(nv for _, nv in fired)
+    v = box[sl].ravel()
+    p_fock = jnp.sum(jnp.abs(v) ** 2)
+    prob = p_vac * p_fock
+    psi = jnp.where(p_fock > 0, v / jnp.sqrt(jnp.maximum(p_fock, 1e-300)), v)
+    return psi, prob

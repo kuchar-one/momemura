@@ -17,7 +17,11 @@ import pytest
 
 from src.genotypes.genotypes import get_genotype_decoder
 from frontend.gaussian_decomposition import compute_equivalent_gaussian
-from src.simulation.jax.moment_scorer import jax_equivalent_gaussian
+from frontend.gbs_optimizer import reduced_herald
+from src.simulation.jax.moment_scorer import (
+    jax_equivalent_gaussian, jax_reduced_herald, fired_product,
+    REDUCED_HERALD_PROD_BUDGET,
+)
 
 CFG = dict(genotype="00B", depth=3, modes=3, pnr_max=15,
            r_scale=1.87, d_scale=2.24, hx_scale=1.37, window=0.0)
@@ -80,3 +84,38 @@ def test_equivalent_gaussian_is_differentiable():
     h = 1e-5
     fd = (float(scalar(g0.at[i].add(h))) - float(scalar(g0.at[i].add(-h)))) / (2 * h)
     assert abs(grad[i] - fd) / (abs(fd) + 1e-12) < 1e-5
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_reduced_herald_matches_numpy(seed):
+    """jax_reduced_herald == numpy reduced_herald, BIT-exact (same convention):
+    heralded signal state psi AND herald probability, across fired patterns.
+    Skips the over-budget extreme-Sigma-n tail (routed to CPU fallback in prod)."""
+    L = 60
+    dec, gens = _random_genotypes(8, seed=seed)
+    n_checked = 0
+    kf_seen = set()
+    for g in gens:
+        params = dec.decode(jnp.asarray(g), CUTOFF)
+        pnp = {k: (np.asarray(v) if hasattr(v, "shape") else v)
+               for k, v in params.items()}
+        eq = compute_equivalent_gaussian(pnp, light=True)
+        cov = np.asarray(eq["cov"], float)
+        mu = np.asarray(eq["mu"], float)
+        sig = int(eq["signal_idx"])
+        ctrl = tuple(int(x) for x in eq["control_idx"])
+        n0 = tuple(int(x) for x in eq["pnr_outcomes"])
+        if fired_product(n0) * L > REDUCED_HERALD_PROD_BUDGET * L:
+            continue  # extreme tail -> CPU fallback, not the in-loop path
+        psi_np, p_np = reduced_herald(cov, mu, sig, list(ctrl), list(n0), cutoff=L)
+        psi_jx, p_jx = jax_reduced_herald(jnp.asarray(cov), jnp.asarray(mu),
+                                          sig, ctrl, n0, L)
+        psi_jx = np.asarray(psi_jx)
+        Lm = min(len(psi_np), len(psi_jx))
+        assert np.allclose(psi_np[:Lm], psi_jx[:Lm], atol=1e-7), \
+            f"psi max|Δ|={np.max(np.abs(psi_np[:Lm] - psi_jx[:Lm])):.2e}"
+        assert abs(p_np - float(p_jx)) <= 1e-7 * (abs(p_np) + 1e-12), \
+            f"prob rel|Δ|={abs(p_np - float(p_jx)) / (abs(p_np) + 1e-30):.2e}"
+        n_checked += 1
+        kf_seen.add(sum(1 for x in n0 if x >= 1))
+    assert n_checked > 0, "no in-budget genotypes were checked"

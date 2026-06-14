@@ -137,6 +137,23 @@ compare fronts/throughput/VRAM to Fock, confirm the periodic sweep removes ~0.
 - First PR = **scorer behind `--scorer moment|fock`, default `fock`**; keep the
   dual-cutoff sweep as a safety net; flip default + retire sweep after cluster A/B.
 
+## 6b. Status (2026-06-14)
+- **2a DONE + validated**: `jax_equivalent_gaussian` == numpy ref to ~1e-14
+  (cov/mu/densities/indices, all groups incl. high-`k` `a1p00_b1p41`); autodiff
+  == finite-diff to 1e-9. Self-contained tests pass on Mac + cluster.
+- **2b DONE + validated**: `jax_reduced_herald` == numpy `reduced_herald`
+  BIT-exact (psi + prob, ~1e-16–1e-11) across fired counts kf=0–3; general-rank
+  so kf≥4 use the identical path.
+- **Perf finding (key for task 3/5)**: the base-slab fill is O(∏(n_j+1))
+  SEQUENTIAL (`lax.fori_loop`). Cheap for the common case (∏ median ~70) but
+  O(7700) at p90 in the hard group and millions in the Σn extreme tail (kf=6
+  ∏≈3.2M timed out). Mitigations, in order: (i) `REDUCED_HERALD_PROD_BUDGET`
+  (16384) routes the extreme tail to the exact CPU fallback; (ii) **if the
+  cluster benchmark shows the in-loop base slab is hot, vectorise it by
+  anti-diagonal** (fill layers of constant Σ photons: O(Σn≤~45) sequential
+  layers, each vectorised — turns ∏ into Σn). Signal axis is already a
+  vectorised `lax.scan`, so only the base slab needs this.
+
 ## 7. Risks
 - Moment path is exact only for **point** homodyne (window=0). 00B uses window=0;
   guard against finite-window configs (would need mixed-state hybrid — out of
