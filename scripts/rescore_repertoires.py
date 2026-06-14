@@ -200,9 +200,13 @@ def process_run(cfgf: str, opts: dict):
     ab = (cfg.get("target_alpha"), cfg.get("target_beta"))
     key = str(ab)
     if key not in _OP_CACHE:
-        _OP_CACHE[key] = gkp_operator(opts["cutoff"],
-                                      complex(str(ab[0]).replace("i", "j")),
-                                      pr.parse_complex(str(ab[1])))
+        try:
+            _OP_CACHE[key] = gkp_operator(opts["cutoff"],
+                                          complex(str(ab[0]).replace("i", "j")),
+                                          pr.parse_complex(str(ab[1])))
+        except Exception as e:
+            # one malformed config must not kill the whole sweep -- skip this run
+            return label, None, f"bad target (alpha={ab[0]!r}, beta={ab[1]!r}): {e}", None, []
     O, _u = _OP_CACHE[key]
     decoder = get_genotype_decoder(cfg.get("genotype"),
                                    depth=int(cfg.get("depth") or 3), config=cfg)
