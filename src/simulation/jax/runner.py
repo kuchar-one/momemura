@@ -846,6 +846,19 @@ def jax_scoring_fn_batch(
     Batched scoring function for QDax.
     Returns: (fitnesses, descriptors, extras)
     """
+    # --- Moment-space scorer (exact, truncation-free) behind config flag ----
+    cfg_d = dict(genotype_config) if isinstance(genotype_config, dict) else (
+        dict(genotype_config) if genotype_config else {})
+    if cfg_d.get("scorer") == "moment":
+        from src.simulation.jax.moment_scorer import (
+            moment_score_population, moment_operator)
+        L = int(cfg_d.get("moment_cutoff", 100))
+        opL = moment_operator(L, cfg_d.get("target_alpha"), cfg_d.get("target_beta"))
+        config_hashable = tuple(sorted(cfg_d.items()))
+        return moment_score_population(genotypes, opL, genotype_name,
+                                       config_hashable, int(cutoff), L,
+                                       float(gs_eig), float(gaussian_limit))
+
     n_devices = jax.local_device_count()
 
     if n_devices <= 1:

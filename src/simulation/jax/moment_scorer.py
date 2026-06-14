@@ -29,6 +29,7 @@ import numpy as np
 from typing import Any, Dict, List, Tuple
 
 from src.simulation.jax.runner import jax_clements_unitary
+from src.genotypes.genotypes import get_genotype_decoder
 from src.simulation.jax.herald import (
     passive_unitary_to_symplectic,
     vacuum_covariance,
@@ -285,39 +286,58 @@ from src.simulation.jax.herald import Amat as _Amat, Qmat as _Qmat, \
     complex_to_real_displacements as _c2r
 
 
-def _base_slab_tables(sub: Tuple[int, ...]):
-    """Precompute (numpy, trace-time) the gather/coefficient tables that fill the
-    fired-mode box at signal index 0, in C-order. ``sub`` = (n_1+1,...,n_kf+1).
+from functools import lru_cache as _lru_cache
 
-    For box index ``idx`` with first nonzero axis ``i`` (global axis ai=i+1):
-        full = idx - e_i  (the 'main' predecessor);  R0[idx] =
+
+@_lru_cache(maxsize=256)
+def _base_slab_schedule(sub: Tuple[int, ...]):
+    """Anti-diagonal fill schedule for the fired-mode box (signal index 0),
+    cached per static ``sub`` = (n_1+1,...,n_kf+1).
+
+    The box entry ``idx`` (first nonzero axis i, global axis ai=i+1) obeys
+        full = idx - e_i;  R0[idx] =
           ( m_vec[ai]*R0[full] + Σ_a A[ai,a+1]*sqrt(full[a])*R0[full-e_a] )
           / sqrt(idx[i])
+    Entries at total-photon level t = Σ idx depend only on levels t-1 (full) and
+    t-2 (full-e_a), so we fill level-by-level: T = Σ n_j SEQUENTIAL layers, each
+    of <= W entries filled in PARALLEL.  This replaces the O(∏) fori_loop with an
+    O(Σn) lax.scan -- cheap, and crucially reverse-mode-AD-friendly.
+
+    Returns padded (T, W) tables (or None if the box is a single point).
     """
     kf = len(sub)
     P = int(np.prod(sub)) if kf else 1
-    ai = np.zeros(P, np.int32)
-    inv = np.zeros(P, np.float64)
-    main_pred = np.zeros(P, np.int32)
-    predA = np.zeros((P, max(kf, 1)), np.int32)
-    sqrtA = np.zeros((P, max(kf, 1)), np.float64)
-    if kf == 0:
-        return ai, inv, main_pred, predA, sqrtA, P
+    if kf == 0 or P == 1:
+        return None
     idxs = list(np.ndindex(*sub))
-    for q, idx in enumerate(idxs):
-        if all(v == 0 for v in idx):
-            continue
-        i = next(a for a, v in enumerate(idx) if v > 0)
-        ai[q] = i + 1
-        inv[q] = 1.0 / np.sqrt(idx[i])
-        full = list(idx); full[i] -= 1
-        main_pred[q] = int(np.ravel_multi_index(tuple(full), sub))
-        for a in range(kf):
-            if full[a] > 0:
-                nm = list(full); nm[a] -= 1
-                predA[q, a] = int(np.ravel_multi_index(tuple(nm), sub))
-                sqrtA[q, a] = np.sqrt(full[a])
-    return ai, inv, main_pred, predA, sqrtA, P
+    flat = {idx: int(np.ravel_multi_index(idx, sub)) for idx in idxs}
+    levels: Dict[int, list] = {}
+    for idx in idxs:
+        levels.setdefault(sum(idx), []).append(idx)
+    T = max(levels)
+    W = max((len(levels.get(t, [])) for t in range(1, T + 1)), default=0)
+    q = np.zeros((T, W), np.int32)
+    ai = np.zeros((T, W), np.int32)
+    inv = np.zeros((T, W), np.float64)
+    mp = np.zeros((T, W), np.int32)
+    pA = np.zeros((T, W, kf), np.int32)
+    sA = np.zeros((T, W, kf), np.float64)
+    mask = np.zeros((T, W), np.float64)
+    for ti, t in enumerate(range(1, T + 1)):
+        for wi, idx in enumerate(levels.get(t, [])):
+            i = next(a for a, v in enumerate(idx) if v > 0)
+            full = list(idx); full[i] -= 1
+            q[ti, wi] = flat[idx]; ai[ti, wi] = i + 1
+            inv[ti, wi] = 1.0 / np.sqrt(idx[i])
+            mp[ti, wi] = flat[tuple(full)]
+            for a in range(kf):
+                if full[a] > 0:
+                    nm = list(full); nm[a] -= 1
+                    pA[ti, wi, a] = flat[tuple(nm)]
+                    sA[ti, wi, a] = np.sqrt(full[a])
+            mask[ti, wi] = 1.0
+    return dict(T=T, W=W, P=P, kf=kf, q=q, ai=ai, inv=inv, mp=mp, pA=pA,
+                sA=sA, mask=mask)
 
 
 def _gaussian_amplitudes_jax(cov: jnp.ndarray, mu: jnp.ndarray,
@@ -340,23 +360,27 @@ def _gaussian_amplitudes_jax(cov: jnp.ndarray, mu: jnp.ndarray,
     A = jnp.conj(B).astype(cdt)
     m_vec = jnp.conj(gamma).astype(cdt)
 
-    # ---- base slab (signal index 0): fill the fired box -------------------- #
-    ai, inv, main_pred, predA, sqrtA, P = _base_slab_tables(sub)
+    # ---- base slab (signal index 0): anti-diagonal lax.scan over levels ---- #
+    sched = _base_slab_schedule(sub)
+    P = int(np.prod(sub)) if sub else 1
     R0 = jnp.zeros(P, dtype=cdt).at[0].set(1.0 + 0j)
-    if P > 1:
-        ai_j = jnp.asarray(ai); inv_j = jnp.asarray(inv).astype(cdt)
-        mp_j = jnp.asarray(main_pred)
-        pA_j = jnp.asarray(predA); sA_j = jnp.asarray(sqrtA).astype(cdt)
-        cols = jnp.arange(len(sub)) + 1
+    if sched is not None:
+        cols = jnp.arange(sched["kf"]) + 1            # global A-columns of fired axes
+        q_a = jnp.asarray(sched["q"]); ai_a = jnp.asarray(sched["ai"])
+        inv_a = jnp.asarray(sched["inv"]).astype(cdt); mp_a = jnp.asarray(sched["mp"])
+        pA_a = jnp.asarray(sched["pA"]); sA_a = jnp.asarray(sched["sA"]).astype(cdt)
+        mask_a = jnp.asarray(sched["mask"]).astype(cdt)
 
-        def body(q, R):
-            a_i = ai_j[q]
-            acc = m_vec[a_i] * R[mp_j[q]]
-            row = A[a_i][cols]                       # A[ai, fired-axis globals]
-            acc = acc + jnp.sum(row * sA_j[q] * R[pA_j[q]])
-            return R.at[q].set(acc * inv_j[q])
+        def level(R, x):
+            q_t, ai_t, inv_t, mp_t, pA_t, sA_t, mk_t = x   # each leading dim W
+            main = m_vec[ai_t] * R[mp_t]                    # (W,)
+            Acols = A[ai_t][:, cols]                        # (W, kf)
+            contrib = jnp.sum(Acols * sA_t * R[pA_t], axis=1)
+            vals = (main + contrib) * inv_t
+            R = R.at[q_t].set(jnp.where(mk_t != 0, vals, R[q_t]))
+            return R, None
 
-        R0 = jax.lax.fori_loop(1, P, body, R0)
+        R0, _ = jax.lax.scan(level, R0, (q_a, ai_a, inv_a, mp_a, pA_a, sA_a, mask_a))
 
     box0 = R0.reshape(sub) if sub else R0.reshape(())
 
@@ -511,3 +535,233 @@ def moment_score_one(params: Dict[str, Any], operator: jnp.ndarray,
     info = {"signal_idx": sig, "control_idx": ctrl, "pnr_outcomes": n0,
             "fired_product": fired_product(n0), "cov": eq["cov"], "mu": eq["mu"]}
     return exp, prob_pnr, P_leaf, info
+
+
+# =========================================================================== #
+# Piece 3b/3c: batched, structure-bucketed population scorer producing the same
+# (fitnesses, descriptors, extras) contract as runner._score_batch_shard, so it
+# drops into jax_scoring_fn_batch behind config "scorer"="moment".
+# =========================================================================== #
+from functools import partial as _partial
+
+
+@_lru_cache(maxsize=8)
+def moment_operator(L: int, alpha_str: str, beta_str: str) -> jnp.ndarray:
+    """Cached L x L GKP target operator (jax) for the moment scorer's <O>."""
+    from src.utils.gkp_operator import construct_gkp_operator
+    a = complex(str(alpha_str).replace("i", "j"))
+    b = complex(str(beta_str).replace("i", "j"))
+    return construct_gkp_operator(int(L), a, b, backend="jax")
+
+
+def _struct_fired_product(structure: Structure) -> int:
+    """prod(n+1) over fired control modes, from the discrete structure alone."""
+    active, n_ctrl, pnr = structure
+    p = 1
+    for i in range(8):
+        if not active[i]:
+            continue
+        for c in range(n_ctrl[i]):
+            if int(pnr[i][c]) >= 1:
+                p *= int(pnr[i][c]) + 1
+    return p
+
+
+def _effective_photons(cov: jnp.ndarray, signal_idx: int,
+                       control_idx: Tuple[int, ...], n0: Tuple[int, ...],
+                       eps: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Effective (coupled) photons from the final equivalent-Gaussian cov: each
+    fired mode's detected count weighted by a smooth gate on its covariance
+    coupling to (signal + other controls).  Differentiable; closes the dud-photon
+    exploit at the source (matches rescore's coupling audit)."""
+    N = cov.shape[0] // 2
+    n_eff = jnp.array(0.0)
+    max_eff = jnp.array(0.0)
+    for j, c in enumerate(control_idx):
+        if int(n0[j]) < 1:
+            continue
+        others = [int(signal_idx)] + [c2 for k2, c2 in enumerate(control_idx) if k2 != j]
+        oi = jnp.asarray([i for o in others for i in (int(o), int(o) + N)])
+        rows = cov[jnp.asarray([int(c), int(c) + N])][:, oi]
+        cpl = jnp.sqrt(jnp.sum(rows ** 2))
+        w = cpl ** 2 / (cpl ** 2 + eps ** 2)
+        ne = int(n0[j]) * w
+        n_eff = n_eff + ne
+        max_eff = jnp.maximum(max_eff, ne)
+    return n_eff, max_eff
+
+
+@_partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7))
+def _bucket_score(gs: jnp.ndarray, operator_L: jnp.ndarray, structure: Structure,
+                  genotype_name: str, config_hashable: tuple,
+                  base_cutoff: int, L: int, floats: tuple):
+    """Score one bucket of same-structure genotypes: vmap(value_and_grad(loss)).
+    Returns (fitnesses[nb,4], descriptors[nb,3], gradients[nb,D],
+    raw_exp[nb], joint_prob[nb]).  Mirrors _score_batch_shard's loss/fitness
+    assembly (Tchebycheff), minus the truncation-only penalties (none here)."""
+    gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps = floats
+    cfg = dict(config_hashable)
+    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
+                                   config=cfg)
+    active_modes = jnp.asarray(float(sum(bool(x) for x in structure[0])))
+
+    def loss(g):
+        params = decoder.decode(g, base_cutoff)
+        exp, _prob_pnr, P_leaf, info = moment_score_one(params, operator_L,
+                                                        structure, L)
+        raw_exp = jnp.real(exp)
+        joint_prob = jnp.real(P_leaf)
+        n_eff, max_eff = _effective_photons(info["cov"], info["signal_idx"],
+                                            info["control_idx"],
+                                            info["pnr_outcomes"], coupling_eps)
+        exp_val = jnp.where(joint_prob > 1e-40, raw_exp, 0.0)
+        prob_capped = jnp.minimum(jnp.maximum(joint_prob, 1e-45), 1.0)
+        log_prob = -jnp.log10(prob_capped)
+        log_prob = log_prob + jnp.where(jnp.maximum(joint_prob - 1.0, 0.0) > 1e-4,
+                                        jnp.inf, 0.0)
+        # physics artifact guard: sub-Gaussian <O> with no EFFECTIVE photons
+        is_artifact = jnp.logical_and(exp_val < gaussian_limit, n_eff < 0.5)
+        art = jnp.where(is_artifact, jnp.inf, 0.0)
+        exp_val = exp_val + art
+        log_prob = log_prob + art
+        eps0 = 0.01
+        d_e = w_exp * jnp.abs(exp_val - (gs_eig - eps0))
+        d_p = w_prob * jnp.abs(log_prob - (-eps0))
+        loss_val = jnp.maximum(d_e, d_p) + 0.01 * (d_e + d_p)
+        final_exp = jnp.where(joint_prob > 1e-40, raw_exp, jnp.inf) + art
+        aux = dict(final_exp=final_exp, log_prob=log_prob, max_pnr=max_eff,
+                   photons=n_eff, raw_exp=raw_exp, joint_prob=joint_prob)
+        return jnp.real(loss_val), aux
+
+    (_lv, aux), grad = jax.vmap(jax.value_and_grad(loss, has_aux=True))(gs)
+    ones = jnp.ones_like(aux["log_prob"])
+    fit = jnp.stack([-aux["final_exp"], -aux["log_prob"],
+                     -active_modes * ones, -aux["photons"]], axis=1)
+    desc = jnp.stack([active_modes * ones, aux["max_pnr"], aux["photons"]], axis=1)
+    return fit, desc, grad, aux["raw_exp"], aux["joint_prob"]
+
+
+def moment_score_population(genotypes, operator_L, genotype_name: str,
+                            config_hashable: tuple, base_cutoff: int, L: int,
+                            gs_eig: float, gaussian_limit: float):
+    """Structure-bucketed moment-space scorer. Same return contract as
+    runner._score_batch_shard: (fitnesses[N,4], descriptors[N,3], extras).
+    Over-budget (extreme-Σn) genotypes are scored exactly via the numpy
+    reduced_herald fallback with zero gradient (graceful, kept exact)."""
+    cfg = dict(config_hashable)
+    w_exp = float(cfg.get("alpha_expectation", 1.0))
+    w_prob = float(cfg.get("alpha_probability", 0.0))
+    coupling_eps = float(cfg.get("coupling_eps", 0.05))
+    floats = (float(gs_eig), float(gaussian_limit), w_exp, w_prob, coupling_eps)
+
+    g_np = np.asarray(genotypes)
+    Npop, D = g_np.shape
+    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
+                                   config=cfg)
+    structs = []
+    for i in range(Npop):
+        params = decoder.decode(jnp.asarray(g_np[i]), base_cutoff)
+        structs.append(extract_structure(params))
+
+    fit = np.full((Npop, 4), -np.inf)
+    desc = np.zeros((Npop, 3))
+    grads = np.zeros((Npop, D))
+    rawe = np.zeros(Npop)
+    jprob = np.zeros(Npop)
+
+    buckets: Dict[Structure, list] = {}
+    over = []
+    for i, st in enumerate(structs):
+        if _struct_fired_product(st) > REDUCED_HERALD_PROD_BUDGET:
+            over.append(i)
+        else:
+            buckets.setdefault(st, []).append(i)
+
+    for st, idxs in buckets.items():
+        f, d, gr, re, jp = _bucket_score(
+            jnp.asarray(g_np[idxs]), operator_L, st, genotype_name,
+            config_hashable, int(base_cutoff), int(L), floats)
+        f = np.asarray(f); d = np.asarray(d); gr = np.asarray(gr)
+        re = np.asarray(re); jp = np.asarray(jp)
+        for k, ii in enumerate(idxs):
+            fit[ii] = f[k]; desc[ii] = d[k]; grads[ii] = gr[k]
+            rawe[ii] = re[k]; jprob[ii] = jp[k]
+
+    if over:
+        _score_over_budget_numpy(over, g_np, decoder, cfg, np.asarray(operator_L),
+                                 base_cutoff, L, w_prob, fit, desc, rawe, jprob)
+
+    extras = {
+        "gradients": jnp.asarray(grads),
+        "raw_expectation": jnp.asarray(rawe),
+        "joint_probability": jnp.asarray(jprob),
+        "leakage": jnp.zeros(Npop),
+        "pnr_cost": jnp.asarray(desc[:, 2]),
+        "final_state": jnp.zeros((Npop, base_cutoff), dtype=jnp.complex128),
+    }
+    return jnp.asarray(fit), jnp.asarray(desc), extras
+
+
+def _numpy_leaf_prob_product(params, L):
+    """Exact product of per-leaf herald probs (numpy), the 'leaf' fitness P."""
+    from frontend.independent_verifier import _build_gaussian_moments
+    from frontend.gbs_optimizer import reduced_herald
+    lp = params["leaf_params"]
+    P = 1.0
+    for i in range(8):
+        if not bool(np.asarray(params["leaf_active"])[i]):
+            continue
+        nc = int(np.asarray(lp["n_ctrl"])[i])
+        if nc == 0:
+            continue
+        N = nc + 1
+        r = np.asarray(lp["r"][i], float)[:N]
+        ph = np.asarray(lp["phases"][i], float)[:N * N]
+        dv = np.asarray(lp["disp"][i])[:N]
+        pnr = [int(x) for x in np.asarray(lp["pnr"][i])[:nc]]
+        mu, cov = _build_gaussian_moments(r, ph, dv, N)
+        _, p = reduced_herald(cov, mu, 0, list(range(1, N)), pnr, cutoff=L)
+        P *= float(p)
+    return P
+
+
+def _score_over_budget_numpy(over, g_np, decoder, cfg, O_np, base_cutoff, L,
+                             w_prob, fit, desc, rawe, jprob):
+    """Exact CPU scoring for the rare extreme-Σn tail (zero gradient): keeps
+    these solutions scored correctly so they aren't artificially penalised."""
+    from frontend.gaussian_decomposition import compute_equivalent_gaussian
+    from frontend.gbs_optimizer import reduced_herald
+    eps = float(cfg.get("coupling_eps", 0.05))
+    for i in over:
+        try:
+            params = decoder.decode(jnp.asarray(g_np[i]), base_cutoff)
+            pnp = {k: (np.asarray(v) if hasattr(v, "shape") else v)
+                   for k, v in params.items()}
+            eq = compute_equivalent_gaussian(pnp, light=True)
+            cov = np.asarray(eq["cov"], float); mu = np.asarray(eq["mu"], float)
+            Nm = cov.shape[0] // 2
+            ctrl = [int(x) for x in eq["control_idx"]]; sig = int(eq["signal_idx"])
+            n0 = [int(x) for x in eq["pnr_outcomes"]]
+            psi, _ = reduced_herald(cov, mu, sig, ctrl, n0, cutoff=L)
+            if not np.isfinite(psi).all() or np.linalg.norm(psi) < 0.5:
+                continue
+            Le = len(psi)
+            exp = float(np.real(np.vdot(psi, O_np[:Le, :Le] @ psi)))
+            # effective photons (coupling audit)
+            n_eff = 0.0; max_eff = 0.0
+            for j, c in enumerate(ctrl):
+                if n0[j] < 1:
+                    continue
+                others = [sig] + [c2 for k2, c2 in enumerate(ctrl) if k2 != j]
+                oi = [m for o in others for m in (o, o + Nm)]
+                cpl = float(np.linalg.norm(cov[np.ix_([c, c + Nm], oi)]))
+                w = cpl ** 2 / (cpl ** 2 + eps ** 2)
+                n_eff += n0[j] * w; max_eff = max(max_eff, n0[j] * w)
+            P_leaf = _numpy_leaf_prob_product(params, L)
+            active = float(sum(bool(x) for x in np.asarray(params["leaf_active"])))
+            log_prob = -np.log10(min(max(P_leaf, 1e-45), 1.0))
+            fit[i] = [-exp, -log_prob, -active, -n_eff]
+            desc[i] = [active, max_eff, n_eff]
+            rawe[i] = exp; jprob[i] = P_leaf
+        except Exception:
+            continue

@@ -1444,6 +1444,7 @@ def run(
                 sweep_interval = 250
                 if (
                     correction_cutoff is not None
+                    and (genotype_config or {}).get("scorer") != "moment"
                     and completed % sweep_interval == 0
                     and completed > 0
                 ):
@@ -1694,7 +1695,9 @@ def run(
                 # --- Mid-Run Fidelity Validation (Single Mode) ---
                 # Every 250 iterations, validate genotypes and replace artifacts
                 sweep_interval = 250
-                if correction_cutoff is not None and (i + 1) % sweep_interval == 0:
+                if (correction_cutoff is not None
+                        and (genotype_config or {}).get("scorer") != "moment"
+                        and (i + 1) % sweep_interval == 0):
                     try:
                         from src.utils.archive_validator import batch_validate_genotypes
 
@@ -1827,8 +1830,12 @@ def run(
     h_fronts = locals().get("history_fronts", None)
 
     # --- Final Archive Validation (Option F) ---
-    # Validate all archive solutions at dual cutoffs to remove numerical artifacts
-    if correction_cutoff is not None and cutoff is not None:
+    # Validate all archive solutions at dual cutoffs to remove numerical artifacts.
+    # Skipped for the moment scorer: it is exact (no truncation), so the dual-
+    # cutoff sweep is redundant -- and it relies on the Fock final_state which the
+    # moment path does not produce.
+    if (correction_cutoff is not None and cutoff is not None
+            and (genotype_config or {}).get("scorer") != "moment"):
         try:
             from src.utils.archive_validator import final_archive_validation
 
@@ -1927,6 +1934,15 @@ def main():
         "--window", type=float, default=0.1, help="Homodyne window width"
     )
     parser.add_argument("--pnr-max", type=int, default=3, help="Max PNR outcome")
+    parser.add_argument(
+        "--scorer", choices=["fock", "moment"], default="fock",
+        help="Scoring backend: 'fock' (truncated breeding sim) or 'moment' "
+             "(exact moment-space scorer, truncation-free).",
+    )
+    parser.add_argument(
+        "--moment-cutoff", type=int, default=100,
+        help="Final single-mode Fock cutoff L for the moment scorer's <O>.",
+    )
     parser.add_argument(
         "--modes",
         type=int,
@@ -2093,6 +2109,12 @@ def main():
         "modes": args.modes,
         "alpha_expectation": args.alpha_expectation,
         "alpha_probability": args.alpha_probability,
+        # Moment-space scorer (exact, truncation-free); target (alpha,beta) are
+        # needed here so the scorer can build its L-cutoff <O> operator.
+        "scorer": args.scorer,
+        "moment_cutoff": args.moment_cutoff,
+        "target_alpha": args.target_alpha,
+        "target_beta": args.target_beta,
     }
 
     # Profiling context

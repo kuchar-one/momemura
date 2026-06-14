@@ -148,25 +148,33 @@ compare fronts/throughput/VRAM to Fock, confirm the periodic sweep removes ~0.
   `P_leaf` match the numpy rescore to ~1e-12; structure is static (jit/vmap/
   bucket-ready). Forward value test in the suite (fast); gradient test gated
   behind `MOMENT_SLOW=1`.
-- **Perf finding (the task-3 BLOCKER, resolve before wiring/benchmark)**: the
-  base-slab fill is O(∏(n_j+1)) SEQUENTIAL (`lax.fori_loop`). Forward is fine for
-  the common case (∏ median ~70), but **reverse-mode AD through the fori_loop is
-  expensive** and recompiles per structure — a single genotype's `jax.grad`
-  compiled in ~tens of s on CPU, and larger-∏ structures blow up. Since the
-  gradient emitters need `value_and_grad` over the whole population every
-  iteration, this must be fixed first. Fix, in order:
-    1. **Vectorise the base slab by anti-diagonal** — fill layers of constant
-       Σ-photons: O(Σn ≤ ~45) sequential *layers*, each vectorised (gather/
-       scatter within the layer). Turns the AD-hostile O(∏) loop into an
-       O(Σn) `lax.scan`, matching the already-vectorised signal axis. This is the
-       main item.
-    2. If still hot, a `custom_vjp` for the recurrence (analytic adjoint), and/or
-       forward-mode (`jacfwd`) for the small genome.
-    3. `REDUCED_HERALD_PROD_BUDGET` (16384) keeps the extreme-Σn tail (kf=6
-       ∏≈3.2M) out of the in-loop path → exact CPU fallback.
-  Only after this does 3b (structure-bucketed batched `value_and_grad`) + 3c
-  (wire into `_score_batch_shard` behind `--scorer`) + the cluster A/B (task 5)
-  make sense.
+- **AD blocker RESOLVED (2026-06-14)**: the base slab was an O(∏(n_j+1))
+  `lax.fori_loop` — forward fine, but reverse-mode AD compiled in tens of s and
+  blew up for larger ∏. Replaced with **anti-diagonal `lax.scan`**: fill the
+  fired box in T=Σn layers of constant total photons, each layer's <=W entries
+  filled in parallel (`_base_slab_schedule`, cached per static `sub`). Now
+  bit-exact (dpsi ~1e-16–1e-13) and `jax.grad` compiles in ~1–8 s, runs <1 s,
+  even at kf=3 / ∏≈3500 / Σn≈43 (which previously hung). Suite: 13 passed incl.
+  the gradient test (`MOMENT_SLOW=1`). `REDUCED_HERALD_PROD_BUDGET` (16384) still
+  routes the extreme-Σn tail to the exact CPU fallback.
+- **3b + 3c DONE + validated (2026-06-14)**: `moment_score_population` —
+  structure-bucketed `vmap(value_and_grad(moment_score_one))` (one compile per
+  fired/active signature, cached), exact CPU `reduced_herald` fallback (zero grad)
+  for the over-budget Σn tail, scatter back to population order. Same
+  (fitnesses[N,4], descriptors[N,3], extras{gradients,...}) contract as
+  `_score_batch_shard`. Native effective-photon descriptor from the final cov
+  (closes the dud exploit); physics artifact guard kept; truncation-only
+  penalties dropped. Wired into `jax_scoring_fn_batch` behind config
+  `scorer="moment"`; CLI `--scorer moment|fock` + `--moment-cutoff` in run_mome;
+  L-cutoff `<O>` operator cached (`moment_operator`).
+  Local validation: moment vs Fock <O> agree to ~1e-4 on well-behaved genotypes,
+  log-prob agree, gradients finite; wired `jax_scoring_fn_batch(scorer=moment)`
+  returns correct shapes & finite grads.
+- **Acceptance gate**: `scripts/consistency_moment_vs_fock.py` (cluster) — moment
+  vs Fock through the real wired path, PASS if median |Δ<O>| on well-behaved
+  (<8 dB) solutions < tol and all moment grads finite. After it passes, full runs
+  with `--scorer moment` are valid (do a short smoke run first; then task 5
+  benchmark / retire the dual-cutoff sweep).
 
 ## 7. Risks
 - Moment path is exact only for **point** homodyne (window=0). 00B uses window=0;
