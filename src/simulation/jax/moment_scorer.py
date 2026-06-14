@@ -274,6 +274,142 @@ def jax_equivalent_gaussian(params: Dict[str, Any],
 
 
 # =========================================================================== #
+# OPTION 2 -- single-compile STATIC equivalent-Gaussian.
+#
+# Everything is fixed-shape (8 leaves x 3 modes = 24; tree = 7 nodes), so the
+# Python loops below UNROLL into ONE XLA graph -- no per-structure recompile.
+# The discrete genotype info (leaf_active, n_ctrl, pnr) flows as TRACED jnp
+# values used only inside jnp.where masks:
+#   * inactive leaf / unused control mode -> vacuum & decoupled (mask squeezing,
+#     displacement, and the Clements BS gates that touch the padding modes);
+#   * tree routing -> masked BS angle per node: identity when one child subtree
+#     is dead, a clean swap (theta=pi/2, phi=0) when only the RIGHT child is
+#     live (so the surviving signal always lands in the fixed A slot, matching
+#     the dynamic "propagate the active child, measure the other" logic).
+# Output: fixed 17-mode (1 signal + 16 control-slot) cov/mu + effective control
+# pnr (unused slots forced to 0 -> conditioned away trivially in piece B).
+# =========================================================================== #
+_LEAF_X = [(3 * i, 3 * i + 1, 3 * i + 2) for i in range(8)]   # x-mode indices/leaf
+# tree nodes: (A_mode, B_mode, left_leaves, right_leaves), mix_params index = order
+_TREE = [
+    (0, 3, (0,), (1,)), (6, 9, (2,), (3,)), (12, 15, (4,), (5,)), (18, 21, (6,), (7,)),
+    (0, 6, (0, 1), (2, 3)), (12, 18, (4, 5), (6, 7)),
+    (0, 12, (0, 1, 2, 3), (4, 5, 6, 7)),
+]
+# kept modes after the tree: signal(0) + the 16 control slots, in leaf order
+_KEEP = [0] + [3 * i + 1 for i in range(8)] + [3 * i + 2 for i in range(8)]
+# reorder _KEEP so controls are (leaf0 c0, leaf0 c1, leaf1 c0, ...) = same order
+# as the per-structure scanner appends them
+_KEEP = [0] + [m for i in range(8) for m in (3 * i + 1, 3 * i + 2)]
+
+
+def _leaf_moments_masked(r: jnp.ndarray, ph: jnp.ndarray, dv: jnp.ndarray,
+                         n_real: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """3-mode leaf moments with modes >= n_real masked to vacuum & decoupled.
+    n_real (traced scalar) = active ? n_ctrl+1 : 0.  Bit-equivalent to building
+    at the true mode count: the Clements gates touching padding modes are zeroed
+    (theta->0 => identity BS) so those modes stay decoupled vacuum."""
+    idx = jnp.arange(3)
+    live = idx < n_real
+    rm = jnp.where(live, r[:3], 0.0)
+    dvm = jnp.where(live, dv[:3], 0.0 + 0j)
+    # The decoder builds the leaf interferometer with the N-mode Clements
+    # (phases[:N^2]); the gate layout differs per N, so reproduce each N exactly
+    # and embed in 3 modes, then select by n_real (=active ? n_ctrl+1 : 0).
+    def _embed(Uk, k):
+        return jnp.eye(3, dtype=jnp.complex128).at[:k, :k].set(Uk)
+    U1 = _embed(jax_clements_unitary(ph[:1], 1), 1)
+    U2 = _embed(jax_clements_unitary(ph[:4], 2), 2)
+    U3 = jax_clements_unitary(ph[:9], 3)
+    U = jnp.where(n_real < 1.5, U1, jnp.where(n_real < 2.5, U2, U3))
+    S_sq = jnp.diag(jnp.concatenate([jnp.exp(-rm), jnp.exp(rm)]))
+    S = passive_unitary_to_symplectic(U) @ S_sq
+    mu = complex_alpha_to_qp(dvm, HBAR)
+    cov = S @ vacuum_covariance(3, HBAR) @ S.T
+    return mu, cov
+
+
+def _measure_homodyne_fixed(V, mu, b, N, x):
+    """Point-homodyne on mode ``b`` (x-quadrature) keeping fixed 2N shape: Schur
+    update on all modes, then retire b to decoupled vacuum.  Returns (V,mu,dens)."""
+    B11 = V[b, b]
+    c = V[:, b]
+    Vn = V - jnp.outer(c, c) / B11
+    mun = mu + (x - mu[b]) / B11 * c
+    dens = jnp.exp(-0.5 * (x - mu[b]) ** 2 / B11) / jnp.sqrt(2.0 * jnp.pi * B11)
+    for q in (b, b + N):
+        Vn = Vn.at[q, :].set(0.0).at[:, q].set(0.0).at[q, q].set(1.0)
+        mun = mun.at[q].set(0.0)
+    return Vn, mun, dens
+
+
+def jax_equivalent_gaussian_static(params: Dict[str, Any]
+                                   ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Single-compile, fully-masked JAX equivalent-Gaussian.  All structure is
+    traced (no static args) => one XLA graph for any genotype.
+
+    Returns (cov17[34,34], mu17[34], eff_pnr[16], densities[7]):
+      signal = mode 0; control slots 1..16 in leaf order (leaf0 c0, leaf0 c1, ...);
+      eff_pnr[s] = pnr of that control slot, or 0 if the slot is unused/inactive
+      (so piece B conditions it away as decoupled vacuum)."""
+    lp = params["leaf_params"]
+    active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)   # (8,)
+    n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)           # (8,)
+    r = jnp.asarray(lp["r"]); ph = jnp.asarray(lp["phases"]); dv = jnp.asarray(lp["disp"])
+    pnr = jnp.asarray(lp["pnr"])                                     # (8, >=2)
+
+    N = 24
+    Vg = jnp.eye(2 * N)              # vacuum (hbar=2 => cov = I)
+    mug = jnp.zeros(2 * N)
+    for i in range(8):
+        n_real = jnp.where(active[i] > 0.5, n_ctrl[i] + 1.0, 0.0)
+        mu_l, cov_l = _leaf_moments_masked(r[i], ph[i], dv[i], n_real)
+        xs = _LEAF_X[i]
+        idxs = jnp.asarray([xs[0], xs[1], xs[2],
+                            xs[0] + N, xs[1] + N, xs[2] + N])
+        Vg = Vg.at[jnp.ix_(idxs, idxs)].set(cov_l)
+        mug = mug.at[idxs].set(mu_l)
+
+    # homodyne broadcast to 7 nodes
+    hx_raw = params.get("homodyne_x", 0.0)
+    hx_arr = jnp.atleast_1d(jnp.asarray(hx_raw, dtype=jnp.float64))
+    hx = hx_arr if hx_arr.shape[0] >= 7 else jnp.broadcast_to(hx_arr[:1], (7,))
+
+    densities = []
+    for node, (A, B, Lk, Rk) in enumerate(_TREE):
+        La = jnp.max(jnp.stack([active[l] for l in Lk]))
+        Ra = jnp.max(jnp.stack([active[l] for l in Rk]))
+        both = (La > 0.5) & (Ra > 0.5)
+        only_right = (Ra > 0.5) & (La <= 0.5)
+        th0 = params["mix_params"][node][0]; ph0 = params["mix_params"][node][1]
+        theta = jnp.where(both, th0, jnp.where(only_right, jnp.pi / 2.0, 0.0))
+        phi = jnp.where(both, ph0, 0.0)
+        S = _bs_symplectic(theta, phi, N, A, B)
+        Vg = S @ Vg @ S.T
+        mug = S @ mug
+        Vg, mug, dens = _measure_homodyne_fixed(Vg, mug, B, N, hx[node])
+        densities.append(dens)
+
+    fg = params.get("final_gauss", None)
+    if fg:
+        Vg, mug = _apply_final_gaussian(Vg, mug, fg, 0, N)
+
+    keep = jnp.asarray(_KEEP)
+    idxs = jnp.concatenate([keep, keep + N])
+    cov17 = Vg[jnp.ix_(idxs, idxs)]
+    mu17 = mug[idxs]
+
+    # effective control pnr per slot (leaf order): real iff active & c < n_ctrl
+    eff = []
+    for i in range(8):
+        for c in range(2):
+            real = (active[i] > 0.5) & (c < n_ctrl[i])
+            eff.append(jnp.where(real, pnr[i, c].astype(jnp.float64), 0.0))
+    eff_pnr = jnp.stack(eff)          # (16,)
+    return cov17, mu17, eff_pnr, jnp.stack(densities)
+
+
+# =========================================================================== #
 # Piece 2b: jax_reduced_herald -- analytic vacuum conditioning + multidim
 # Hermite recurrence.  Bit-exact JAX mirror of gbs_optimizer.reduced_herald /
 # _gaussian_amplitudes (SAME convention, not just up-to-conjugation).

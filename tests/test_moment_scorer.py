@@ -21,6 +21,7 @@ from frontend.gbs_optimizer import reduced_herald
 from src.simulation.jax.moment_scorer import (
     jax_equivalent_gaussian, jax_reduced_herald, fired_product,
     REDUCED_HERALD_PROD_BUDGET, moment_score_one, extract_structure,
+    jax_equivalent_gaussian_static,
 )
 
 CFG = dict(genotype="00B", depth=3, modes=3, pnr_max=15,
@@ -84,6 +85,44 @@ def test_equivalent_gaussian_is_differentiable():
     h = 1e-5
     fd = (float(scalar(g0.at[i].add(h))) - float(scalar(g0.at[i].add(-h)))) / (2 * h)
     assert abs(grad[i] - fd) / (abs(fd) + 1e-12) < 1e-5
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_static_equivalent_gaussian_matches_per_structure(seed):
+    """The single-compile static equivalent-Gaussian (fixed 24-mode masked) ==
+    the per-structure version on the real (signal + active-control) submodes,
+    bit-exact, INCLUDING inactive-leaf routing. This is the Option-2 piece A
+    correctness gate."""
+    def submat(cov, order, Nfull):
+        idx = np.array(list(order) + [o + Nfull for o in order])
+        return cov[np.ix_(idx, idx)]
+
+    dec, gens = _random_genotypes(20, seed=seed)
+    n_checked = 0
+    for g in gens:
+        params = dec.decode(jnp.asarray(g), CUTOFF)
+        st = extract_structure(params)
+        active, nctrl, _pnr = st
+        if sum(active) == 0:
+            continue
+        eq = jax_equivalent_gaussian(params, st)
+        cov_ps = np.asarray(eq["cov"]); mu_ps = np.asarray(eq["mu"])
+        Nps = cov_ps.shape[0] // 2
+        order_ps = [eq["signal_idx"]] + list(eq["control_idx"])
+        cs, ms, ep, _dn = jax_equivalent_gaussian_static(params)
+        cov_st = np.asarray(cs); mu_st = np.asarray(ms)
+        real = [1 + 2 * i + c for i in range(8) for c in range(2)
+                if active[i] and c < nctrl[i]]
+        order_st = [0] + real
+        A = submat(cov_ps, order_ps, Nps)
+        B = submat(cov_st, order_st, 17)
+        assert A.shape == B.shape
+        assert np.allclose(A, B, atol=1e-7), f"cov Δ={np.max(np.abs(A - B)):.2e}"
+        mps = np.array([mu_ps[o] for o in order_ps] + [mu_ps[o + Nps] for o in order_ps])
+        mst = np.array([mu_st[o] for o in order_st] + [mu_st[o + 17] for o in order_st])
+        assert np.allclose(mps, mst, atol=1e-7)
+        n_checked += 1
+    assert n_checked > 0
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
