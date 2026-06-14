@@ -595,6 +595,176 @@ def fired_product(n: Tuple[int, ...]) -> int:
     return p
 
 
+# =========================================================================== #
+# OPTION 2 piece B: single-compile reduced_herald.
+#   * vacuum-condition the non-fired controls (fixed Schur on a fixed mode set
+#     after a fired-first reorder);
+#   * Hermite box over (signal + MAXF fired slots) in a FIXED flat buffer whose
+#     mixed-radix strides / predecessor indices are computed at RUNTIME from the
+#     pnr-derived radii -> data-dependent INDEXING, not shapes => one XLA graph.
+#   * fired-box base slab filled by a LEVEL-scan (<=T_MAX fixed steps), signal
+#     axis by a separate lax.scan over L.  Both keep AD memory ~O(steps*B_F).
+# Genotypes with kf>MAXF or prod(n_j+1)>B_F route to the exact CPU fallback.
+# =========================================================================== #
+MOMENT_MAXF = 8                 # max fired control modes handled in-graph
+MOMENT_BF = 1 << 12             # fired-box flat buffer (prod(n_j+1) budget) = 4096
+_T_MAX = MOMENT_MAXF * 15       # max total fired photons (pnr_max=15)
+
+
+def _flat_amplitudes(cov, mu, radii, L, MAXF=MOMENT_MAXF, BF=MOMENT_BF):
+    """Signal amplitudes psi[L] at the detection slice (each fired axis j at
+    k_j = radii[j]-1), for a pure (1+MAXF)-mode Gaussian.  ``radii`` (MAXF,)
+    traced ints (n_j+1, =1 for unused slots).  Fixed flat buffer BF.
+    Same convention as _gaussian_amplitudes_jax (bit-exact)."""
+    T_max = MAXF * 15
+    M = 1 + MAXF
+    cdt = jnp.complex128
+    beta = _c2r(mu, HBAR)
+    B = _Amat(cov, HBAR)[:M, :M]
+    alpha = beta[:M]
+    gamma = jnp.conj(alpha) - B @ alpha
+    pref = jnp.exp(jnp.conj(-0.5 * (jnp.sum(jnp.abs(alpha) ** 2) - alpha @ B @ alpha)))
+    denom = jnp.sqrt(jnp.sqrt(jnp.real(jnp.linalg.det(_Qmat(cov, HBAR)))))
+    A = jnp.conj(B).astype(cdt)
+    m_vec = jnp.conj(gamma).astype(cdt)
+
+    r = radii.astype(jnp.int32)                       # (MAXF,)
+    # C-order strides over the MAXF fired axes (stride[j] = prod_{k>j} r[k])
+    rev = jnp.concatenate([jnp.ones((1,), jnp.int32), jnp.cumprod(r[::-1])[:-1]])
+    stride = rev[::-1]                                # (MAXF,)
+    prodf = stride[0] * r[0]
+    det_flat = jnp.sum((r - 1) * stride)
+
+    q = jnp.arange(BF)
+    kjq = (q[None, :] // stride[:, None]) % r[:, None]    # (MAXF, BF) k_j(q)
+    valid = q < prodf
+    level = jnp.sum(kjq, axis=0)                          # (BF,)
+    pos = kjq > 0                                         # (MAXF, BF)
+    i_q = jnp.argmax(pos, axis=0)                         # first nonzero axis
+    stride_i = stride[i_q]                               # (BF,)
+    full = q - stride_i                                   # main predecessor (BF,)
+    ki = jnp.take_along_axis(kjq, i_q[None, :], 0)[0]     # k_i(q)
+    inv = jnp.where(ki > 0, 1.0 / jnp.sqrt(jnp.maximum(ki, 1)), 0.0).astype(cdt)
+    ai = i_q + 1                                          # mode index of axis i
+    mvec_ai = m_vec[ai]                                   # (BF,)
+    fullc = jnp.clip(full, 0, BF - 1)
+
+    # ---- base slab (signal index 0): level-scan ---------------------------- #
+    R0 = jnp.zeros(BF, dtype=cdt).at[0].set(1.0 + 0j)
+
+    def base_step(R, t):
+        term = mvec_ai * R[fullc]
+        for a in range(MAXF):
+            full_a = kjq[a] - (i_q == a).astype(jnp.int32)     # (full)[a]
+            preda = jnp.clip(full - stride[a], 0, BF - 1)
+            coef = A[ai, a + 1] * jnp.sqrt(jnp.maximum(full_a, 0).astype(cdt))
+            term = term + jnp.where(full_a > 0, coef * R[preda], 0.0 + 0j)
+        val = term * inv
+        commit = (level == t) & valid
+        return jnp.where(commit, val, R), None
+
+    R0, _ = jax.lax.scan(base_step, R0, jnp.arange(1, T_max + 1))
+
+    # ---- signal axis: lax.scan over L (vectorised over fired buffer) -------- #
+    sqrt_k = [jnp.sqrt(kjq[j].astype(cdt)) for j in range(MAXF)]
+    predj = [jnp.clip(q - stride[j], 0, BF - 1) for j in range(MAXF)]
+
+    def sig_step(carry, m):
+        R1, R2 = carry
+        slab = m_vec[0] * R1
+        slab = slab + jnp.where(m >= 2, A[0, 0] * jnp.sqrt(jnp.maximum(m - 1, 0.0)), 0.0) * R2
+        for j in range(MAXF):
+            slab = slab + A[0, j + 1] * jnp.where(kjq[j] > 0, sqrt_k[j] * R1[predj[j]], 0.0 + 0j)
+        slab = slab / jnp.sqrt(m.astype(jnp.float64))
+        return (slab, R1), slab[det_flat]
+
+    if L > 1:
+        (_, _), outs = jax.lax.scan(sig_step, (R0, jnp.zeros_like(R0)),
+                                    jnp.arange(1, L))
+        psi = jnp.concatenate([R0[det_flat][None], outs])
+    else:
+        psi = R0[det_flat][None]
+    return psi * pref / denom
+
+
+def _vac_condition_one(V, mu, b, do, N=17):
+    """Vacuum-project (herald |0>) control mode ``b`` if ``do``, keeping the fixed
+    2N shape and decoupling b to vacuum.  Returns (V, mu, prob_factor).  A vacuum
+    projection is Gaussian (Schur complement, measurement cov = I, hbar=2)."""
+    bi = jnp.asarray([b, b + N])
+    Vbb = V[jnp.ix_(bi, bi)]
+    Mm = Vbb + jnp.eye(2)
+    Minv = jnp.linalg.inv(Mm)
+    Vob = V[:, bi]                                   # (2N, 2)
+    Vn = V - Vob @ Minv @ Vob.T
+    mun = mu - Vob @ Minv @ mu[bi]
+    pf = 2.0 / jnp.sqrt(jnp.linalg.det(Mm)) * jnp.exp(-0.5 * mu[bi] @ Minv @ mu[bi])
+    # decouple b -> vacuum
+    Vn = Vn.at[bi, :].set(0.0).at[:, bi].set(0.0).at[b, b].set(1.0).at[b + N, b + N].set(1.0)
+    mun = mun.at[bi].set(0.0)
+    V2 = jnp.where(do, Vn, V)
+    mu2 = jnp.where(do, mun, mu)
+    pfac = jnp.where(do, pf, 1.0)
+    return V2, mu2, pfac
+
+
+def _herald_static(cov, mu, eff, ncontrol, Nmodes, MAXF, BF, L):
+    """Generic single-compile herald: vacuum-condition eff==0 controls (masked
+    Schur), then Hermite box over (signal + <=MAXF fired) in a flat buffer BF.
+    cov/mu over Nmodes=1+ncontrol modes; eff (ncontrol,).  Returns (psi[L], prob)."""
+    V = cov; m = mu
+    p_vac = jnp.array(1.0)
+    for b in range(1, ncontrol + 1):
+        do = eff[b - 1] < 0.5
+        V, m, pf = _vac_condition_one(V, m, b, do, N=Nmodes)
+        p_vac = p_vac * pf
+    fired = (eff >= 1).astype(jnp.int32)
+    order = jnp.argsort(1 - fired)                        # fired controls first
+    perm = jnp.concatenate([jnp.zeros((1,), jnp.int32), 1 + order.astype(jnp.int32)])
+    keepc = perm[: 1 + MAXF]
+    kk = jnp.concatenate([keepc, keepc + Nmodes])
+    cov_k = V[jnp.ix_(kk, kk)]
+    mu_k = m[kk]
+    radii = eff[order][:MAXF].astype(jnp.int32) + 1
+    psi_raw = _flat_amplitudes(cov_k, mu_k, radii, L, MAXF, BF)
+    p_fock = jnp.sum(jnp.abs(psi_raw) ** 2)
+    prob = p_vac * p_fock
+    psi = jnp.where(p_fock > 0, psi_raw / jnp.sqrt(jnp.maximum(p_fock, 1e-300)), psi_raw)
+    return psi, prob
+
+
+def jax_reduced_herald_static(cov17, mu17, eff_pnr, L):
+    """Single-compile heralded signal state + prob from the static
+    equivalent-Gaussian outputs (cov17[34,34], mu17[34], eff_pnr[16])."""
+    return _herald_static(cov17, mu17, eff_pnr, 16, 17, MOMENT_MAXF, MOMENT_BF, L)
+
+
+_LEAF_MAXF = 2
+_LEAF_BF = (15 + 1) ** 2          # 256: leaf has <=2 controls, each <=pnr_max
+
+
+def _leaf_prob_product_static(params, L):
+    """Product of exact per-leaf herald probs (fitness 'leaf' P), single-compile.
+    A leaf with no real controls (n_ctrl=0 or inactive) contributes 1."""
+    lp = params["leaf_params"]
+    active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)
+    n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)
+    r = jnp.asarray(lp["r"]); ph = jnp.asarray(lp["phases"]); dv = jnp.asarray(lp["disp"])
+    pnr = jnp.asarray(lp["pnr"])
+    P = jnp.array(1.0)
+    for i in range(8):
+        n_real = jnp.where(active[i] > 0.5, n_ctrl[i] + 1.0, 0.0)
+        mu_l, cov_l = _leaf_moments_masked(r[i], ph[i], dv[i], n_real)
+        eff2 = jnp.stack([
+            jnp.where((active[i] > 0.5) & (0 < n_ctrl[i]), pnr[i, 0].astype(jnp.float64), 0.0),
+            jnp.where((active[i] > 0.5) & (1 < n_ctrl[i]), pnr[i, 1].astype(jnp.float64), 0.0),
+        ])
+        _, p = _herald_static(cov_l, mu_l, eff2, 2, 3, _LEAF_MAXF, _LEAF_BF, L)
+        real_ctrl = jnp.where((active[i] > 0.5), jnp.minimum(n_ctrl[i], 2.0), 0.0)
+        P = P * jnp.where(real_ctrl < 0.5, 1.0, p)
+    return P
+
+
 def jax_reduced_herald(cov: jnp.ndarray, mu: jnp.ndarray, signal_idx: int,
                        control_idx: Tuple[int, ...], n: Tuple[int, ...],
                        cutoff: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -842,6 +1012,114 @@ def moment_score_population(genotypes, operator_L, genotype_name: str,
             fit[i] = [-f_exp, -f_lp, 0.0, 0.0]
             desc[i] = [0.0, 0.0, 0.0]
             rawe[i] = O00; jprob[i] = 1.0
+
+    extras = {
+        "gradients": jnp.asarray(grads),
+        "raw_expectation": jnp.asarray(rawe),
+        "joint_probability": jnp.asarray(jprob),
+        "leakage": jnp.zeros(Npop),
+        "pnr_cost": jnp.asarray(desc[:, 2]),
+        "final_state": jnp.zeros((Npop, base_cutoff), dtype=jnp.complex128),
+    }
+    return jnp.asarray(fit), jnp.asarray(desc), extras
+
+
+def _effective_photons_static(cov17, eff_pnr, eps):
+    """Effective (coupled) photons from the final 17-mode equivalent cov: each
+    fired control's detected count weighted by a smooth gate on its coupling to
+    (signal + other controls).  Differentiable; fixed shape."""
+    N = 17
+    n_eff = jnp.array(0.0); max_eff = jnp.array(0.0)
+    for c in range(1, 17):
+        others = [0] + [c2 for c2 in range(1, 17) if c2 != c]
+        oi = jnp.asarray([i for o in others for i in (o, o + N)])
+        rows = cov17[jnp.asarray([c, c + N])][:, oi]
+        cpl = jnp.sqrt(jnp.sum(rows ** 2))
+        w = cpl ** 2 / (cpl ** 2 + eps ** 2)
+        ne = jnp.where(eff_pnr[c - 1] >= 1, eff_pnr[c - 1] * w, 0.0)
+        n_eff = n_eff + ne; max_eff = jnp.maximum(max_eff, ne)
+    return n_eff, max_eff
+
+
+@_partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
+def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
+                          base_cutoff, L, floats):
+    """ONE-compile vmap'd moment scorer over a population (no per-structure
+    recompile).  Returns (fitnesses[N,4], descriptors[N,3], gradients[N,D],
+    raw_exp[N], joint_prob[N])."""
+    gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps = floats
+    cfg = dict(config_hashable)
+    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
+                                   config=cfg)
+
+    def loss(g):
+        params = decoder.decode(g, base_cutoff)
+        cov17, mu17, eff_pnr, _dens = jax_equivalent_gaussian_static(params)
+        psi, _prob_pnr = jax_reduced_herald_static(cov17, mu17, eff_pnr, L)
+        Lp = psi.shape[0]
+        raw_exp = jnp.real(jnp.vdot(psi, operator_L[:Lp, :Lp] @ psi))
+        P_leaf = _leaf_prob_product_static(params, L)
+        joint_prob = jnp.real(P_leaf)
+        n_eff, max_eff = _effective_photons_static(cov17, eff_pnr, coupling_eps)
+        active_modes = jnp.sum(jnp.asarray(params["leaf_active"]).astype(jnp.float64))
+        exp_val = jnp.where(joint_prob > 1e-40, raw_exp, 0.0)
+        prob_capped = jnp.minimum(jnp.maximum(joint_prob, 1e-45), 1.0)
+        log_prob = -jnp.log10(prob_capped)
+        log_prob = log_prob + jnp.where(jnp.maximum(joint_prob - 1.0, 0.0) > 1e-4, jnp.inf, 0.0)
+        is_artifact = jnp.logical_and(exp_val < gaussian_limit, n_eff < 0.5)
+        art = jnp.where(is_artifact, jnp.inf, 0.0)
+        exp_val = exp_val + art; log_prob = log_prob + art
+        eps0 = 0.01
+        d_e = w_exp * jnp.abs(exp_val - (gs_eig - eps0))
+        d_p = w_prob * jnp.abs(log_prob - (-eps0))
+        loss_val = jnp.maximum(d_e, d_p) + 0.01 * (d_e + d_p)
+        final_exp = jnp.where(joint_prob > 1e-40, raw_exp, jnp.inf) + art
+        aux = dict(final_exp=final_exp, log_prob=log_prob, active=active_modes,
+                   max_pnr=max_eff, photons=n_eff, raw_exp=raw_exp, joint_prob=joint_prob)
+        return jnp.real(loss_val), aux
+
+    (_lv, aux), grad = jax.vmap(jax.value_and_grad(loss, has_aux=True))(genotypes)
+    ones = jnp.ones_like(aux["log_prob"])
+    fit = jnp.stack([-aux["final_exp"], -aux["log_prob"],
+                     -aux["active"], -aux["photons"]], axis=1)
+    desc = jnp.stack([aux["active"], aux["max_pnr"], aux["photons"]], axis=1)
+    return fit, desc, grad, aux["raw_exp"], aux["joint_prob"]
+
+
+def moment_score_population_static(genotypes, operator_L, genotype_name,
+                                   config_hashable, base_cutoff, L,
+                                   gs_eig, gaussian_limit):
+    """Option-2 scorer: ONE XLA compile, single vmap over the whole population.
+    Over-budget genotypes (kf>MAXF or prod(n_j+1)>BF -- the rare extreme-Sigma-n
+    tail) are exact-rescored on CPU with zero gradient."""
+    cfg = dict(config_hashable)
+    w_exp = float(cfg.get("alpha_expectation", 1.0))
+    w_prob = float(cfg.get("alpha_probability", 0.0))
+    coupling_eps = float(cfg.get("coupling_eps", 0.05))
+    floats = (float(gs_eig), float(gaussian_limit), w_exp, w_prob, coupling_eps)
+    g_np = np.asarray(genotypes)
+    Npop, D = g_np.shape
+    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
+                                   config=cfg)
+
+    # eager over-budget detection (kf>MAXF or prod>BF)
+    over = []
+    for i in range(Npop):
+        st = extract_structure(decoder.decode(jnp.asarray(g_np[i]), base_cutoff))
+        kf = sum(1 for leaf in st[2] for p in leaf if p >= 1)
+        if kf > MOMENT_MAXF or _struct_fired_product(st) > MOMENT_BF:
+            over.append(i)
+
+    f, d, gr, re, jp = _score_pop_static_jit(
+        jnp.asarray(g_np), operator_L, genotype_name, config_hashable,
+        int(base_cutoff), int(L), floats)
+    fit = np.asarray(f); desc = np.asarray(d); grads = np.asarray(gr)
+    rawe = np.asarray(re); jprob = np.asarray(jp)
+
+    if over:
+        _score_over_budget_numpy(over, g_np, decoder, cfg, np.asarray(operator_L),
+                                 base_cutoff, L, w_prob, fit, desc, rawe, jprob)
+        grads[over] = 0.0
 
     extras = {
         "gradients": jnp.asarray(grads),

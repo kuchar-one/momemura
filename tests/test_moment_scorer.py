@@ -21,7 +21,13 @@ from frontend.gbs_optimizer import reduced_herald
 from src.simulation.jax.moment_scorer import (
     jax_equivalent_gaussian, jax_reduced_herald, fired_product,
     REDUCED_HERALD_PROD_BUDGET, moment_score_one, extract_structure,
-    jax_equivalent_gaussian_static,
+    jax_equivalent_gaussian_static, jax_reduced_herald_static,
+    MOMENT_MAXF, MOMENT_BF,
+)
+from frontend.gbs_optimizer import reduced_herald as _np_reduced_herald
+from src.simulation.jax.herald import (
+    passive_unitary_to_symplectic as _p2s, vacuum_covariance as _vac,
+    complex_alpha_to_qp as _a2qp,
 )
 
 CFG = dict(genotype="00B", depth=3, modes=3, pnr_max=15,
@@ -123,6 +129,39 @@ def test_static_equivalent_gaussian_matches_per_structure(seed):
         assert np.allclose(mps, mst, atol=1e-7)
         n_checked += 1
     assert n_checked > 0
+
+
+@pytest.mark.parametrize("M,nj", [(6, [2, 1, 1, 1, 1]), (8, [1, 1, 1, 1, 1, 1, 1]),
+                                  (5, [3, 2, 1, 1]), (8, [2, 1, 1, 1, 1, 1, 1]),
+                                  (2, [4]), (1, [])])
+def test_reduced_herald_static_matches_numpy(M, nj):
+    """Option-2 piece B: the single-compile flat-buffer reduced_herald (runtime
+    radii) == numpy reduced_herald, bit-exact, across fired-mode counts incl. the
+    high-kf regime (random pure Gaussian states)."""
+    L = 50
+    rng = np.random.default_rng(M * 7 + sum(nj) + len(nj))
+    r = rng.uniform(0.1, 0.8, M)
+    X = rng.standard_normal((M, M)) + 1j * rng.standard_normal((M, M))
+    U, _ = np.linalg.qr(X)
+    S = np.asarray(_p2s(jnp.asarray(U))) @ np.diag(np.concatenate([np.exp(-r), np.exp(r)]))
+    cov = S @ np.asarray(_vac(M, 2.0)) @ S.T
+    mu = np.asarray(_a2qp(jnp.asarray(rng.uniform(-.3, .3, M) + 1j * rng.uniform(-.3, .3, M)), 2.0))
+    if fired_product(tuple(nj)) > MOMENT_BF or len(nj) > MOMENT_MAXF:
+        pytest.skip("over budget")
+    psi_np, p_np = _np_reduced_herald(cov, mu, 0, list(range(1, M)), nj, cutoff=L)
+    # embed into the static 17-mode layout (signal 0, controls 1..M-1)
+    C = np.eye(34); m = np.zeros(34)
+    idx = list(range(M)) + [17 + i for i in range(M)]
+    C[np.ix_(idx, idx)] = cov; m[np.array(idx)] = mu
+    eff = np.zeros(16)
+    for j, n in enumerate(nj):
+        eff[j] = n
+    psi_st, p_st = jax_reduced_herald_static(jnp.asarray(C), jnp.asarray(m), jnp.asarray(eff), L)
+    psi_st = np.asarray(psi_st)
+    mm = min(len(psi_np), len(psi_st))
+    assert np.allclose(psi_np[:mm], psi_st[:mm], atol=1e-7), \
+        f"psi Δ={np.max(np.abs(psi_np[:mm] - psi_st[:mm])):.2e}"
+    assert abs(p_np - float(p_st)) <= 1e-7 * (abs(p_np) + 1e-12)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])

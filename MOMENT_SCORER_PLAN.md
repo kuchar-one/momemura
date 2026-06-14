@@ -176,6 +176,35 @@ compare fronts/throughput/VRAM to Fock, confirm the periodic sweep removes ~0.
   with `--scorer moment` are valid (do a short smoke run first; then task 5
   benchmark / retire the dual-cutoff sweep).
 
+## 6c. Option 2 -- single-compile static scorer (2026-06-14)
+
+The structure-bucketed scorer recompiled per genotype (~60 distinct structures /
+64-genotype population) -> XLA compile storm, fatal for QDax. Replaced with a
+ONE-compile, fully-masked, fixed-shape scorer:
+
+- **Piece A** `jax_equivalent_gaussian_static`: fixed 8x3=24-mode layout; inactive
+  leaves / variable n_ctrl via masked Clements gates (build N=1/2/3 Clements and
+  select by n_real); tree routing via masked BS angles (identity when one child
+  dead, theta=pi/2 swap when only the right child is live). Fixed loop counts ->
+  unrolls into one graph. **Bit-exact vs per-structure (dcov 0, dmu 1e-14)** incl.
+  inactive-leaf routing.
+- **Piece B** `jax_reduced_herald_static` / `_flat_amplitudes`: vacuum-condition
+  eff==0 controls (masked sequential Schur), then Hermite box over (signal + <=MAXF
+  fired) in a FIXED flat buffer `MOMENT_BF`, with mixed-radix strides / predecessor
+  indices computed at RUNTIME from the pnr-derived radii. Base slab = level-scan
+  (<=T_MAX steps); signal axis = lax.scan over L. **Bit-exact vs numpy
+  reduced_herald (psi 1e-12) for kf=0..7**, incl. high-kf synthetic states.
+- `_leaf_prob_product_static` reuses `_herald_static` at MAXF=2/BF=256 per leaf.
+  Full forward chain (exp + P_leaf) == numpy rescore to 1e-16 / 1e-12.
+- `moment_score_population_static`: single `vmap(value_and_grad)` over the whole
+  population (ONE compile, no bucketing); over-budget tail (kf>MAXF or
+  prod(n_j+1)>BF) -> exact CPU fallback (zero grad). Wired into
+  `jax_scoring_fn_batch` behind `scorer="moment"`.
+- Knobs: `MOMENT_MAXF=8`, `MOMENT_BF=4096` (raise to cover more of the ∏ tail if
+  VRAM allows). Tests in `tests/test_moment_scorer.py` (static equiv + static
+  reduced_herald, self-contained). The jit+vmap+grad COMPILE is only verifiable on
+  the cluster (CPU sandbox window too small) -- that's the smoke run.
+
 ## 7. Risks
 - Moment path is exact only for **point** homodyne (window=0). 00B uses window=0;
   guard against finite-window configs (would need mixed-state hybrid — out of

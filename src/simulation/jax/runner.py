@@ -851,13 +851,13 @@ def jax_scoring_fn_batch(
         dict(genotype_config) if genotype_config else {})
     if cfg_d.get("scorer") == "moment":
         from src.simulation.jax.moment_scorer import (
-            moment_score_population, moment_operator)
+            moment_score_population_static, moment_operator)
         L = int(cfg_d.get("moment_cutoff", 100))
         opL = moment_operator(L, cfg_d.get("target_alpha"), cfg_d.get("target_beta"))
         config_hashable = tuple(sorted(cfg_d.items()))
-        return moment_score_population(genotypes, opL, genotype_name,
-                                       config_hashable, int(cutoff), L,
-                                       float(gs_eig), float(gaussian_limit))
+        return moment_score_population_static(genotypes, opL, genotype_name,
+                                              config_hashable, int(cutoff), L,
+                                              float(gs_eig), float(gaussian_limit))
 
     n_devices = jax.local_device_count()
 
