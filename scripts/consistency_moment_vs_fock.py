@@ -25,7 +25,9 @@ sys.path.insert(0, REPO)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=os.path.join(REPO, "experiments"))
+    ap.add_argument("--root", default=None,
+                    help="experiments root (auto-detects experiments/ or "
+                         "output/experiments/ if omitted)")
     ap.add_argument("--group", default="00B_c30_a1p00_b1p00")
     ap.add_argument("--n", type=int, default=60, help="max genotypes to score")
     ap.add_argument("--moment-cutoff", type=int, default=100)
@@ -42,7 +44,20 @@ def main():
     from frontend.gaussian_decomposition import compute_equivalent_gaussian
     from src.utils.gkp_operator import construct_gkp_operator
 
-    cfgf = sorted(glob.glob(os.path.join(args.root, args.group, "*", "config.json")))[0]
+    # resolve experiments root (cluster uses output/experiments/, sandbox uses experiments/)
+    roots = ([args.root] if args.root else
+             [os.path.join(REPO, "experiments"),
+              os.path.join(REPO, "output", "experiments"), "experiments",
+              "output/experiments"])
+    cfgs = []
+    for r in roots:
+        cfgs = sorted(glob.glob(os.path.join(r, args.group, "*", "config.json")))
+        if cfgs:
+            break
+    if not cfgs:
+        raise SystemExit(f"no runs found for group '{args.group}' under {roots}")
+    cfgf = cfgs[0]
+    print(f"using {cfgf}")
     cfg = json.load(open(cfgf))
     rep = pr.load_repertoire(cfgf.replace("config.json", "results.pkl"))
     fit = np.asarray(rep.fitnesses, float).reshape(-1, np.asarray(rep.fitnesses).shape[-1])
