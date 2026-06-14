@@ -144,15 +144,29 @@ compare fronts/throughput/VRAM to Fock, confirm the periodic sweep removes ~0.
 - **2b DONE + validated**: `jax_reduced_herald` == numpy `reduced_herald`
   BIT-exact (psi + prob, ~1e-16–1e-11) across fired counts kf=0–3; general-rank
   so kf≥4 use the identical path.
-- **Perf finding (key for task 3/5)**: the base-slab fill is O(∏(n_j+1))
-  SEQUENTIAL (`lax.fori_loop`). Cheap for the common case (∏ median ~70) but
-  O(7700) at p90 in the hard group and millions in the Σn extreme tail (kf=6
-  ∏≈3.2M timed out). Mitigations, in order: (i) `REDUCED_HERALD_PROD_BUDGET`
-  (16384) routes the extreme tail to the exact CPU fallback; (ii) **if the
-  cluster benchmark shows the in-loop base slab is hot, vectorise it by
-  anti-diagonal** (fill layers of constant Σ photons: O(Σn≤~45) sequential
-  layers, each vectorised — turns ∏ into Σn). Signal axis is already a
-  vectorised `lax.scan`, so only the base slab needs this.
+- **3a DONE + validated**: `moment_score_one` (per-genotype kernel) — `<O>` and
+  `P_leaf` match the numpy rescore to ~1e-12; structure is static (jit/vmap/
+  bucket-ready). Forward value test in the suite (fast); gradient test gated
+  behind `MOMENT_SLOW=1`.
+- **Perf finding (the task-3 BLOCKER, resolve before wiring/benchmark)**: the
+  base-slab fill is O(∏(n_j+1)) SEQUENTIAL (`lax.fori_loop`). Forward is fine for
+  the common case (∏ median ~70), but **reverse-mode AD through the fori_loop is
+  expensive** and recompiles per structure — a single genotype's `jax.grad`
+  compiled in ~tens of s on CPU, and larger-∏ structures blow up. Since the
+  gradient emitters need `value_and_grad` over the whole population every
+  iteration, this must be fixed first. Fix, in order:
+    1. **Vectorise the base slab by anti-diagonal** — fill layers of constant
+       Σ-photons: O(Σn ≤ ~45) sequential *layers*, each vectorised (gather/
+       scatter within the layer). Turns the AD-hostile O(∏) loop into an
+       O(Σn) `lax.scan`, matching the already-vectorised signal axis. This is the
+       main item.
+    2. If still hot, a `custom_vjp` for the recurrence (analytic adjoint), and/or
+       forward-mode (`jacfwd`) for the small genome.
+    3. `REDUCED_HERALD_PROD_BUDGET` (16384) keeps the extreme-Σn tail (kf=6
+       ∏≈3.2M) out of the in-loop path → exact CPU fallback.
+  Only after this does 3b (structure-bucketed batched `value_and_grad`) + 3c
+  (wire into `_score_batch_shard` behind `--scorer`) + the cluster A/B (task 5)
+  make sense.
 
 ## 7. Risks
 - Moment path is exact only for **point** homodyne (window=0). 00B uses window=0;

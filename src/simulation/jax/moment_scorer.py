@@ -134,7 +134,27 @@ def _global_assemble(blocks: List[Tuple[int, jnp.ndarray]],
     return mu, V
 
 
-def jax_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
+Structure = Tuple[Tuple[bool, ...], Tuple[int, ...], Tuple[Tuple[int, ...], ...]]
+
+
+def extract_structure(params: Dict[str, Any]) -> Structure:
+    """Read the discrete structure (leaf_active, n_ctrl, per-leaf pnr) concretely
+    from decoded params.  Hashable => usable as a static jit argument and as a
+    bucket key.  Call EAGERLY (outside jit); pass the result back in as
+    ``structure=`` so the heavy path can be jitted/vmapped over continuous params.
+    """
+    lp = params["leaf_params"]
+    active = tuple(bool(np.asarray(params["leaf_active"])[i]) for i in range(8))
+    n_ctrl = tuple(int(np.asarray(lp["n_ctrl"])[i]) for i in range(8))
+    pnr = tuple(
+        tuple(int(x) for x in np.asarray(lp["pnr"][i])[: n_ctrl[i]])
+        for i in range(8)
+    )
+    return active, n_ctrl, pnr
+
+
+def jax_equivalent_gaussian(params: Dict[str, Any],
+                            structure: Structure = None) -> Dict[str, Any]:
     """Differentiable JAX mirror of
     ``frontend.gaussian_decomposition.compute_equivalent_gaussian(light=True)``.
 
@@ -142,13 +162,17 @@ def jax_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
     (1 signal + all active-leaf control modes, post point-homodyne) plus the
     signal/control bookkeeping and per-node homodyne densities.
 
-    The discrete structure (leaf_active, n_ctrl, pnr) is read concretely; the
-    continuous params are traced => gradients flow to r/phases/disp/theta/phi/
-    homodyne_x/final_gauss.
+    ``structure`` (leaf_active, n_ctrl, pnr) is STATIC -- read concretely from
+    ``params`` when None (eager use), or supplied by the caller so this traces
+    to a static graph over the continuous params (r/phases/disp/theta/phi/
+    homodyne_x/final_gauss), which carry exact gradients.
     """
     lp = params["leaf_params"]
-    leaf_active = [bool(np.asarray(params["leaf_active"])[i]) for i in range(8)]
-    n_ctrl = [int(np.asarray(lp["n_ctrl"])[i]) for i in range(8)]
+    if structure is None:
+        structure = extract_structure(params)
+    active_t, n_ctrl_t, pnr_t = structure
+    leaf_active = [bool(x) for x in active_t]
+    n_ctrl = [int(x) for x in n_ctrl_t]
 
     # --- per-leaf moments + mode bookkeeping (mirror numpy assembly) --------- #
     blocks_V: List[Tuple[int, jnp.ndarray]] = []
@@ -163,7 +187,7 @@ def jax_equivalent_gaussian(params: Dict[str, Any]) -> Dict[str, Any]:
         mu_leaf, V_leaf = _leaf_moments(lp["r"][i], lp["phases"][i], lp["disp"][i], N_leaf)
         blocks_V.append((N_leaf, V_leaf))
         blocks_mu.append((N_leaf, mu_leaf))
-        pnr_i = [int(x) for x in np.asarray(lp["pnr"][i])[: n_ctrl[i]]]
+        pnr_i = [int(x) for x in pnr_t[i]][: n_ctrl[i]]
         modes.append({"type": "signal", "leaf": i})
         for c in range(n_ctrl[i]):
             modes.append({"type": "control", "leaf": i, "pnr_val": pnr_i[c]})
@@ -431,3 +455,59 @@ def jax_reduced_herald(cov: jnp.ndarray, mu: jnp.ndarray, signal_idx: int,
     prob = p_vac * p_fock
     psi = jnp.where(p_fock > 0, v / jnp.sqrt(jnp.maximum(p_fock, 1e-300)), v)
     return psi, prob
+
+
+# =========================================================================== #
+# Piece 3a: differentiable per-genotype scoring kernel.
+#   exp = <O> on the exact heralded state; P_leaf = product of exact per-leaf
+#   herald probs (the optimizer's truncation-free 'leaf' probability).
+# Structure is STATIC => this traces to one graph per fired/active signature,
+# vmappable within a bucket and value_and_grad-able for the gradient emitters.
+# =========================================================================== #
+def _leaf_herald_prob(lp: Dict[str, Any], i: int, n_ctrl_i: int,
+                      pnr_i: Tuple[int, ...], cutoff: int) -> jnp.ndarray:
+    """Exact moment-space herald probability of one leaf (signal=0, controls
+    1..n_ctrl)."""
+    if n_ctrl_i == 0:
+        return jnp.array(1.0)
+    N = n_ctrl_i + 1
+    mu, cov = _leaf_moments(lp["r"][i], lp["phases"][i], lp["disp"][i], N)
+    _, p = jax_reduced_herald(cov, mu, 0, tuple(range(1, N)),
+                              tuple(int(x) for x in pnr_i[:n_ctrl_i]), cutoff)
+    return p
+
+
+def moment_score_one(params: Dict[str, Any], operator: jnp.ndarray,
+                     structure: Structure, cutoff: int
+                     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
+    """Score one genotype's decoded ``params`` in moment space.
+
+    Returns (exp, prob_pnr, P_leaf, info):
+      exp      = <O> on the exact heralded signal state (real)
+      prob_pnr = exact PNR herald probability on the equivalent generator
+      P_leaf   = product of exact per-leaf herald probs (fitness 'leaf' P)
+      info     = {signal_idx, control_idx, pnr_outcomes, fired_product, cov, mu}
+
+    ``operator`` is the L x L target operator (L = ``cutoff`` here, the FINAL
+    single-mode Fock cutoff -- large & cheap, e.g. 100). Differentiable in the
+    continuous params; ``structure`` is static.
+    """
+    eq = jax_equivalent_gaussian(params, structure)
+    sig = eq["signal_idx"]
+    ctrl = tuple(int(c) for c in eq["control_idx"])
+    n0 = tuple(int(x) for x in eq["pnr_outcomes"])
+    psi, prob_pnr = jax_reduced_herald(eq["cov"], eq["mu"], sig, ctrl, n0, cutoff)
+    Lp = psi.shape[0]
+    Oe = operator[:Lp, :Lp]
+    exp = jnp.real(jnp.vdot(psi, Oe @ psi))
+
+    active, n_ctrl_t, pnr_t = structure
+    P_leaf = jnp.array(1.0)
+    lp = params["leaf_params"]
+    for i in range(8):
+        if active[i] and n_ctrl_t[i] > 0:
+            P_leaf = P_leaf * _leaf_herald_prob(lp, i, n_ctrl_t[i], pnr_t[i], cutoff)
+
+    info = {"signal_idx": sig, "control_idx": ctrl, "pnr_outcomes": n0,
+            "fired_product": fired_product(n0), "cov": eq["cov"], "mu": eq["mu"]}
+    return exp, prob_pnr, P_leaf, info

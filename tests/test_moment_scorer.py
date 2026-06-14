@@ -20,7 +20,7 @@ from frontend.gaussian_decomposition import compute_equivalent_gaussian
 from frontend.gbs_optimizer import reduced_herald
 from src.simulation.jax.moment_scorer import (
     jax_equivalent_gaussian, jax_reduced_herald, fired_product,
-    REDUCED_HERALD_PROD_BUDGET,
+    REDUCED_HERALD_PROD_BUDGET, moment_score_one, extract_structure,
 )
 
 CFG = dict(genotype="00B", depth=3, modes=3, pnr_max=15,
@@ -119,3 +119,64 @@ def test_reduced_herald_matches_numpy(seed):
         n_checked += 1
         kf_seen.add(sum(1 for x in n0 if x >= 1))
     assert n_checked > 0, "no in-budget genotypes were checked"
+
+
+def test_moment_score_one_matches_numpy_exp():
+    """The per-genotype scoring kernel: <O> and P_leaf match a direct numpy
+    (reduced_herald + O) computation. Synthetic Hermitian O (number operator)
+    -> no qutip dependency. Restricted to small fired-product genotypes."""
+    L = 40
+    O = np.diag(np.arange(L, dtype=float))      # Hermitian
+    Oj = jnp.asarray(O)
+    dec, gens = _random_genotypes(60, seed=11)
+    checked = 0
+    for g in gens:
+        params = dec.decode(jnp.asarray(g), CUTOFF)
+        pnp = {k: (np.asarray(v) if hasattr(v, "shape") else v)
+               for k, v in params.items()}
+        eq = compute_equivalent_gaussian(pnp, light=True)
+        n0 = tuple(int(x) for x in eq["pnr_outcomes"])
+        if fired_product(n0) > 16:
+            continue
+        struct = extract_structure(params)
+        psi_np, _ = reduced_herald(np.asarray(eq["cov"], float),
+                                   np.asarray(eq["mu"], float),
+                                   int(eq["signal_idx"]), list(eq["control_idx"]),
+                                   list(n0), cutoff=L)
+        m = min(L, len(psi_np))
+        exp_np = float(np.real(np.vdot(psi_np[:m], O[:m, :m] @ psi_np[:m])))
+        e, _, _, _ = moment_score_one(params, Oj, struct, L)
+        assert abs(float(e) - exp_np) < 1e-6, f"exp Δ={abs(float(e) - exp_np):.2e}"
+        checked += 1
+        if checked >= 3:
+            break
+    assert checked > 0, "no small-fired genotype found to check"
+
+
+@pytest.mark.skipif(not os.environ.get("MOMENT_SLOW"),
+                    reason="slow AD test; set MOMENT_SLOW=1 to run")
+def test_moment_score_one_is_differentiable():
+    """d<O>/dgenotype is finite & nonzero through the moment kernel. Slow:
+    reverse-mode AD through the recurrence fori_loop is the known task-3 perf
+    item (see MOMENT_SCORER_PLAN.md 6b). Run with: MOMENT_SLOW=1 pytest ..."""
+    L = 40
+    Oj = jnp.asarray(np.diag(np.arange(L, dtype=float)))
+    dec, gens = _random_genotypes(60, seed=11)
+    for g in gens:
+        params = dec.decode(jnp.asarray(g), CUTOFF)
+        pnp = {k: (np.asarray(v) if hasattr(v, "shape") else v)
+               for k, v in params.items()}
+        eq = compute_equivalent_gaussian(pnp, light=True)
+        n0 = tuple(int(x) for x in eq["pnr_outcomes"])
+        if fired_product(n0) > 4:
+            continue
+        struct = extract_structure(params)
+
+        def loss(gg):
+            e, _, _, _ = moment_score_one(dec.decode(gg, CUTOFF), Oj, struct, L)
+            return e
+
+        grad = np.asarray(jax.grad(loss)(jnp.asarray(g, np.float64)))
+        assert np.all(np.isfinite(grad)) and np.sum(np.abs(grad) > 1e-9) > 0
+        return
+    pytest.skip("no small-fired genotype found")
