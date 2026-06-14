@@ -246,9 +246,9 @@ def jax_equivalent_gaussian(params: Dict[str, Any],
 
     # --- final Gaussian on the root signal ----------------------------------- #
     fg = params.get("final_gauss", None)
-    if fg:
-        root_leaf = [s for s in active_signals if s is not None][0]
-        root_idx = signal_index(root_leaf)
+    roots = [s for s in active_signals if s is not None]
+    if fg and roots:
+        root_idx = signal_index(roots[0])
         V_g, mu_g = _apply_final_gaussian(V_g, mu_g, fg, root_idx, N_cur)
 
     # --- signal / control bookkeeping ---------------------------------------- #
@@ -671,8 +671,11 @@ def moment_score_population(genotypes, operator_L, genotype_name: str,
 
     buckets: Dict[Structure, list] = {}
     over = []
+    vac = []
     for i, st in enumerate(structs):
-        if _struct_fired_product(st) > REDUCED_HERALD_PROD_BUDGET:
+        if sum(bool(x) for x in st[0]) == 0:
+            vac.append(i)            # no active leaves (e.g. injected vacuum seed)
+        elif _struct_fired_product(st) > REDUCED_HERALD_PROD_BUDGET:
             over.append(i)
         else:
             buckets.setdefault(st, []).append(i)
@@ -690,6 +693,19 @@ def moment_score_population(genotypes, operator_L, genotype_name: str,
     if over:
         _score_over_budget_numpy(over, g_np, decoder, cfg, np.asarray(operator_L),
                                  base_cutoff, L, w_prob, fit, desc, rawe, jprob)
+
+    if vac:
+        # All-vacuum genotype: single-mode vacuum signal, no photons. <O>=O[0,0],
+        # P=1. Subject to the same physics artifact guard (a no-photon state below
+        # the Gaussian limit is penalised, exactly as in the Fock path). grad = 0.
+        O00 = float(np.real(np.asarray(operator_L)[0, 0]))
+        artifact = O00 < gaussian_limit
+        f_exp = np.inf if artifact else O00
+        f_lp = np.inf if artifact else 0.0
+        for i in vac:
+            fit[i] = [-f_exp, -f_lp, 0.0, 0.0]
+            desc[i] = [0.0, 0.0, 0.0]
+            rawe[i] = O00; jprob[i] = 1.0
 
     extras = {
         "gradients": jnp.asarray(grads),

@@ -17,6 +17,13 @@ Usage:
 
 import os
 import sys
+
+# The moment-space scorer (--scorer moment) requires 64-bit precision. The
+# watchdog spawns run_mome.py as a fresh subprocess whose env may not carry
+# JAX_ENABLE_X64, so enforce it here BEFORE jax is imported anywhere.
+if "moment" in sys.argv:
+    os.environ["JAX_ENABLE_X64"] = "1"
+
 import time
 import argparse
 import numpy as np
