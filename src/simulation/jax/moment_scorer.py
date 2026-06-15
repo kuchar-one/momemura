@@ -1051,6 +1051,12 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
     gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps = floats
     cfg = dict(config_hashable)
     BF = int(cfg.get("moment_bf", MOMENT_BF))           # fired-box buffer (perf knob)
+    # heralded-state norm tolerance: a state with too much mass beyond L has an
+    # UNRELIABLE renormalised <O>, so gradient descent can exploit the L-cutoff
+    # truncation (the moment-scorer analogue of the Fock artifact).  Require the
+    # signal state to be essentially complete within L (default 99%).  If too
+    # many states are rejected at a low L, RAISE --moment-cutoff.
+    norm_tol = float(cfg.get("moment_norm_tol", 0.99))
     # 'fast' search mode: skip the exact per-leaf probability (8 sub-heralds) when
     # probability isn't being optimised (w_prob~0) -> big speedup; periodic exact
     # re-validation recovers the true probability.  Default on when w_prob==0.
@@ -1134,6 +1140,59 @@ def moment_score_population_static(genotypes, operator_L, genotype_name,
         "final_state": jnp.zeros((Npop, base_cutoff), dtype=jnp.complex128),
     }
     return f, d, extras
+
+
+@_partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
+def _revalidate_jit(genotypes, op_lo, op_hi, genotype_name, config_hashable,
+                    base_cutoff, L_lo, L_hi):
+    """For each genotype: (<O>_searchL, <O>_highL, herald_norm_searchL).  One
+    compile per (L_lo, L_hi)."""
+    cfg = dict(config_hashable)
+    BF_lo = int(cfg.get("moment_bf", MOMENT_BF))
+    BF_hi = int(cfg.get("moment_bf_high", 8192))
+    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
+                                   config=cfg)
+
+    def one(g):
+        p = decoder.decode(g, base_cutoff)
+        cs, ms, ep, _ = jax_equivalent_gaussian_static(p)
+        plo, _ = jax_reduced_herald_static(cs, ms, ep, L_lo, BF_lo)
+        phi, _ = jax_reduced_herald_static(cs, ms, ep, L_hi, BF_hi)
+        elo = jnp.real(jnp.vdot(plo, op_lo[:plo.shape[0], :plo.shape[0]] @ plo))
+        ehi = jnp.real(jnp.vdot(phi, op_hi[:phi.shape[0], :phi.shape[0]] @ phi))
+        return elo, ehi, jnp.sum(jnp.abs(plo) ** 2)
+
+    return jax.vmap(one)(genotypes)
+
+
+def clean_archive_moment(repertoire, genotype_name, config_hashable, base_cutoff,
+                         L_lo, L_hi, tol=0.02, norm_tol=0.99, chunk=32):
+    """Periodic dual-L sweep: re-score the archive at high L, refresh fitness[0]
+    to the exact high-L <O>, and DROP any cell whose search-L <O> disagrees by
+    >tol (or whose search-L herald wasn't normalised) -- i.e. an L-truncation
+    artifact.  Returns (cleaned_repertoire, num_removed)."""
+    cfg = dict(config_hashable)
+    a, b = cfg.get("target_alpha"), cfg.get("target_beta")
+    op_lo = moment_operator(int(L_lo), a, b)
+    op_hi = moment_operator(int(L_hi), a, b)
+    fit = np.asarray(repertoire.fitnesses)
+    shp = fit.shape
+    fitf = fit.reshape(-1, shp[-1])
+    gen = np.asarray(repertoire.genotypes).reshape(fitf.shape[0], -1)
+    valid = np.where(np.isfinite(fitf[:, 0]) & (fitf[:, 0] > -1e9))[0]
+    n_removed = 0
+    for s in range(0, len(valid), chunk):
+        idx = valid[s:s + chunk]
+        elo, ehi, nlo = _revalidate_jit(
+            jnp.asarray(gen[idx].astype(np.float64)), op_lo, op_hi,
+            genotype_name, config_hashable, int(base_cutoff), int(L_lo), int(L_hi))
+        elo = np.asarray(elo); ehi = np.asarray(ehi); nlo = np.asarray(nlo)
+        art = (np.abs(ehi - elo) > tol) | (nlo < norm_tol)
+        fitf[idx, 0] = -ehi                       # refresh to exact high-L <O>
+        fitf[idx[art], 0] = -np.inf               # drop the artifacts
+        n_removed += int(art.sum())
+    new = repertoire.replace(fitnesses=jnp.asarray(fitf.reshape(shp)))
+    return new, n_removed
 
 
 def _numpy_leaf_prob_product(params, L):

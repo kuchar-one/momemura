@@ -1450,9 +1450,33 @@ def run(
                 # --- Periodic Archive Sweep (Option D) ---
                 # Validate archive every 250 generations to remove numerical artifacts
                 sweep_interval = 250
+                _is_moment = (genotype_config or {}).get("scorer") == "moment"
+                _mom_every = int((genotype_config or {}).get("moment_validate_every", 250))
                 if (
+                    _is_moment
+                    and completed % _mom_every == 0
+                    and completed > 0
+                ):
+                    # Dual-L moment sweep: re-score at high L, drop L-truncation
+                    # artifacts (the cheap search-L <O> can be biased by the
+                    # operator's high-Fock tail even when the state looks complete).
+                    try:
+                        from src.simulation.jax.moment_scorer import clean_archive_moment
+                        L_lo = int(genotype_config.get("moment_cutoff", 100))
+                        L_hi = int(genotype_config.get("moment_l_high", max(2 * L_lo, 120)))
+                        tol = float(genotype_config.get("moment_validate_tol", 0.02))
+                        ch = tuple(sorted(genotype_config.items()))
+                        print(f"\n=== Moment Validation Sweep (gen {completed}, "
+                              f"L {L_lo}->{L_hi}) ===")
+                        repertoire, num_removed = clean_archive_moment(
+                            repertoire, genotype, ch, cutoff, L_lo, L_hi, tol=tol)
+                        print(f"Removed {num_removed} L-truncation artifacts "
+                              f"(archive refreshed to exact L={L_hi} <O>).\n")
+                    except Exception as e:
+                        print(f"Moment validation sweep failed (non-fatal): {e}")
+                elif (
                     correction_cutoff is not None
-                    and (genotype_config or {}).get("scorer") != "moment"
+                    and not _is_moment
                     and completed % sweep_interval == 0
                     and completed > 0
                 ):
@@ -1962,6 +1986,19 @@ def main():
              "via a periodic exact re-validation). Big speedup for exp-focused runs.",
     )
     parser.add_argument(
+        "--moment-l-high", type=int, default=0,
+        help="High validation cutoff for the periodic dual-L moment sweep "
+             "(0 = auto: max(2*moment_cutoff, 120)). Catches L-truncation artifacts.",
+    )
+    parser.add_argument(
+        "--moment-validate-every", type=int, default=250,
+        help="Run the dual-L moment validation sweep every N QDax generations.",
+    )
+    parser.add_argument(
+        "--moment-validate-tol", type=float, default=0.02,
+        help="Drop an archive cell if |<O>_searchL - <O>_highL| exceeds this.",
+    )
+    parser.add_argument(
         "--modes",
         type=int,
         default=2,
@@ -2133,6 +2170,10 @@ def main():
         "moment_cutoff": args.moment_cutoff,
         "moment_bf": args.moment_bf,
         "moment_fast": args.moment_fast,
+        "moment_l_high": (args.moment_l_high if args.moment_l_high > 0
+                          else max(2 * args.moment_cutoff, 120)),
+        "moment_validate_every": args.moment_validate_every,
+        "moment_validate_tol": args.moment_validate_tol,
         "target_alpha": args.target_alpha,
         "target_beta": args.target_beta,
     }
