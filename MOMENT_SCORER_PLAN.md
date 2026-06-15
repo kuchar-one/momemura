@@ -205,6 +205,34 @@ ONE-compile, fully-masked, fixed-shape scorer:
   reduced_herald, self-contained). The jit+vmap+grad COMPILE is only verifiable on
   the cluster (CPU sandbox window too small) -- that's the smoke run.
 
+## 6d. Performance knobs + exact re-validation (2026-06-15)
+
+The single-compile scorer is correct but f64 + the level/signal scans are heavy
+(~18 GB, ~2.9 s/iter at L=100, BF=4096). Knobs to trade speed vs coverage/accuracy:
+- `--moment-bf` (default 4096): fired-box flat buffer. Memory ∝ BF. 1024 ⇒ ~4×
+  less VRAM (kills the 18 GB rematerialization), drops more high-Σn genotypes.
+- `--moment-cutoff` (L, default 100): final signal Fock cutoff. 50 halves the
+  signal scan; mildly truncates high-squeezing signal states (caught by the gate
+  + re-validation).
+- `--moment-fast`: skip the exact per-leaf probability (8 sub-heralds) — big
+  speedup. Auto-on when `alpha_probability==0`. Sets prob objective flat, so use
+  only for exp-focused search (recover true prob via re-validation), NOT for a
+  Pareto/probability experiment.
+
+Workflow (fast search + exact validation):
+1. Search fast: `... --scorer moment --moment-cutoff 50 --moment-bf 1024 [--moment-fast]`.
+2. Re-validate the archive exactly:
+   `JAX_ENABLE_X64=1 python scripts/validate_moment_archive.py --group <g> \
+       --l-search 50 --l-high 120 --write`
+   Re-scores every point at high L/BF, flags low-L artifacts (|Δ<O>|>tol or
+   low-L herald norm<0.99), prints the best EXACT <O>, and (`--write`) emits an
+   exact-rescored repertoire. This is the moment dual-cutoff sweep, both ends
+   exact.
+
+VRAM cycling during QDax = `XLA_PYTHON_CLIENT_PREALLOCATE=false` + chunked
+MAP-Elites (scan→Python→scan), not reinitialisation. Each watchdog restart
+recompiles (~5 min) — inherent to the watchdog.
+
 ## 7. Risks
 - Moment path is exact only for **point** homodyne (window=0). 00B uses window=0;
   guard against finite-window configs (would need mixed-state hybrid — out of

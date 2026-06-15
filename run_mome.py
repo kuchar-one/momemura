@@ -1952,6 +1952,16 @@ def main():
         help="Final single-mode Fock cutoff L for the moment scorer's <O>.",
     )
     parser.add_argument(
+        "--moment-bf", type=int, default=4096,
+        help="Moment scorer fired-box flat buffer (prod(n_j+1) budget); lower = "
+             "faster/less VRAM, drops more high-photon genotypes.",
+    )
+    parser.add_argument(
+        "--moment-fast", action="store_true",
+        help="Fast moment search: skip the exact per-leaf probability (recover it "
+             "via a periodic exact re-validation). Big speedup for exp-focused runs.",
+    )
+    parser.add_argument(
         "--modes",
         type=int,
         default=2,
@@ -2121,6 +2131,8 @@ def main():
         # needed here so the scorer can build its L-cutoff <O> operator.
         "scorer": args.scorer,
         "moment_cutoff": args.moment_cutoff,
+        "moment_bf": args.moment_bf,
+        "moment_fast": args.moment_fast,
         "target_alpha": args.target_alpha,
         "target_beta": args.target_beta,
     }

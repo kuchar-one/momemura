@@ -733,10 +733,11 @@ def _herald_static(cov, mu, eff, ncontrol, Nmodes, MAXF, BF, L):
     return psi, prob
 
 
-def jax_reduced_herald_static(cov17, mu17, eff_pnr, L):
+def jax_reduced_herald_static(cov17, mu17, eff_pnr, L, BF=MOMENT_BF):
     """Single-compile heralded signal state + prob from the static
-    equivalent-Gaussian outputs (cov17[34,34], mu17[34], eff_pnr[16])."""
-    return _herald_static(cov17, mu17, eff_pnr, 16, 17, MOMENT_MAXF, MOMENT_BF, L)
+    equivalent-Gaussian outputs (cov17[34,34], mu17[34], eff_pnr[16]).
+    ``BF`` (fired-box buffer) is a perf/coverage knob; ``L`` the signal cutoff."""
+    return _herald_static(cov17, mu17, eff_pnr, 16, 17, MOMENT_MAXF, int(BF), L)
 
 
 _LEAF_MAXF = 2
@@ -1049,20 +1050,25 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
     raw_exp[N], joint_prob[N])."""
     gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps = floats
     cfg = dict(config_hashable)
+    BF = int(cfg.get("moment_bf", MOMENT_BF))           # fired-box buffer (perf knob)
+    # 'fast' search mode: skip the exact per-leaf probability (8 sub-heralds) when
+    # probability isn't being optimised (w_prob~0) -> big speedup; periodic exact
+    # re-validation recovers the true probability.  Default on when w_prob==0.
+    skip_leaf = bool(cfg.get("moment_fast", w_prob < 1e-9))
     decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
                                    config=cfg)
 
     def loss(g):
         params = decoder.decode(g, base_cutoff)
         cov17, mu17, eff_pnr, _dens = jax_equivalent_gaussian_static(params)
-        psi, _prob_pnr = jax_reduced_herald_static(cov17, mu17, eff_pnr, L)
+        psi, _prob_pnr = jax_reduced_herald_static(cov17, mu17, eff_pnr, L, BF)
         Lp = psi.shape[0]
         raw_exp = jnp.real(jnp.vdot(psi, operator_L[:Lp, :Lp] @ psi))
         # the herald is valid only if it produced a normalised state; a zero-norm
         # psi (impossible PNR pattern, or numerical underflow) must be INVALID,
         # not scored as <O>=0 (which would masquerade as the global best).
         herald_norm = jnp.sum(jnp.abs(psi) ** 2)
-        P_leaf = _leaf_prob_product_static(params, L)
+        P_leaf = jnp.array(1.0) if skip_leaf else _leaf_prob_product_static(params, L)
         joint_prob = jnp.real(P_leaf)
         # over-budget detection IN-GRAPH (no eager pre-pass): kf>MAXF (fired modes
         # dropped) or prod(n_j+1)>BF (flat buffer overflow) => not representable
@@ -1070,7 +1076,7 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
         fired_mask = eff_pnr >= 1
         kf = jnp.sum(fired_mask.astype(jnp.float64))
         logprod = jnp.sum(jnp.where(fired_mask, jnp.log(eff_pnr + 1.0), 0.0))
-        in_budget = (kf <= MOMENT_MAXF) & (logprod <= jnp.log(float(MOMENT_BF)) + 1e-6)
+        in_budget = (kf <= MOMENT_MAXF) & (logprod <= jnp.log(float(BF)) + 1e-6)
         valid = (joint_prob > 1e-40) & (herald_norm > 0.5) & in_budget
         n_eff, max_eff = _effective_photons_static(cov17, eff_pnr, coupling_eps)
         active_modes = jnp.sum(jnp.asarray(params["leaf_active"]).astype(jnp.float64))
