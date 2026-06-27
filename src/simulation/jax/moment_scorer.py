@@ -23,6 +23,9 @@ Convention (matches thewalrus + the numpy reference): hbar = 2, xp-ordering
 
 from __future__ import annotations
 
+import math
+from functools import lru_cache as _lru_cache
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -145,11 +148,12 @@ def extract_structure(params: Dict[str, Any]) -> Structure:
     ``structure=`` so the heavy path can be jitted/vmapped over continuous params.
     """
     lp = params["leaf_params"]
-    active = tuple(bool(np.asarray(params["leaf_active"])[i]) for i in range(8))
-    n_ctrl = tuple(int(np.asarray(lp["n_ctrl"])[i]) for i in range(8))
+    nleaves = int(np.asarray(params["leaf_active"]).shape[0])   # 2**depth
+    active = tuple(bool(np.asarray(params["leaf_active"])[i]) for i in range(nleaves))
+    n_ctrl = tuple(int(np.asarray(lp["n_ctrl"])[i]) for i in range(nleaves))
     pnr = tuple(
         tuple(int(x) for x in np.asarray(lp["pnr"][i])[: n_ctrl[i]])
-        for i in range(8)
+        for i in range(nleaves)
     )
     return active, n_ctrl, pnr
 
@@ -174,13 +178,16 @@ def jax_equivalent_gaussian(params: Dict[str, Any],
     active_t, n_ctrl_t, pnr_t = structure
     leaf_active = [bool(x) for x in active_t]
     n_ctrl = [int(x) for x in n_ctrl_t]
+    nleaves = len(leaf_active)                       # 2**depth
+    depth = int(round(math.log2(nleaves)))
+    nodes = nleaves - 1
 
     # --- per-leaf moments + mode bookkeeping (mirror numpy assembly) --------- #
     blocks_V: List[Tuple[int, jnp.ndarray]] = []
     blocks_mu: List[Tuple[int, jnp.ndarray]] = []
     modes: List[Dict[str, Any]] = []
     tot = 0
-    for i in range(8):
+    for i in range(nleaves):
         if not leaf_active[i]:
             continue
         N_leaf = n_ctrl[i] + 1
@@ -196,14 +203,14 @@ def jax_equivalent_gaussian(params: Dict[str, Any],
     mu_g, V_g = _global_assemble(blocks_V, blocks_mu, tot)
     N_cur = tot
 
-    # --- homodyne values broadcast to 7 nodes -------------------------------- #
+    # --- homodyne values broadcast to ``nodes`` nodes ------------------------ #
     hx_raw = params.get("homodyne_x", 0.0)
     hx_arr = jnp.atleast_1d(jnp.asarray(hx_raw, dtype=jnp.float64))
     if hx_arr.shape[0] == 1:
-        hx_values = [hx_arr[0]] * 7
+        hx_values = [hx_arr[0]] * nodes
     else:
         hx_values = [hx_arr[j] if j < hx_arr.shape[0] else jnp.array(0.0)
-                     for j in range(7)]
+                     for j in range(nodes)]
 
     def signal_index(leaf_idx: int) -> int:
         for i, m in enumerate(modes):
@@ -211,12 +218,13 @@ def jax_equivalent_gaussian(params: Dict[str, Any],
                 return i
         return -1
 
-    active_signals = [i if leaf_active[i] else None for i in range(8)]
+    active_signals = [i if leaf_active[i] else None for i in range(nleaves)]
     homodyne_densities: List[jnp.ndarray] = []
 
     # --- mixing tree (static schedule; concrete active routing) -------------- #
+    # layer k (k=1..depth) reduces pairs -> 2**(depth-k) nodes, in mix_params order
     mix_node = 0
-    for _layer, num_pairs in [(1, 4), (2, 2), (3, 1)]:
+    for _layer, num_pairs in [(k, 2 ** (depth - k)) for k in range(1, depth + 1)]:
         nxt: List[Any] = []
         for j in range(num_pairs):
             theta = params["mix_params"][mix_node][0]
@@ -289,18 +297,39 @@ def jax_equivalent_gaussian(params: Dict[str, Any],
 # Output: fixed 17-mode (1 signal + 16 control-slot) cov/mu + effective control
 # pnr (unused slots forced to 0 -> conditioned away trivially in piece B).
 # =========================================================================== #
-_LEAF_X = [(3 * i, 3 * i + 1, 3 * i + 2) for i in range(8)]   # x-mode indices/leaf
-# tree nodes: (A_mode, B_mode, left_leaves, right_leaves), mix_params index = order
-_TREE = [
-    (0, 3, (0,), (1,)), (6, 9, (2,), (3,)), (12, 15, (4,), (5,)), (18, 21, (6,), (7,)),
-    (0, 6, (0, 1), (2, 3)), (12, 18, (4, 5), (6, 7)),
-    (0, 12, (0, 1, 2, 3), (4, 5, 6, 7)),
-]
-# kept modes after the tree: signal(0) + the 16 control slots, in leaf order
-_KEEP = [0] + [3 * i + 1 for i in range(8)] + [3 * i + 2 for i in range(8)]
-# reorder _KEEP so controls are (leaf0 c0, leaf0 c1, leaf1 c0, ...) = same order
-# as the per-structure scanner appends them
-_KEEP = [0] + [m for i in range(8) for m in (3 * i + 1, 3 * i + 2)]
+@_lru_cache(maxsize=8)
+def _static_tree(depth: int):
+    """Depth-parametric static topology for the masked single-compile scorer.
+
+    Returns (leaf_x, tree, keep, nleaves, N):
+      * leaf_x  : per-leaf x-mode triple (signal, c0, c1) in a 3-mode-per-leaf
+                  layout, so leaf i owns x-modes (3i, 3i+1, 3i+2).
+      * tree    : balanced binary reduction as (A_x, B_x, left_leaves,
+                  right_leaves), in mix_params node order (layer 1 first: pairs
+                  (0,1),(2,3),...; then layer 2; ...; root last).  A leaf-group's
+                  surviving signal always sits at x-mode 3*min(group), so A_x =
+                  3*min(left), B_x = 3*min(right); B is homodyned and retired.
+      * keep    : signal(x0) + the 2*nleaves control slots in leaf order
+                  (leaf0 c0, leaf0 c1, leaf1 c0, ...) -- same order the
+                  per-structure scanner appends controls.
+      * nleaves = 2**depth ; N = 3*nleaves (x-modes before the keep-projection).
+
+    depth=3 reproduces the original 8-leaf / N=24 / 7-node hardcoding exactly.
+    """
+    nleaves = 2 ** depth
+    N = 3 * nleaves
+    leaf_x = [(3 * i, 3 * i + 1, 3 * i + 2) for i in range(nleaves)]
+    tree = []
+    groups = [[i] for i in range(nleaves)]          # signal of group at 3*group[0]
+    while len(groups) > 1:
+        nxt = []
+        for j in range(0, len(groups), 2):
+            gA, gB = groups[j], groups[j + 1]
+            tree.append((3 * gA[0], 3 * gB[0], tuple(gA), tuple(gB)))
+            nxt.append(gA + gB)
+        groups = nxt
+    keep = [0] + [m for i in range(nleaves) for m in (3 * i + 1, 3 * i + 2)]
+    return leaf_x, tree, keep, nleaves, N
 
 
 def _leaf_moments_masked(r: jnp.ndarray, ph: jnp.ndarray, dv: jnp.ndarray,
@@ -343,40 +372,47 @@ def _measure_homodyne_fixed(V, mu, b, N, x):
     return Vn, mun, dens
 
 
-def jax_equivalent_gaussian_static(params: Dict[str, Any]
+def jax_equivalent_gaussian_static(params: Dict[str, Any], depth: int = 3
                                    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-compile, fully-masked JAX equivalent-Gaussian.  All structure is
-    traced (no static args) => one XLA graph for any genotype.
+    """Single-compile, fully-masked JAX equivalent-Gaussian for any ``depth``.
+    All genotype structure is traced (only ``depth`` is static) => one XLA graph
+    per depth.  At ``depth`` there are nleaves=2**depth leaves, nodes=nleaves-1
+    mixing nodes, and 2*nleaves control slots.
 
-    Returns (cov17[34,34], mu17[34], eff_pnr[16], densities[7]):
-      signal = mode 0; control slots 1..16 in leaf order (leaf0 c0, leaf0 c1, ...);
-      eff_pnr[s] = pnr of that control slot, or 0 if the slot is unused/inactive
-      (so piece B conditions it away as decoupled vacuum)."""
+    Returns (cov[2M,2M], mu[2M], eff_pnr[2*nleaves], densities[nodes]) with
+    M=1+2*nleaves:
+      signal = mode 0; control slots 1..2*nleaves in leaf order (leaf0 c0,
+      leaf0 c1, leaf1 c0, ...); eff_pnr[s] = pnr of that control slot, or 0 if
+      the slot is unused/inactive (so piece B conditions it away as decoupled
+      vacuum).  depth=3 reproduces the original cov17[34,34]/eff_pnr[16] output."""
+    leaf_x, tree, keep_l, nleaves, N = _static_tree(int(depth))
+    nodes = nleaves - 1
+
     lp = params["leaf_params"]
-    active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)   # (8,)
-    n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)           # (8,)
+    active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)   # (nleaves,)
+    n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)           # (nleaves,)
     r = jnp.asarray(lp["r"]); ph = jnp.asarray(lp["phases"]); dv = jnp.asarray(lp["disp"])
-    pnr = jnp.asarray(lp["pnr"])                                     # (8, >=2)
+    pnr = jnp.asarray(lp["pnr"])                                     # (nleaves, >=2)
 
-    N = 24
     Vg = jnp.eye(2 * N)              # vacuum (hbar=2 => cov = I)
     mug = jnp.zeros(2 * N)
-    for i in range(8):
+    for i in range(nleaves):
         n_real = jnp.where(active[i] > 0.5, n_ctrl[i] + 1.0, 0.0)
         mu_l, cov_l = _leaf_moments_masked(r[i], ph[i], dv[i], n_real)
-        xs = _LEAF_X[i]
+        xs = leaf_x[i]
         idxs = jnp.asarray([xs[0], xs[1], xs[2],
                             xs[0] + N, xs[1] + N, xs[2] + N])
         Vg = Vg.at[jnp.ix_(idxs, idxs)].set(cov_l)
         mug = mug.at[idxs].set(mu_l)
 
-    # homodyne broadcast to 7 nodes
+    # homodyne broadcast to ``nodes`` nodes (Design0 supplies one x per node;
+    # the global-homodyne designs supply a single value to broadcast)
     hx_raw = params.get("homodyne_x", 0.0)
     hx_arr = jnp.atleast_1d(jnp.asarray(hx_raw, dtype=jnp.float64))
-    hx = hx_arr if hx_arr.shape[0] >= 7 else jnp.broadcast_to(hx_arr[:1], (7,))
+    hx = hx_arr if hx_arr.shape[0] >= nodes else jnp.broadcast_to(hx_arr[:1], (nodes,))
 
     densities = []
-    for node, (A, B, Lk, Rk) in enumerate(_TREE):
+    for node, (A, B, Lk, Rk) in enumerate(tree):
         La = jnp.max(jnp.stack([active[l] for l in Lk]))
         Ra = jnp.max(jnp.stack([active[l] for l in Rk]))
         both = (La > 0.5) & (Ra > 0.5)
@@ -394,19 +430,19 @@ def jax_equivalent_gaussian_static(params: Dict[str, Any]
     if fg:
         Vg, mug = _apply_final_gaussian(Vg, mug, fg, 0, N)
 
-    keep = jnp.asarray(_KEEP)
+    keep = jnp.asarray(keep_l)
     idxs = jnp.concatenate([keep, keep + N])
-    cov17 = Vg[jnp.ix_(idxs, idxs)]
-    mu17 = mug[idxs]
+    cov_k = Vg[jnp.ix_(idxs, idxs)]
+    mu_k = mug[idxs]
 
     # effective control pnr per slot (leaf order): real iff active & c < n_ctrl
     eff = []
-    for i in range(8):
+    for i in range(nleaves):
         for c in range(2):
             real = (active[i] > 0.5) & (c < n_ctrl[i])
             eff.append(jnp.where(real, pnr[i, c].astype(jnp.float64), 0.0))
-    eff_pnr = jnp.stack(eff)          # (16,)
-    return cov17, mu17, eff_pnr, jnp.stack(densities)
+    eff_pnr = jnp.stack(eff)          # (2*nleaves,)
+    return cov_k, mu_k, eff_pnr, jnp.stack(densities)
 
 
 # =========================================================================== #
@@ -420,9 +456,6 @@ def jax_equivalent_gaussian_static(params: Dict[str, Any]
 # =========================================================================== #
 from src.simulation.jax.herald import Amat as _Amat, Qmat as _Qmat, \
     complex_to_real_displacements as _c2r
-
-
-from functools import lru_cache as _lru_cache
 
 
 @_lru_cache(maxsize=256)
@@ -733,27 +766,38 @@ def _herald_static(cov, mu, eff, ncontrol, Nmodes, MAXF, BF, L):
     return psi, prob
 
 
-def jax_reduced_herald_static(cov17, mu17, eff_pnr, L, BF=MOMENT_BF):
+def jax_reduced_herald_static(cov, mu, eff_pnr, L, BF=MOMENT_BF, depth: int = 3,
+                              maxf: int = MOMENT_MAXF):
     """Single-compile heralded signal state + prob from the static
-    equivalent-Gaussian outputs (cov17[34,34], mu17[34], eff_pnr[16]).
-    ``BF`` (fired-box buffer) is a perf/coverage knob; ``L`` the signal cutoff."""
-    return _herald_static(cov17, mu17, eff_pnr, 16, 17, MOMENT_MAXF, int(BF), L)
+    equivalent-Gaussian outputs over M=1+2*nleaves modes (nleaves=2**depth):
+    cov[2M,2M], mu[2M], eff_pnr[2*nleaves].  ``BF`` (fired-box buffer) and
+    ``maxf`` (in-graph fired-mode cap) are perf/VRAM knobs -- both depth-
+    independent, since the Hermite box is a (1+maxf)-mode object regardless of
+    how many control slots the tree carries; ``L`` is the signal cutoff.
+    depth=3 reproduces the original 16-control / 17-mode behaviour."""
+    nleaves = 2 ** int(depth)
+    ncontrol = 2 * nleaves
+    Nmodes = 1 + 2 * nleaves
+    return _herald_static(cov, mu, eff_pnr, ncontrol, Nmodes, int(maxf), int(BF), L)
 
 
 _LEAF_MAXF = 2
 _LEAF_BF = (15 + 1) ** 2          # 256: leaf has <=2 controls, each <=pnr_max
 
 
-def _leaf_prob_product_static(params, L):
+def _leaf_prob_product_static(params, L, depth: int = 3):
     """Product of exact per-leaf herald probs (fitness 'leaf' P), single-compile.
-    A leaf with no real controls (n_ctrl=0 or inactive) contributes 1."""
+    A leaf with no real controls (n_ctrl=0 or inactive) contributes 1.  Each leaf
+    is a fixed 3-mode object (1 signal + <=2 controls) independent of depth; only
+    the number of leaves (=2**depth) scales."""
+    nleaves = 2 ** int(depth)
     lp = params["leaf_params"]
     active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)
     n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)
     r = jnp.asarray(lp["r"]); ph = jnp.asarray(lp["phases"]); dv = jnp.asarray(lp["disp"])
     pnr = jnp.asarray(lp["pnr"])
     P = jnp.array(1.0)
-    for i in range(8):
+    for i in range(nleaves):
         n_real = jnp.where(active[i] > 0.5, n_ctrl[i] + 1.0, 0.0)
         mu_l, cov_l = _leaf_moments_masked(r[i], ph[i], dv[i], n_real)
         eff2 = jnp.stack([
@@ -835,7 +879,7 @@ def moment_score_one(params: Dict[str, Any], operator: jnp.ndarray,
     active, n_ctrl_t, pnr_t = structure
     P_leaf = jnp.array(1.0)
     lp = params["leaf_params"]
-    for i in range(8):
+    for i in range(len(active)):
         if active[i] and n_ctrl_t[i] > 0:
             P_leaf = P_leaf * _leaf_herald_prob(lp, i, n_ctrl_t[i], pnr_t[i], cutoff)
 
@@ -865,7 +909,7 @@ def _struct_fired_product(structure: Structure) -> int:
     """prod(n+1) over fired control modes, from the discrete structure alone."""
     active, n_ctrl, pnr = structure
     p = 1
-    for i in range(8):
+    for i in range(len(active)):
         if not active[i]:
             continue
         for c in range(n_ctrl[i]):
@@ -1025,16 +1069,17 @@ def moment_score_population(genotypes, operator_L, genotype_name: str,
     return jnp.asarray(fit), jnp.asarray(desc), extras
 
 
-def _effective_photons_static(cov17, eff_pnr, eps):
-    """Effective (coupled) photons from the final 17-mode equivalent cov: each
-    fired control's detected count weighted by a smooth gate on its coupling to
-    (signal + other controls).  Differentiable; fixed shape."""
-    N = 17
+def _effective_photons_static(cov_k, eff_pnr, eps, depth: int = 3):
+    """Effective (coupled) photons from the final M=1+2*nleaves-mode equivalent
+    cov (nleaves=2**depth): each fired control's detected count weighted by a
+    smooth gate on its coupling to (signal + other controls).  Differentiable;
+    fixed shape per depth.  depth=3 reproduces the 17-mode version."""
+    N = 1 + 2 * (2 ** int(depth))
     n_eff = jnp.array(0.0); max_eff = jnp.array(0.0)
-    for c in range(1, 17):
-        others = [0] + [c2 for c2 in range(1, 17) if c2 != c]
+    for c in range(1, N):
+        others = [0] + [c2 for c2 in range(1, N) if c2 != c]
         oi = jnp.asarray([i for o in others for i in (o, o + N)])
-        rows = cov17[jnp.asarray([c, c + N])][:, oi]
+        rows = cov_k[jnp.asarray([c, c + N])][:, oi]
         cpl = jnp.sqrt(jnp.sum(rows ** 2))
         w = cpl ** 2 / (cpl ** 2 + eps ** 2)
         ne = jnp.where(eff_pnr[c - 1] >= 1, eff_pnr[c - 1] * w, 0.0)
@@ -1050,6 +1095,13 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
     raw_exp[N], joint_prob[N])."""
     gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps = floats
     cfg = dict(config_hashable)
+    depth = int(cfg.get("depth", 3))
+    maxf = int(cfg.get("moment_maxf", MOMENT_MAXF))     # in-graph fired-mode cap
+    # gradient checkpointing (rematerialisation): recompute the per-genotype
+    # forward during backward instead of storing it.  ~2x compute, big peak-VRAM
+    # cut on the deep trees.  Default on for depth>=4 (off at depth 3 to keep the
+    # validated fast path identical).
+    remat = bool(cfg.get("moment_remat", depth >= 4))
     BF = int(cfg.get("moment_bf", MOMENT_BF))           # fired-box buffer (perf knob)
     # heralded-state norm tolerance: a state with too much mass beyond L has an
     # UNRELIABLE renormalised <O>, so gradient descent can exploit the L-cutoff
@@ -1066,25 +1118,26 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
 
     def loss(g):
         params = decoder.decode(g, base_cutoff)
-        cov17, mu17, eff_pnr, _dens = jax_equivalent_gaussian_static(params)
-        psi, _prob_pnr = jax_reduced_herald_static(cov17, mu17, eff_pnr, L, BF)
+        cov_k, mu_k, eff_pnr, _dens = jax_equivalent_gaussian_static(params, depth)
+        psi, _prob_pnr = jax_reduced_herald_static(cov_k, mu_k, eff_pnr, L, BF,
+                                                   depth, maxf)
         Lp = psi.shape[0]
         raw_exp = jnp.real(jnp.vdot(psi, operator_L[:Lp, :Lp] @ psi))
         # the herald is valid only if it produced a normalised state; a zero-norm
         # psi (impossible PNR pattern, or numerical underflow) must be INVALID,
         # not scored as <O>=0 (which would masquerade as the global best).
         herald_norm = jnp.sum(jnp.abs(psi) ** 2)
-        P_leaf = jnp.array(1.0) if skip_leaf else _leaf_prob_product_static(params, L)
+        P_leaf = jnp.array(1.0) if skip_leaf else _leaf_prob_product_static(params, L, depth)
         joint_prob = jnp.real(P_leaf)
-        # over-budget detection IN-GRAPH (no eager pre-pass): kf>MAXF (fired modes
+        # over-budget detection IN-GRAPH (no eager pre-pass): kf>maxf (fired modes
         # dropped) or prod(n_j+1)>BF (flat buffer overflow) => not representable
         # here -> mark invalid (the rare extreme-Sigma-n tail).
         fired_mask = eff_pnr >= 1
         kf = jnp.sum(fired_mask.astype(jnp.float64))
         logprod = jnp.sum(jnp.where(fired_mask, jnp.log(eff_pnr + 1.0), 0.0))
-        in_budget = (kf <= MOMENT_MAXF) & (logprod <= jnp.log(float(BF)) + 1e-6)
+        in_budget = (kf <= maxf) & (logprod <= jnp.log(float(BF)) + 1e-6)
         valid = (joint_prob > 1e-40) & (herald_norm > 0.5) & in_budget
-        n_eff, max_eff = _effective_photons_static(cov17, eff_pnr, coupling_eps)
+        n_eff, max_eff = _effective_photons_static(cov_k, eff_pnr, coupling_eps, depth)
         active_modes = jnp.sum(jnp.asarray(params["leaf_active"]).astype(jnp.float64))
         exp_val = jnp.where(valid, raw_exp, 0.0)            # grad-safe placeholder
         prob_capped = jnp.minimum(jnp.maximum(joint_prob, 1e-45), 1.0)
@@ -1103,7 +1156,8 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
                    max_pnr=max_eff, photons=n_eff, raw_exp=raw_exp, joint_prob=joint_prob)
         return jnp.real(loss_val), aux
 
-    (_lv, aux), grad = jax.vmap(jax.value_and_grad(loss, has_aux=True))(genotypes)
+    loss_fn = jax.checkpoint(loss) if remat else loss
+    (_lv, aux), grad = jax.vmap(jax.value_and_grad(loss_fn, has_aux=True))(genotypes)
     ones = jnp.ones_like(aux["log_prob"])
     fit = jnp.stack([-aux["final_exp"], -aux["log_prob"],
                      -aux["active"], -aux["photons"]], axis=1)
@@ -1111,25 +1165,63 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
     return fit, desc, grad, aux["raw_exp"], aux["joint_prob"]
 
 
+def _default_moment_chunk(depth: int, npop: int) -> int:
+    """Population-vmap shard size that keeps peak VRAM bounded as the tree grows.
+    The heavy Hermite box is depth-independent, but the equivalent-Gaussian and
+    vac-conditioning tapes grow ~(2*nleaves)^2 per genotype, so we shrink the
+    simultaneous-vmap width with depth.  Override with cfg['moment_chunk']."""
+    if depth <= 3:
+        return npop                # validated full-pop path unchanged
+    if depth == 4:
+        return min(npop, 16)
+    if depth == 5:
+        return min(npop, 4)
+    return min(npop, 2)            # depth>=6: best-effort
+
+
 def moment_score_population_static(genotypes, operator_L, genotype_name,
                                    config_hashable, base_cutoff, L,
                                    gs_eig, gaussian_limit):
-    """Option-2 scorer: ONE XLA compile, single vmap over the whole population.
-    Over-budget genotypes (kf>MAXF or prod(n_j+1)>BF -- the rare extreme-Sigma-n
-    tail) are exact-rescored on CPU with zero gradient."""
+    """Option-2 scorer: ONE XLA compile, vmap over the population in fixed-size
+    chunks (depth-derived default, or cfg['moment_chunk']).  Chunking bounds peak
+    VRAM as the breeding tree deepens; every chunk shares one compiled graph (the
+    final partial chunk is padded to the chunk width, then truncated).
+    Over-budget genotypes (kf>maxf or prod(n_j+1)>BF -- the rare extreme-Sigma-n
+    tail) are detected in-graph and marked invalid (dropped from the archive)."""
     cfg = dict(config_hashable)
     w_exp = float(cfg.get("alpha_expectation", 1.0))
     w_prob = float(cfg.get("alpha_probability", 0.0))
     coupling_eps = float(cfg.get("coupling_eps", 0.05))
     floats = (float(gs_eig), float(gaussian_limit), w_exp, w_prob, coupling_eps)
-    Npop = np.asarray(genotypes).shape[0]
+    g_all = jnp.asarray(genotypes)
+    Npop = int(g_all.shape[0])
 
-    # Single jit dispatch -- no eager per-genotype pre-pass.  Over-budget
-    # genotypes (kf>MAXF or prod(n_j+1)>BF, the rare extreme-Sigma-n tail) are
-    # detected in-graph and marked invalid (dropped from the archive).
-    f, d, gr, re, jp = _score_pop_static_jit(
-        jnp.asarray(genotypes), operator_L, genotype_name, config_hashable,
-        int(base_cutoff), int(L), floats)
+    depth = int(cfg.get("depth", 3))
+    chunk = int(cfg.get("moment_chunk", 0)) or _default_moment_chunk(depth, Npop)
+    chunk = max(1, min(int(chunk), Npop))
+
+    def _run(gs):
+        return _score_pop_static_jit(gs, operator_L, genotype_name,
+                                     config_hashable, int(base_cutoff), int(L),
+                                     floats)
+
+    if chunk >= Npop:
+        f, d, gr, re, jp = _run(g_all)
+    else:
+        n_chunks = (Npop + chunk - 1) // chunk
+        pad = n_chunks * chunk - Npop
+        gp = g_all if pad == 0 else jnp.concatenate(
+            [g_all, jnp.broadcast_to(g_all[-1:], (pad,) + g_all.shape[1:])], axis=0)
+        fs, ds, grs, res, jps = [], [], [], [], []
+        for ci in range(n_chunks):
+            sl = jax.lax.stop_gradient(gp[ci * chunk:(ci + 1) * chunk])
+            cf, cd, cgr, cre, cjp = _run(sl)
+            fs.append(cf); ds.append(cd); grs.append(cgr); res.append(cre); jps.append(cjp)
+        f = jnp.concatenate(fs, 0)[:Npop]
+        d = jnp.concatenate(ds, 0)[:Npop]
+        gr = jnp.concatenate(grs, 0)[:Npop]
+        re = jnp.concatenate(res, 0)[:Npop]
+        jp = jnp.concatenate(jps, 0)[:Npop]
 
     extras = {
         "gradients": gr,
@@ -1148,16 +1240,17 @@ def _revalidate_jit(genotypes, op_lo, op_hi, genotype_name, config_hashable,
     """For each genotype: (<O>_searchL, <O>_highL, herald_norm_searchL).  One
     compile per (L_lo, L_hi)."""
     cfg = dict(config_hashable)
+    depth = int(cfg.get("depth", 3))
+    maxf = int(cfg.get("moment_maxf", MOMENT_MAXF))
     BF_lo = int(cfg.get("moment_bf", MOMENT_BF))
     BF_hi = int(cfg.get("moment_bf_high", 8192))
-    decoder = get_genotype_decoder(genotype_name, depth=int(cfg.get("depth", 3)),
-                                   config=cfg)
+    decoder = get_genotype_decoder(genotype_name, depth=depth, config=cfg)
 
     def one(g):
         p = decoder.decode(g, base_cutoff)
-        cs, ms, ep, _ = jax_equivalent_gaussian_static(p)
-        plo, _ = jax_reduced_herald_static(cs, ms, ep, L_lo, BF_lo)
-        phi, _ = jax_reduced_herald_static(cs, ms, ep, L_hi, BF_hi)
+        cs, ms, ep, _ = jax_equivalent_gaussian_static(p, depth)
+        plo, _ = jax_reduced_herald_static(cs, ms, ep, L_lo, BF_lo, depth, maxf)
+        phi, _ = jax_reduced_herald_static(cs, ms, ep, L_hi, BF_hi, depth, maxf)
         elo = jnp.real(jnp.vdot(plo, op_lo[:plo.shape[0], :plo.shape[0]] @ plo))
         ehi = jnp.real(jnp.vdot(phi, op_hi[:phi.shape[0], :phi.shape[0]] @ phi))
         return elo, ehi, jnp.sum(jnp.abs(plo) ** 2)
@@ -1201,7 +1294,7 @@ def _numpy_leaf_prob_product(params, L):
     from frontend.gbs_optimizer import reduced_herald
     lp = params["leaf_params"]
     P = 1.0
-    for i in range(8):
+    for i in range(int(np.asarray(params["leaf_active"]).shape[0])):
         if not bool(np.asarray(params["leaf_active"])[i]):
             continue
         nc = int(np.asarray(lp["n_ctrl"])[i])

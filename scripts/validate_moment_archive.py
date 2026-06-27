@@ -62,13 +62,15 @@ def main():
     a, b = cfg.get("target_alpha"), cfg.get("target_beta")
     O_lo = np.asarray(moment_operator(args.l_search, a, b))
     O_hi = np.asarray(moment_operator(args.l_high, a, b))
-    dec = get_genotype_decoder(cfg.get("genotype"), depth=int(cfg.get("depth") or 3), config=cfg)
+    depth = int(cfg.get("depth") or 3)
+    maxf = int(cfg.get("moment_maxf") or 8)
+    dec = get_genotype_decoder(cfg.get("genotype"), depth=depth, config=cfg)
 
     @jax.jit
     def chain(g, L, BF):
         p = dec.decode(g, base)
-        cs, ms, ep, _ = jax_equivalent_gaussian_static(p)
-        return jax_reduced_herald_static(cs, ms, ep, L, BF)
+        cs, ms, ep, _ = jax_equivalent_gaussian_static(p, depth)
+        return jax_reduced_herald_static(cs, ms, ep, L, BF, depth, maxf)
 
     new_fit = fit.copy()
     n_art = 0

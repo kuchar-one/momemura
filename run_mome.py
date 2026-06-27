@@ -98,6 +98,68 @@ GLOBAL_CACHE = CacheManager(cache_dir="./cache", size_limit_bytes=1024 * 1024 * 
 # moved to top
 
 
+def _budget_max_photons(bf: int, pnr_max: int, n_slots: int) -> int:
+    """Largest total photon count a heralded state can realistically carry under
+    the moment-scorer fired-box budget prod(n_j+1) <= ``bf``, with each detector
+    capped at ``pnr_max`` and at most ``n_slots`` control detectors.
+
+    Maximising sum(n_j) under a product budget favours concentrating photons in
+    high-pnr modes (photons-per-log-budget rises with n), so we greedily fill
+    pnr_max modes while the log-budget allows, then top up with single-photon
+    modes. For bf=1024, pnr_max=15, n_slots=16 this gives ~32 -- matching the
+    empirically observed archive max (~31), vs the naive 240 theoretical max.
+    """
+    import math
+    if bf <= 1 or n_slots <= 0 or pnr_max <= 0:
+        return 0
+    log_bf = math.log(float(bf))
+    cost_full = math.log(pnr_max + 1.0)
+    k_full = min(n_slots, int(log_bf // cost_full))
+    total = k_full * pnr_max
+    rem_log = log_bf - k_full * cost_full
+    rem_slots = n_slots - k_full
+    k_one = min(rem_slots, int(rem_log // math.log(2.0)))
+    total += k_one
+    return int(total)
+
+
+def _print_moment_vram_estimate(cfg: Dict[str, Any], pop_size: int, depth: int) -> None:
+    """Rough peak-VRAM advisory for the moment scorer (A5000 = 24GB).
+
+    Cost centres, per genotype, held for every genotype in the simultaneous
+    population shard (the chunk):
+      * Hermite box AD tape  ~ maxf*(L + 15*maxf)*BF complex128  (depth-INDEPENDENT)
+      * equiv-Gaussian tape  ~ nodes*(2*N)^2 complex128, N=3*2**depth  (grows w/ depth)
+    Gradient checkpointing (remat, default on for depth>=4) trades ~2x compute to
+    avoid retaining the box forward, so we discount its contribution accordingly.
+    Estimate is deliberately conservative (upper-ish bound); treat as a guide.
+    """
+    L = int(cfg.get("moment_cutoff", 100))
+    BF = int(cfg.get("moment_bf", 4096))
+    maxf = int(cfg.get("moment_maxf", 8))
+    nleaves = 2 ** depth
+    nodes = nleaves - 1
+    N = 3 * nleaves
+    chunk = int(cfg.get("moment_chunk", 0))
+    if chunk <= 0:
+        chunk = pop_size if depth <= 3 else (16 if depth == 4 else 4 if depth == 5 else 2)
+    chunk = max(1, min(chunk, pop_size))
+    remat_on = cfg["moment_remat"] if "moment_remat" in cfg else (depth >= 4)
+
+    c16 = 16.0  # complex128 bytes
+    box = maxf * (L + 15 * maxf) * BF * c16
+    box *= (0.5 if remat_on else 2.0)               # remat discount vs AD-retain factor
+    gauss = nodes * (2 * N) ** 2 * c16 * 4.0        # ~4 live matrices/node under AD
+    per_geno = box + gauss
+    peak_gb = chunk * per_geno * 1.5 / 1e9          # 1.5x XLA scratch/overhead fudge
+
+    print(f"[moment VRAM] depth={depth} leaves={nleaves} modes(equiv)={1 + 2 * nleaves} "
+          f"L={L} BF={BF} maxf={maxf} chunk={chunk}/{pop_size} remat={'on' if remat_on else 'off'}")
+    print(f"[moment VRAM] est. peak ~{peak_gb:.1f} GB/GPU "
+          f"(box {chunk * box * 1.5 / 1e9:.1f} + gauss {chunk * gauss * 1.5 / 1e9:.1f}). "
+          f"Target <24GB; if higher, lower --moment-chunk (primary), then --moment-bf / --moment-maxf / --pop.")
+
+
 # -------------------------
 # Gaussian block builder
 # -------------------------
@@ -840,13 +902,26 @@ def run(
 
         # D3: Total Photons
         # Coarse Gridding for high photon counts
-        # Max theoretical photons = max_active * pnr_max_val * n_control
-        # Each leaf has n_control detectors, each detecting up to pnr_max photons
         n_modes_val = 2  # Default
         if genotype_config and "modes" in genotype_config:
             n_modes_val = int(genotype_config["modes"])
         n_control = max(1, n_modes_val - 1)
-        max_photons = max_active * pnr_max_val * n_control
+        n_slots = max_active * n_control          # total control detectors
+
+        # The naive theoretical max (every detector at pnr_max) is unreachable: a
+        # valid heralded state needs prod(n_j+1) <= BF (the moment-scorer budget),
+        # which caps the realistically-producible total photon count FAR below
+        # max_active*pnr_max*n_control. Using the theoretical max leaves ~80% of
+        # the photon axis permanently empty and tanks the coverage metric (see
+        # HANDOFF_coverage_and_minimum.md sec.2). For the moment scorer we size the
+        # axis to the budget-realistic max instead, so the bins resolve the region
+        # states actually occupy and coverage is honest. Other scorers keep the
+        # theoretical max (their budget model differs).
+        if (genotype_config or {}).get("scorer") == "moment":
+            _bf = int((genotype_config or {}).get("moment_bf", 1024))
+            max_photons = _budget_max_photons(_bf, pnr_max_val, n_slots)
+        else:
+            max_photons = n_slots * pnr_max_val
 
         # Target ~10 bins for Total dimension (Coarse buckets)
         n_bins_d3 = min(max_photons + 1, 10)
@@ -872,7 +947,7 @@ def run(
                             n_achievable_bins += 1
                     else:
                         min_total = max_pnr_bin_val
-                        max_total = active_int * n_control * pnr_max_val
+                        max_total = max_photons   # budget-realistic (see D3 above)
                         # Check if bin center is in valid range (with half-bin tolerance)
                         if (
                             total_val >= min_total - d3_width / 2
@@ -888,6 +963,13 @@ def run(
         # Store for metrics (closure will capture this)
         _n_achievable = n_achievable_bins
         total_centroids = centroids.shape[0]
+
+        # Moment-scorer VRAM advisory: the dominant cost is the per-genotype
+        # Hermite box (depth-independent: ~maxf*(L+15*maxf)*BF complex128) held
+        # for every genotype scored simultaneously (= the population chunk).
+        # Print a rough peak estimate so the run can be sized to the 24GB GPUs.
+        if (genotype_config or {}).get("scorer") == "moment":
+            _print_moment_vram_estimate(genotype_config, pop_size, depth_val)
 
     if mode == "random":
         # Random search baseline
@@ -1999,6 +2081,24 @@ def main():
         help="Drop an archive cell if |<O>_searchL - <O>_highL| exceeds this.",
     )
     parser.add_argument(
+        "--moment-maxf", type=int, default=8,
+        help="Moment scorer in-graph fired-mode cap (Hermite box = 1+maxf modes). "
+             "Depth-independent VRAM/coverage knob; genotypes with more fired "
+             "controls are marked over-budget. Raise for deep trees with many "
+             "simultaneously-fired controls (costs ~maxf x box memory).",
+    )
+    parser.add_argument(
+        "--moment-chunk", type=int, default=0,
+        help="Population-vmap shard size for the moment scorer (0 = depth-derived "
+             "auto: full pop at depth<=3, 16 at depth 4, 4 at depth 5). The primary "
+             "VRAM control as the tree deepens; smaller = less VRAM, same result.",
+    )
+    parser.add_argument(
+        "--moment-remat", choices=["auto", "on", "off"], default="auto",
+        help="Gradient checkpointing for the moment scorer (recompute forward in "
+             "backward). 'auto' = on for depth>=4. Big peak-VRAM cut at ~2x compute.",
+    )
+    parser.add_argument(
         "--modes",
         type=int,
         default=2,
@@ -2174,6 +2274,11 @@ def main():
                           else max(2 * args.moment_cutoff, 120)),
         "moment_validate_every": args.moment_validate_every,
         "moment_validate_tol": args.moment_validate_tol,
+        "moment_maxf": args.moment_maxf,
+        "moment_chunk": args.moment_chunk,
+        # remat: 'auto' is left to the scorer (on for depth>=4); on/off force it
+        **({"moment_remat": (args.moment_remat == "on")}
+           if args.moment_remat != "auto" else {}),
         "target_alpha": args.target_alpha,
         "target_beta": args.target_beta,
     }
