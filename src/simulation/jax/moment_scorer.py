@@ -1259,12 +1259,21 @@ def _revalidate_jit(genotypes, op_lo, op_hi, genotype_name, config_hashable,
 
 
 def clean_archive_moment(repertoire, genotype_name, config_hashable, base_cutoff,
-                         L_lo, L_hi, tol=0.02, norm_tol=0.99, chunk=32):
+                         L_lo, L_hi, tol=0.02, norm_tol=0.99, chunk=None):
     """Periodic dual-L sweep: re-score the archive at high L, refresh fitness[0]
     to the exact high-L <O>, and DROP any cell whose search-L <O> disagrees by
     >tol (or whose search-L herald wasn't normalised) -- i.e. an L-truncation
-    artifact.  Returns (cleaned_repertoire, num_removed)."""
+    artifact.  Returns (cleaned_repertoire, num_removed).
+
+    NB: this re-score runs at L_hi AND moment_bf_high (default 8192) -- a MUCH
+    bigger Hermite box than the search -- so it is the heaviest VRAM moment of a
+    deep run.  The validation chunk therefore defaults SMALLER than the search
+    chunk and shrinks with depth; override with cfg['moment_validate_chunk']."""
     cfg = dict(config_hashable)
+    if chunk is None:
+        _depth = int(cfg.get("depth", 3))
+        chunk = int(cfg.get("moment_validate_chunk", 0)) or (
+            32 if _depth <= 3 else 8 if _depth == 4 else 2)
     a, b = cfg.get("target_alpha"), cfg.get("target_beta")
     op_lo = moment_operator(int(L_lo), a, b)
     op_hi = moment_operator(int(L_hi), a, b)

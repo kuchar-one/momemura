@@ -19,6 +19,23 @@ sys.path.insert(0, REPO)
 import numpy as np
 
 
+def _as_complex(v, name):
+    """Robustly parse a config/CLI target into a Python complex, or None if
+    absent. Handles bare numbers (the QDax configs store target_alpha as a
+    number), parenthesised reprs like '(1+1j)', 'i'->'j', and stray spaces."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float, complex)):
+        return complex(v)
+    s = str(v).strip().replace(" ", "").replace("i", "j")
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+    try:
+        return complex(s)
+    except ValueError:
+        raise SystemExit(f"could not parse {name}={v!r} as a complex number")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=None)
@@ -30,6 +47,10 @@ def main():
     ap.add_argument("--bf-high", type=int, default=8192)
     ap.add_argument("--tol", type=float, default=0.02, help="max |Δ<O>| before flagging an artifact")
     ap.add_argument("--write", action="store_true", help="write an exact (L-high) rescored repertoire next to the input")
+    ap.add_argument("--target-alpha", default=None,
+                    help="override target alpha (QDax/MOME configs may lack it)")
+    ap.add_argument("--target-beta", default=None,
+                    help="override target beta, e.g. '1+1j' (QDax/MOME configs omit target_beta)")
     args = ap.parse_args()
 
     import jax, jax.numpy as jnp
@@ -59,7 +80,22 @@ def main():
     valid = np.where(np.isfinite(fit[:, 0]) & (fit[:, 0] > -1e9))[0]
 
     base = int(cfg.get("cutoff") or 30)
-    a, b = cfg.get("target_alpha"), cfg.get("target_beta")
+    # Resolve the target (alpha,beta): CLI override > config. QDax/MOME configs
+    # store target_alpha as a bare number and OMIT target_beta entirely, so fall
+    # back to an explicit --target-beta and fail loudly (not with a cryptic
+    # complex() error) if neither source has it.
+    a = _as_complex(args.target_alpha if args.target_alpha is not None
+                    else cfg.get("target_alpha"), "target_alpha")
+    b = _as_complex(args.target_beta if args.target_beta is not None
+                    else cfg.get("target_beta"), "target_beta")
+    if a is None:
+        raise SystemExit("no target_alpha in config or --target-alpha; pass --target-alpha.")
+    if b is None:
+        raise SystemExit(
+            f"config.json for this run has no 'target_beta' (QDax/MOME runs omit it). "
+            f"Re-run with an explicit target, e.g.  --target-alpha {a.real:g} --target-beta '1+1j'  "
+            f"(group {args.group!r} encodes alpha=a..., |beta|=b...; supply the true complex beta).")
+    print(f"target: alpha={a}  beta={b}")
     O_lo = np.asarray(moment_operator(args.l_search, a, b))
     O_hi = np.asarray(moment_operator(args.l_high, a, b))
     depth = int(cfg.get("depth") or 3)

@@ -2081,6 +2081,18 @@ def main():
         help="Drop an archive cell if |<O>_searchL - <O>_highL| exceeds this.",
     )
     parser.add_argument(
+        "--moment-bf-high", type=int, default=8192,
+        help="Fired-box buffer for the periodic high-L validation sweep (exact "
+             "re-score). Bigger than --moment-bf since validation must not itself "
+             "truncate; this is the heaviest VRAM step of a deep run.",
+    )
+    parser.add_argument(
+        "--moment-validate-chunk", type=int, default=0,
+        help="Population shard for the validation sweep (0 = depth-auto: 32 "
+             "<=depth3 / 8 @depth4 / 2 @depth5). Lower if the high-L/high-BF "
+             "re-score spikes VRAM at depth.",
+    )
+    parser.add_argument(
         "--moment-maxf", type=int, default=8,
         help="Moment scorer in-graph fired-mode cap (Hermite box = 1+maxf modes). "
              "Depth-independent VRAM/coverage knob; genotypes with more fired "
@@ -2274,6 +2286,8 @@ def main():
                           else max(2 * args.moment_cutoff, 120)),
         "moment_validate_every": args.moment_validate_every,
         "moment_validate_tol": args.moment_validate_tol,
+        "moment_bf_high": args.moment_bf_high,
+        "moment_validate_chunk": args.moment_validate_chunk,
         "moment_maxf": args.moment_maxf,
         "moment_chunk": args.moment_chunk,
         # remat: 'auto' is left to the scorer (on for depth>=4); on/off force it

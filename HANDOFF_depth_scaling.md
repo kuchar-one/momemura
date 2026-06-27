@@ -77,7 +77,9 @@ python run_pipeline.py --backend jax --pop 64 --iters 2500 --cutoff 30 \
   --genotype 00B --dynamic-limits --modes 3 --pnr-max 15 --depth 4 \
   --target-alpha 2.7320508 --target-beta "1+1j" --chunk-size 50 --emitter hybrid \
   --seed-scan --scorer moment --moment-cutoff 50 --moment-bf 1024 --moment-fast \
-  --moment-maxf 10 --moment-chunk 16 --moment-remat auto --single-run
+  --moment-maxf 10 --moment-chunk 16 --moment-remat auto \
+  --moment-l-high 120 --moment-validate-every 250 --moment-bf-high 8192 \
+  --moment-validate-chunk 8 --single-run
 ```
 
 - `--moment-maxf 10`: depth-4's richer trees can fire more controls at once; 10 captures the
@@ -89,12 +91,31 @@ python run_pipeline.py --backend jax --pop 64 --iters 2500 --cutoff 30 \
 - If depth-4 best states carry more photons/squeezing and you see over-budget drops, bump
   `--moment-bf 4096` (and check fp/norm) — VRAM still fine; re-validate at high L.
 
-Validate (drop any L-truncation artifacts, refresh to exact high-L ⟨O⟩):
+**Higher-L artifact detection is automatic — you don't need extra flags for it.**
+`--moment-cutoff 50` is only the *search* L. In the QDax/MOME phase the optimizer
+runs a periodic **dual-L validation sweep** by default: every `--moment-validate-every`
+(250) generations it re-scores the whole archive at `--moment-l-high` (auto =
+max(2·cutoff,120) = 120) with `--moment-bf-high` (8192), drops any cell whose
+search-L ⟨O⟩ disagrees by >`--moment-validate-tol` (0.02) or whose herald wasn't
+normalised, and refreshes survivors to the exact high-L ⟨O⟩. The flags above just
+make those defaults explicit. Note this sweep is the **heaviest VRAM moment** of a
+deep run (L=120 + BF=8192 is a much bigger Hermite box than the search), which is
+why `--moment-validate-chunk` defaults smaller than `--moment-chunk` and shrinks
+with depth — lower it (or `--moment-bf-high`) if validation spikes memory. The
+single-objective seeding phase has no in-loop sweep; the post-hoc script below
+covers it.
+
+Post-hoc exact re-validation (drop L-truncation artifacts, refresh to exact high-L ⟨O⟩):
 
 ```bash
 JAX_ENABLE_X64=1 python scripts/validate_moment_archive.py \
-  --group 00B_c30_a2p73_b1p41 --l-search 50 --l-high 120 --write
+  --group 00B_c30_a2p73_b1p41 --l-search 50 --l-high 120 \
+  --target-alpha 2.7320508 --target-beta "1+1j" --write
 ```
+
+(The QDax/MOME `config.json` stores `target_alpha` as a bare number and **omits
+`target_beta`**, so pass the target explicitly — the script now requires it and
+errors clearly instead of failing with a cryptic `complex()` message.)
 
 ### Depth 5 (best-effort — VRAM is fine, but compile/search-bound)
 
@@ -103,7 +124,9 @@ python run_pipeline.py --backend jax --pop 32 --iters 2500 --cutoff 30 \
   --genotype 00B --dynamic-limits --modes 3 --pnr-max 15 --depth 5 \
   --target-alpha 2.7320508 --target-beta "1+1j" --chunk-size 50 --emitter hybrid \
   --seed-scan --scorer moment --moment-cutoff 50 --moment-bf 1024 --moment-fast \
-  --moment-maxf 10 --moment-chunk 4 --moment-remat on --single-run
+  --moment-maxf 10 --moment-chunk 4 --moment-remat on \
+  --moment-l-high 120 --moment-validate-every 250 --moment-bf-high 4096 \
+  --moment-validate-chunk 2 --single-run
 ```
 
 - Memory is **not** the wall at depth 5 (est. <1 GB at chunk=4). Expect the costs to be:
