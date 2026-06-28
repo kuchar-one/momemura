@@ -808,20 +808,27 @@ def _rescore_run(eng, gen, fit, des, sel, args, a, b, glim, gs_eig, O_hi, O_lo,
         fp_budget = int(np.prod(fired + 1)) if fired.size else 1
         active_modes = int(round(float(nact[j])))
 
-        # independent thewalrus cross-check on the subsample
+        # independent thewalrus cross-check on the subsample.  reduced_herald uses
+        # numpy det/solve, which legitimately overflows/underflows on high-squeezing
+        # or near-impossible (vanishing-probability) heralds -- the reference state
+        # is numerically ill-defined there, so we silence the warnings and let the
+        # resulting non-finite fidelity be ignored (classify_artifact only flags a
+        # finite fidelity < 0.999).  The authoritative state is the jax x64 scorer.
         indep_fidelity = np.nan
         if j in sub_idx:
             try:
-                cov, mu, effc = eng.equivalent_gaussian(gen[k].astype(np.float32))
-                from frontend.gbs_optimizer import reduced_herald
-                ncontrol = effc.shape[0]
-                cidx = list(range(1, 1 + ncontrol))
-                nvec = [int(round(x)) for x in effc]
-                psi_ind, _ = reduced_herald(cov, mu, 0, cidx, nvec, cutoff=args.l_high)
-                psi_ind = np.asarray(psi_ind).ravel()
-                L = min(len(psi_ind), len(ph))
-                ov = np.vdot(psi_ind[:L], ph[:L])
-                indep_fidelity = float(abs(ov) ** 2)
+                with np.errstate(all="ignore"):
+                    cov, mu, effc = eng.equivalent_gaussian(gen[k].astype(np.float32))
+                    from frontend.gbs_optimizer import reduced_herald
+                    ncontrol = effc.shape[0]
+                    cidx = list(range(1, 1 + ncontrol))
+                    nvec = [int(round(x)) for x in effc]
+                    psi_ind, _ = reduced_herald(cov, mu, 0, cidx, nvec, cutoff=args.l_high)
+                    psi_ind = np.asarray(psi_ind).ravel()
+                    L = min(len(psi_ind), len(ph))
+                    ov = np.vdot(psi_ind[:L], ph[:L])
+                    fid = float(abs(ov) ** 2)
+                indep_fidelity = fid if np.isfinite(fid) else np.nan
             except Exception:  # noqa: BLE001
                 indep_fidelity = np.nan
 
