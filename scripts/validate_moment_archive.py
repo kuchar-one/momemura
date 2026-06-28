@@ -102,7 +102,11 @@ def main():
     maxf = int(cfg.get("moment_maxf") or 8)
     dec = get_genotype_decoder(cfg.get("genotype"), depth=depth, config=cfg)
 
-    @jax.jit
+    import functools
+    # L and BF are buffer/scan SHAPES inside the herald (jnp.arange(BF), psi[L]),
+    # so they must be static -- otherwise int(BF)/int(L) hit a traced value
+    # (ConcretizationTypeError). g stays traced.
+    @functools.partial(jax.jit, static_argnums=(1, 2))
     def chain(g, L, BF):
         p = dec.decode(g, base)
         cs, ms, ep, _ = jax_equivalent_gaussian_static(p, depth)

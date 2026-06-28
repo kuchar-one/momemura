@@ -826,8 +826,19 @@ def run(
         )
 
         # Seeding Strategy (Shared)
-        from src.genotypes.converter import create_vacuum_genotype, upgrade_genotype
+        from src.genotypes.converter import (
+            create_vacuum_genotype, upgrade_genotype, upgrade_depth,
+            _PERNODE_HOM_DESIGNS)
         from src.utils.result_scanner import scan_results_for_seeds
+
+        def _infer_src_depth(name, length):
+            """Depth whose genotype length matches `length` for design `name`
+            (so a shallower seed can be embedded into the current deeper tree)."""
+            for d in range(1, depth_val + 1):
+                if get_genotype_decoder(
+                        name, depth=d, config=genotype_config).get_length(d) == length:
+                    return d
+            return None
 
         print("Applying Seeding Strategy...")
         if "modes" not in genotype_config:
@@ -861,17 +872,31 @@ def run(
 
             idx = 1
             injected_count = 0
+            embedded_count = 0
             for g_src, name_src, score in seeds:
                 if idx >= pop_size:
                     break
                 try:
-                    g_new = upgrade_genotype(
-                        g_src,
-                        name_src,
-                        genotype,
-                        depth=depth_val,
-                        config=genotype_config,
-                    )
+                    # Same design but a SHALLOWER tree -> embed it as a subtree
+                    # and vacuum-pad the rest, so the deep genotype reproduces the
+                    # shallow heralded state exactly (same <O> at the start).
+                    src_d = None
+                    if (name_src == genotype
+                            and genotype in _PERNODE_HOM_DESIGNS
+                            and len(g_src) != D):
+                        src_d = _infer_src_depth(name_src, len(g_src))
+                    if src_d is not None and src_d < depth_val:
+                        g_new = upgrade_depth(
+                            g_src, genotype, src_d, depth_val, genotype_config)
+                        embedded_count += 1
+                    else:
+                        g_new = upgrade_genotype(
+                            g_src,
+                            name_src,
+                            genotype,
+                            depth=depth_val,
+                            config=genotype_config,
+                        )
                     if len(g_new) == D:
                         genotypes = genotypes.at[idx].set(g_new)
                         idx += 1
@@ -880,7 +905,9 @@ def run(
                     pass
 
             if injected_count > 0:
-                print(f"  - Injected {injected_count} seeds.")
+                _emb = (f" ({embedded_count} depth-embedded from shallower runs)"
+                        if embedded_count else "")
+                print(f"  - Injected {injected_count} seeds.{_emb}")
             else:
                 pass
 

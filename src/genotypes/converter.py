@@ -24,6 +24,93 @@ def create_vacuum_genotype(
     return np.zeros(length, dtype=np.float32)
 
 
+def _layer_node_offsets(depth: int):
+    """Flat-array start index of each tree layer's node block.  Nodes are stored
+    layer-by-layer (layer 1 first); layer k (1-indexed) has 2**(depth-k) nodes.
+    Returns offs with offs[k-1] = start index of layer k."""
+    offs, cur = [], 0
+    for k in range(1, depth + 1):
+        offs.append(cur)
+        cur += 2 ** (depth - k)
+    return offs
+
+
+# per-node-homodyne designs (Design0 / Design00B) share the layout
+#   hom(nodes) | leaves(L * P_leaf_full) | mix(nodes * PN) | final(F)
+_PERNODE_HOM_DESIGNS = {"0", "design0", "00B"}
+
+
+def upgrade_depth(
+    source_g: np.ndarray,
+    genotype_name: str,
+    src_depth: int,
+    dst_depth: int,
+    config: dict = None,
+) -> np.ndarray:
+    """Embed a SHALLOWER genotype into a DEEPER tree of the same design, with the
+    extra subtrees vacuum-padded (leaves marked inactive).
+
+    The source's 2**src_depth leaves go into the first 2**src_depth leaves of the
+    deep tree; the remaining leaves are set INACTIVE.  The masked equivalent-
+    Gaussian then routes every mixing node that touches a dead subtree to a
+    no-op (theta=0 identity BS + a homodyne on a decoupled vacuum mode, which
+    leaves the live signal untouched), so the deep genotype reproduces the
+    shallow heralded state EXACTLY (to float precision) -> same <O> at the start.
+
+    Internal (still-live) mixing nodes and their per-node homodyne values are
+    mapped layer-by-layer so the live subtree is bit-identical to the source.
+    (For Design00B the decoder forces every BS to theta=pi/4 anyway, so only the
+    inactive-leaf flags and the homodyne mapping actually drive the embedding;
+    the mix-param copy is kept for the Design0/A members of the family.)
+
+    Only the per-node-homodyne family (Design0 / Design00B) is supported.
+    """
+    if dst_depth < src_depth:
+        raise ValueError(f"dst_depth {dst_depth} < src_depth {src_depth}")
+    if dst_depth == src_depth:
+        return np.asarray(source_g, dtype=np.float32).copy()
+    if genotype_name not in _PERNODE_HOM_DESIGNS:
+        raise NotImplementedError(
+            f"upgrade_depth supports {_PERNODE_HOM_DESIGNS}, not {genotype_name!r}")
+
+    dec_s = get_genotype_decoder(genotype_name, src_depth, config)
+    dec_t = get_genotype_decoder(genotype_name, dst_depth, config)
+    Ls, Lt = 2 ** src_depth, 2 ** dst_depth
+    nodes_s, nodes_t = Ls - 1, Lt - 1
+    P, PN, F = dec_s.P_leaf_full, dec_s.PN, dec_s.F
+
+    g = np.asarray(source_g, dtype=np.float32)
+    exp_src = dec_s.get_length(src_depth)
+    if g.shape[0] != exp_src:
+        raise ValueError(f"source length {g.shape[0]} != depth-{src_depth} length {exp_src}")
+
+    i = 0
+    hom_s = g[i:i + nodes_s]; i += nodes_s
+    leaves_s = g[i:i + Ls * P].reshape(Ls, P); i += Ls * P
+    mix_s = g[i:i + nodes_s * PN].reshape(nodes_s, PN); i += nodes_s * PN
+    final_s = g[i:i + F]
+
+    hom_t = np.zeros(nodes_t, dtype=np.float32)
+    mix_t = np.zeros((nodes_t, PN), dtype=np.float32)
+    offs_s, offs_t = _layer_node_offsets(src_depth), _layer_node_offsets(dst_depth)
+    for k in range(1, src_depth + 1):           # map each live layer's node block
+        cnt = 2 ** (src_depth - k)
+        s0, t0 = offs_s[k - 1], offs_t[k - 1]
+        hom_t[t0:t0 + cnt] = hom_s[s0:s0 + cnt]
+        mix_t[t0:t0 + cnt] = mix_s[s0:s0 + cnt]
+
+    leaves_t = np.zeros((Lt, P), dtype=np.float32)
+    leaves_t[:Ls] = leaves_s
+    leaves_t[Ls:, 0] = -1.0                      # active flag (col 0) <= 0 => inactive
+
+    target_g = np.concatenate(
+        [hom_t, leaves_t.reshape(-1), mix_t.reshape(-1), final_s]).astype(np.float32)
+    exp_dst = dec_t.get_length(dst_depth)
+    if target_g.shape[0] != exp_dst:
+        raise ValueError(f"built length {target_g.shape[0]} != depth-{dst_depth} length {exp_dst}")
+    return target_g
+
+
 def upgrade_genotype(
     source_g: np.ndarray,
     source_name: str,
