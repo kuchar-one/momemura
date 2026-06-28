@@ -695,6 +695,15 @@ def run_sweep(args):
                    "reason": f"length_mismatch:glen={glen}", "n_cells": int(gen.shape[0])})
             continue
 
+        # The exact STATIC moment scorer is hardwired to 3 modes/leaf (1 signal +
+        # 2 control); modes!=3 genotypes (e.g. the early 0_c5 modes-2 group) cannot
+        # be re-scored by it.  Log a clean reason instead of a cryptic broadcast error.
+        n_modes = int(cfg.get("modes") or 3)
+        if n_modes != 3:
+            _emit({**prov, "status": "undecodable",
+                   "reason": f"unsupported_modes:{n_modes}", "n_cells": int(gen.shape[0])})
+            continue
+
         maxf = int(cfg.get("moment_maxf") or args.maxf)
         try:
             eng = get_engine(design, depth, maxf, cfg)
