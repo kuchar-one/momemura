@@ -15,3 +15,6 @@ output_backup_*
 # rescore archaeology: keep REPORT.md + CSVs + json, omit large binaries
 recompute/all_solutions.parquet
 recompute/**/*.npy
+recompute*/_rows.jsonl
+recompute*/_runs.jsonl
+recompute_a2p73/

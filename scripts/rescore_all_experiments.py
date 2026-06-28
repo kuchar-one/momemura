@@ -608,31 +608,72 @@ def run_sweep(args):
     if contradictions:
         print(f"[targets] WARNING contradictions: {contradictions}")
 
-    rows = []           # per re-scored cell
-    undecodable = []    # per non-rescored run
-    run_status = []     # ledger: one row per run
-    n_runs_rescored = n_runs_undecodable = n_runs_unloadable = 0
+    # --- checkpointing (PROMPT s8: never lose a long run to an interruption) ---
+    # Each finished run is appended to _runs.jsonl (status+reason) and its cells to
+    # _rows.jsonl, so progress survives a kill.  --resume reloads them and skips
+    # already-done runs; deliverables are also flushed every --flush-every runs.
+    ckpt_runs = os.path.join(out, "_runs.jsonl")
+    ckpt_rows = os.path.join(out, "_rows.jsonl")
+    rows, undecodable, run_status, done = [], [], [], set()
+    if args.resume and os.path.exists(ckpt_runs):
+        for line in open(ckpt_runs):
+            try:
+                rec = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            run_status.append(rec)
+            done.add((rec["root"], rec["group"], rec["run"]))
+            if rec.get("status") in ("undecodable", "unloadable"):
+                undecodable.append({k: rec.get(k) for k in
+                                    ("root", "group", "run", "status", "reason", "n_cells")})
+        if os.path.exists(ckpt_rows):
+            for line in open(ckpt_rows):
+                try:
+                    rows.append(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        print(f"[resume] {len(done)} runs already done ({len(rows)} cells); continuing")
+    else:
+        for p in (ckpt_runs, ckpt_rows):
+            if os.path.exists(p):
+                os.remove(p)
+    runs_fh = open(ckpt_runs, "a")
+    rows_fh = open(ckpt_rows, "a")
+
+    def _emit(rec, run_rows=None):
+        run_status.append(rec)
+        if rec.get("status") in ("undecodable", "unloadable"):
+            undecodable.append({k: rec.get(k) for k in
+                                ("root", "group", "run", "status", "reason", "n_cells")})
+        runs_fh.write(json.dumps(rec, default=_json_default) + "\n"); runs_fh.flush()
+        if run_rows:
+            rows.extend(run_rows)
+            for r in run_rows:
+                rows_fh.write(json.dumps(r, default=_json_default) + "\n")
+            rows_fh.flush()
+
+    def _counts():
+        c = Counter(r["status"] for r in run_status)
+        return c.get("rescored", 0), c.get("undecodable", 0), c.get("unloadable", 0)
 
     for ri, (root, group, run, pkl) in enumerate(runs):
+        if (root, group, run) in done:
+            continue
         cfg = configs[pkl]
         prov = dict(root=root, group=group, run=run)
         # --- load ---
         try:
             gen, fit, des = load_run_arrays(pkl)
         except Exception as e:  # noqa: BLE001
-            undecodable.append({**prov, "status": "unloadable",
-                                "reason": f"{type(e).__name__}:{str(e)[:80]}", "n_cells": 0})
-            run_status.append({**prov, "status": "unloadable"})
-            n_runs_unloadable += 1
+            _emit({**prov, "status": "unloadable",
+                   "reason": f"{type(e).__name__}:{str(e)[:80]}", "n_cells": 0})
             continue
 
         # --- resolve target ---
         a, b, tsrc, treason = resolve_target(cfg, group, beta_map, alpha_map)
         if a is None:
-            undecodable.append({**prov, "status": "undecodable", "reason": treason,
-                                "n_cells": int(gen.shape[0])})
-            run_status.append({**prov, "status": "undecodable"})
-            n_runs_undecodable += 1
+            _emit({**prov, "status": "undecodable", "reason": treason,
+                   "n_cells": int(gen.shape[0])})
             continue
 
         # --- decoder / depth ---
@@ -650,37 +691,29 @@ def run_sweep(args):
             except Exception:  # noqa: BLE001
                 depth = infer_depth(design, cfg, glen)
         if depth is None:
-            undecodable.append({**prov, "status": "undecodable",
-                                "reason": f"length_mismatch:glen={glen}", "n_cells": int(gen.shape[0])})
-            run_status.append({**prov, "status": "undecodable"})
-            n_runs_undecodable += 1
+            _emit({**prov, "status": "undecodable",
+                   "reason": f"length_mismatch:glen={glen}", "n_cells": int(gen.shape[0])})
             continue
 
         maxf = int(cfg.get("moment_maxf") or args.maxf)
         try:
             eng = get_engine(design, depth, maxf, cfg)
         except Exception as e:  # noqa: BLE001
-            undecodable.append({**prov, "status": "undecodable",
-                                "reason": f"engine_build:{type(e).__name__}:{str(e)[:60]}",
-                                "n_cells": int(gen.shape[0])})
-            run_status.append({**prov, "status": "undecodable"})
-            n_runs_undecodable += 1
+            _emit({**prov, "status": "undecodable",
+                   "reason": f"engine_build:{type(e).__name__}:{str(e)[:60]}",
+                   "n_cells": int(gen.shape[0])})
             continue
         if glen != eng.glen:
-            undecodable.append({**prov, "status": "undecodable",
-                                "reason": f"length_mismatch:glen={glen}!=dec={eng.glen}",
-                                "n_cells": int(gen.shape[0])})
-            run_status.append({**prov, "status": "undecodable"})
-            n_runs_undecodable += 1
+            _emit({**prov, "status": "undecodable",
+                   "reason": f"length_mismatch:glen={glen}!=dec={eng.glen}",
+                   "n_cells": int(gen.shape[0])})
             continue
 
         # --- select cells ---
         sel, n_valid, n_skipped = select_cells(fit, des, args.per_run_cap)
         if sel.size == 0:
-            undecodable.append({**prov, "status": "undecodable", "reason": "no_valid_cells",
-                                "n_cells": int(gen.shape[0])})
-            run_status.append({**prov, "status": "undecodable"})
-            n_runs_undecodable += 1
+            _emit({**prov, "status": "undecodable", "reason": "no_valid_cells",
+                   "n_cells": int(gen.shape[0])})
             continue
 
         glim, gs_eig, O_hi = target_refs(a, b, args.l_high)
@@ -695,31 +728,35 @@ def run_sweep(args):
         except Exception as e:  # noqa: BLE001
             if args.debug:
                 traceback.print_exc()
-            undecodable.append({**prov, "status": "undecodable",
-                                "reason": f"rescore_error:{type(e).__name__}:{str(e)[:60]}",
-                                "n_cells": int(gen.shape[0])})
-            run_status.append({**prov, "status": "undecodable"})
-            n_runs_undecodable += 1
+            _emit({**prov, "status": "undecodable",
+                   "reason": f"rescore_error:{type(e).__name__}:{str(e)[:60]}",
+                   "n_cells": int(gen.shape[0])})
             continue
 
         for r in run_rows:
             r["target_source"] = tsrc
             r["n_skipped_cells"] = n_skipped
-        rows.extend(run_rows)
-        run_status.append({**prov, "status": "rescored", "n_rescored": len(run_rows)})
-        n_runs_rescored += 1
+        _emit({**prov, "status": "rescored", "n_rescored": len(run_rows)}, run_rows)
+
         if (ri + 1) % max(1, args.progress_every) == 0 or ri + 1 == len(runs):
             print(f"[{ri+1}/{len(runs)}] {root}/{group}/{run}  "
                   f"valid={n_valid} scored={len(run_rows)}  rows so far={len(rows)}  "
-                  f"({time.time()-t_start:.0f}s)")
+                  f"({time.time()-t_start:.0f}s)", flush=True)
+        if args.flush_every and (ri + 1) % args.flush_every == 0:
+            print(f"[flush] writing partial deliverables at run {ri+1} "
+                  f"({len(rows)} cells)", flush=True)
+            _write_outputs(pd.DataFrame(rows), undecodable, run_status, runs,
+                           beta_map, alpha_map, contradictions, args, out, roots, light=True)
 
-    print(f"[sweep] rescored={n_runs_rescored} undecodable={n_runs_undecodable} "
-          f"unloadable={n_runs_unloadable}  cells={len(rows)}  ({time.time()-t_start:.0f}s)")
+    runs_fh.close(); rows_fh.close()
+    nr, nu, nl = _counts()
+    print(f"[sweep] rescored={nr} undecodable={nu} unloadable={nl}  "
+          f"cells={len(rows)}  ({time.time()-t_start:.0f}s)", flush=True)
 
-    # --- write deliverables ---
+    # --- write final deliverables (full: incl best states + plots) ---
     df = pd.DataFrame(rows)
     summary = _write_outputs(df, undecodable, run_status, runs, beta_map, alpha_map,
-                             contradictions, args, out, roots)
+                             contradictions, args, out, roots, light=False)
     return df, summary
 
 
@@ -848,8 +885,21 @@ def pareto_front(sub):
     return v[keep].sort_values("exp_hi")
 
 
+def _json_default(o):
+    """JSON encoder fallback for numpy scalars/arrays in checkpoint records."""
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return str(o)
+
+
 def _write_outputs(df, undecodable, run_status, runs, beta_map, alpha_map,
-                   contradictions, args, out, roots):
+                   contradictions, args, out, roots, light=False):
     import pandas as pd
     # sort deterministically
     if not df.empty:
@@ -884,14 +934,17 @@ def _write_outputs(df, undecodable, run_status, runs, beta_map, alpha_map,
     pd.DataFrame(undecodable).to_csv(os.path.join(out, "undecodable.csv"), index=False)
     pd.DataFrame(run_status).to_csv(os.path.join(out, "run_ledger.csv"), index=False)
 
-    # 3 + 6. best states + plots
-    best_per_group = _save_best_states_and_plots(df, out, args)
+    # 3 + 6. best states + plots (skipped on light/periodic flushes -- the
+    # per-group engine rebuild + Wigner rendering is the slow part; the final
+    # write does it once).
+    best_per_group = {} if light else _save_best_states_and_plots(df, out, args)
 
     # 4. REPORT.md
     summary = _write_report(df, undecodable, run_status, runs, beta_map, alpha_map,
                             contradictions, args, out, roots, front_summ, best_per_group)
-    print(f"[outputs] wrote {out}/REPORT.md, all_solutions.parquet, "
-          f"pareto_fronts/, best_states/, undecodable.csv, plots/")
+    if not light:
+        print(f"[outputs] wrote {out}/REPORT.md, all_solutions.parquet, "
+              f"pareto_fronts/, best_states/, undecodable.csv, plots/")
     return summary
 
 
@@ -1178,6 +1231,10 @@ def build_argparser():
     ap.add_argument("--limit", type=int, default=0, help="cap #runs processed (smoke runs)")
     ap.add_argument("--max-per-group", type=int, default=0, dest="max_per_group",
                     help="keep only the newest N runs of each (root, group); 0 = all")
+    ap.add_argument("--resume", action="store_true",
+                    help="reload <out>/_runs.jsonl + _rows.jsonl and skip finished runs")
+    ap.add_argument("--flush-every", type=int, default=200, dest="flush_every",
+                    help="write partial deliverables every N runs (0 = only at the end)")
     ap.add_argument("--progress-every", type=int, default=10, dest="progress_every")
     ap.add_argument("--out", default="recompute/")
     ap.add_argument("--debug", action="store_true")
