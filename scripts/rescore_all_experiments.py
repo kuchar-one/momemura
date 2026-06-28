@@ -537,12 +537,15 @@ def expectation(psi, O):
 # --------------------------------------------------------------------------- #
 # discovery                                                                     #
 # --------------------------------------------------------------------------- #
-def discover_runs(roots, group_glob, max_per_group=0):
+def discover_runs(roots, group_glob, max_per_group=0, exclude_globs=None):
     """Yield (root, group, run, pkl_path) for every results.pkl, sorted.
     ``max_per_group`` (>0) keeps only the newest N runs of each (root, group) --
     a deterministic way to spread a bounded smoke run across many targets instead
-    of front-loading one big group (which is what --limit alone does)."""
+    of front-loading one big group (which is what --limit alone does).
+    ``exclude_globs`` drops any group matching any of those fnmatch patterns (so
+    the bulk run can skip groups handled separately at a higher cutoff)."""
     import fnmatch
+    exclude_globs = exclude_globs or []
     runs = []
     for root in roots:
         rabs = root if os.path.isabs(root) else os.path.join(REPO, root)
@@ -552,6 +555,8 @@ def discover_runs(roots, group_glob, max_per_group=0):
             run = os.path.basename(os.path.dirname(pkl))
             group = os.path.basename(os.path.dirname(os.path.dirname(pkl)))
             if group_glob and not fnmatch.fnmatch(group, group_glob):
+                continue
+            if any(fnmatch.fnmatch(group, ex) for ex in exclude_globs):
                 continue
             runs.append((root, group, run, pkl))
     runs.sort(key=lambda r: (r[0], r[1], r[2]))
@@ -580,7 +585,7 @@ def run_sweep(args):
     os.makedirs(out, exist_ok=True)
 
     t_start = time.time()
-    runs = discover_runs(roots, args.groups, args.max_per_group)
+    runs = discover_runs(roots, args.groups, args.max_per_group, args.exclude_groups)
     if args.limit and args.limit > 0:
         runs = runs[: args.limit]
     print(f"[discover] {len(runs)} runs under roots={roots} groups={args.groups!r}"
@@ -1149,6 +1154,8 @@ def build_argparser():
     ap.add_argument("--roots", nargs="+", default=DEFAULT_ROOTS,
                     help="run roots (each a <root>/<group>/<run>/results.pkl tree)")
     ap.add_argument("--groups", default="*", help="group-name glob filter (fnmatch)")
+    ap.add_argument("--exclude-groups", nargs="+", default=[], dest="exclude_groups",
+                    help="drop groups matching any of these fnmatch patterns")
     ap.add_argument("--l-search", type=int, default=50, dest="l_search")
     ap.add_argument("--bf-search", type=int, default=1024, dest="bf_search")
     ap.add_argument("--l-high", type=int, default=120, dest="l_high")
