@@ -12,3 +12,6 @@ profiles/
 .DS_Store
 output_backup_*
 *experiments/
+# rescore archaeology: keep REPORT.md + CSVs + json, omit large binaries
+recompute/all_solutions.parquet
+recompute/**/*.npy

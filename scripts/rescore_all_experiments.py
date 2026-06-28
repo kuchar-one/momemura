@@ -391,6 +391,25 @@ class RescoreEngine:
         return np.asarray(cov, float), np.asarray(mu, float), np.asarray(eff, float)
 
 
+# one compiled engine per decoder bucket, reused across the sweep AND the
+# best-state dump (avoids recompiling per group at output time).
+_ENGINE_CACHE = {}
+
+
+def engine_key(design, depth, maxf, cfg):
+    return (design, int(depth), int(cfg.get("modes") or 3), int(cfg.get("pnr_max") or 3),
+            round(float(cfg.get("r_scale", 2.0)), 6), round(float(cfg.get("d_scale", 3.0)), 6),
+            round(float(cfg.get("hx_scale", 4.0)), 6), round(float(cfg.get("window", 0.1)), 6),
+            int(maxf), int(cfg.get("cutoff") or 30))
+
+
+def get_engine(design, depth, maxf, cfg):
+    key = engine_key(design, depth, maxf, cfg)
+    if key not in _ENGINE_CACHE:
+        _ENGINE_CACHE[key] = RescoreEngine(design, depth, maxf, cfg)
+    return _ENGINE_CACHE[key]
+
+
 # --------------------------------------------------------------------------- #
 # Wigner negative volume via displaced parity (PROMPT s5, no qutip)            #
 # --------------------------------------------------------------------------- #
@@ -412,15 +431,21 @@ def wigner_negative_volume(psi, grid=25, span=5.0, pad=None, return_grid=False):
         out = (0.0, None, None, None) if return_grid else 0.0
         return out
     psi = psi / nrm
-    # working dim: state support + headroom for the largest displacement (|z|^2 ~ span^2)
+    # Working dim = state support + headroom for the largest displacement.  The
+    # displaced-parity expm is unitary only on a basis big enough to hold
+    # D(z)|psi> for |z| up to ~span (z=(x+ip)/sqrt2 => max|z|=span); too small a
+    # dim leaks norm at the top and fakes ~1e-2 of spurious negativity.  We PAD
+    # with zeros (never truncate) so the floor on Gaussian states stays ~1e-8.
     prob = np.abs(psi) ** 2
     csum = np.cumsum(prob)
     supp = int(np.searchsorted(csum, csum[-1] * (1 - 1e-10))) + 1
     if pad is None:
-        pad = int(span * span) + 30
-    dim = min(len(psi), supp + pad)
-    psi = psi[:dim].copy()
-    psi = psi / np.linalg.norm(psi)
+        pad = int((span + 3.0) ** 2) + 10
+    dim = supp + pad
+    work = np.zeros(dim, dtype=complex)
+    n_copy = min(dim, len(psi))
+    work[:n_copy] = psi[:n_copy]
+    psi = work / np.linalg.norm(work)
 
     sq = np.sqrt(np.arange(1, dim))
     a = diags(sq, 1, format="csc")          # annihilation: a[n-1,n]=sqrt(n)
@@ -512,8 +537,11 @@ def expectation(psi, O):
 # --------------------------------------------------------------------------- #
 # discovery                                                                     #
 # --------------------------------------------------------------------------- #
-def discover_runs(roots, group_glob):
-    """Yield (root, group, run, pkl_path) for every results.pkl, sorted."""
+def discover_runs(roots, group_glob, max_per_group=0):
+    """Yield (root, group, run, pkl_path) for every results.pkl, sorted.
+    ``max_per_group`` (>0) keeps only the newest N runs of each (root, group) --
+    a deterministic way to spread a bounded smoke run across many targets instead
+    of front-loading one big group (which is what --limit alone does)."""
     import fnmatch
     runs = []
     for root in roots:
@@ -527,6 +555,15 @@ def discover_runs(roots, group_glob):
                 continue
             runs.append((root, group, run, pkl))
     runs.sort(key=lambda r: (r[0], r[1], r[2]))
+    if max_per_group and max_per_group > 0:
+        seen = Counter()
+        kept = []
+        for r in sorted(runs, key=lambda r: (r[0], r[1], r[2]), reverse=True):  # newest first
+            key = (r[0], r[1])
+            if seen[key] < max_per_group:
+                seen[key] += 1
+                kept.append(r)
+        runs = sorted(kept, key=lambda r: (r[0], r[1], r[2]))
     return runs
 
 
@@ -543,7 +580,7 @@ def run_sweep(args):
     os.makedirs(out, exist_ok=True)
 
     t_start = time.time()
-    runs = discover_runs(roots, args.groups)
+    runs = discover_runs(roots, args.groups, args.max_per_group)
     if args.limit and args.limit > 0:
         runs = runs[: args.limit]
     print(f"[discover] {len(runs)} runs under roots={roots} groups={args.groups!r}"
@@ -566,7 +603,6 @@ def run_sweep(args):
     if contradictions:
         print(f"[targets] WARNING contradictions: {contradictions}")
 
-    engines = {}        # bucket-key -> RescoreEngine
     rows = []           # per re-scored cell
     undecodable = []    # per non-rescored run
     run_status = []     # ledger: one row per run
@@ -616,14 +652,8 @@ def run_sweep(args):
             continue
 
         maxf = int(cfg.get("moment_maxf") or args.maxf)
-        bkey = (design, depth, int(cfg.get("modes") or 3), int(cfg.get("pnr_max") or 3),
-                round(float(cfg.get("r_scale", 2.0)), 6), round(float(cfg.get("d_scale", 3.0)), 6),
-                round(float(cfg.get("hx_scale", 4.0)), 6), round(float(cfg.get("window", 0.1)), 6),
-                maxf, int(cfg.get("cutoff") or 30))
         try:
-            if bkey not in engines:
-                engines[bkey] = RescoreEngine(design, depth, maxf, cfg)
-            eng = engines[bkey]
+            eng = get_engine(design, depth, maxf, cfg)
         except Exception as e:  # noqa: BLE001
             undecodable.append({**prov, "status": "undecodable",
                                 "reason": f"engine_build:{type(e).__name__}:{str(e)[:60]}",
@@ -756,19 +786,24 @@ def _rescore_run(eng, gen, fit, des, sel, args, a, b, glim, gs_eig, O_hi, O_lo,
         vs_gs = exp_hi - gs_eig
         vs_gaussian = exp_hi - glim
 
-        # ---- Hudson / Wigner gate: only suspicious sub-Gaussian rows need it ----
+        # ---- artifact filters (PROMPT s5) ----
+        # The Hudson/Wigner gate is the only expensive filter (625 expm_multiply),
+        # and it only matters when a cell CLAIMS a sub-Gaussian advantage AND would
+        # otherwise be valid.  So classify with the cheap filters first; only then,
+        # if the cell still looks like a genuine sub-Gaussian optimum, spend the
+        # Wigner negativity check (Hudson: a real sub-Gaussian pure state must be
+        # Wigner-negative; a positive one is a numerical ghost -> fake_subgaussian).
+        kw = dict(exp_lo=exp_lo, exp_hi=exp_hi, P=P, herald_norm=herald_norm,
+                  fired_modes=fired_modes, fp_budget=fp_budget,
+                  indep_fidelity=indep_fidelity, gaussian_limit=glim,
+                  tol=args.tol, neg_tol=args.neg_tol, margin=args.margin,
+                  bf_high=args.bf_high, maxf=maxf, has_fidelity=(j in sub_idx))
         wig = np.nan
         claims_subgaussian = exp_hi < (glim - args.margin)
-        if claims_subgaussian:
+        is_artifact, reasons = classify_artifact(wigner_negvol=np.nan, **kw)
+        if claims_subgaussian and not is_artifact:
             wig = wigner_negative_volume(ph, grid=args.wigner_grid, span=args.wigner_span)
-
-        # ---- artifact filters (PROMPT s5) ----
-        is_artifact, reasons = classify_artifact(
-            exp_lo=exp_lo, exp_hi=exp_hi, P=P, herald_norm=herald_norm,
-            fired_modes=fired_modes, fp_budget=fp_budget,
-            indep_fidelity=indep_fidelity, wigner_negvol=wig, gaussian_limit=glim,
-            tol=args.tol, neg_tol=args.neg_tol, margin=args.margin,
-            bf_high=args.bf_high, maxf=maxf, has_fidelity=(j in sub_idx))
+            is_artifact, reasons = classify_artifact(wigner_negvol=wig, **kw)
 
         rows.append(dict(
             **prov, cell_idx=int(k), design=eng.design, depth=int(depth),
@@ -934,7 +969,7 @@ def _dump_best_state(best, gdir, args):
     design = cfg.get("genotype") or parse_group_name(best["group"])["design"]
     depth = int(best["depth"])
     maxf = int(cfg.get("moment_maxf") or args.maxf)
-    eng = RescoreEngine(design, depth, maxf, cfg)
+    eng = get_engine(design, depth, maxf, cfg)
     a = complex(best["target_alpha"]); b = complex(best["target_beta"])
     psi, prob, eff, _na = eng.score(g[None], args.l_high, args.bf_high)
     psi = psi[0]
@@ -1134,6 +1169,8 @@ def build_argparser():
     ap.add_argument("--wigner-span", type=float, default=5.0, dest="wigner_span")
     ap.add_argument("--csv-sample", type=int, default=4000, dest="csv_sample")
     ap.add_argument("--limit", type=int, default=0, help="cap #runs processed (smoke runs)")
+    ap.add_argument("--max-per-group", type=int, default=0, dest="max_per_group",
+                    help="keep only the newest N runs of each (root, group); 0 = all")
     ap.add_argument("--progress-every", type=int, default=10, dest="progress_every")
     ap.add_argument("--out", default="recompute/")
     ap.add_argument("--debug", action="store_true")

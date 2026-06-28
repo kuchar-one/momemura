@@ -1,0 +1,18 @@
+{
+ "exp_hi": 1.0722013415837355,
+ "exp_stored": 1.072271591973972,
+ "prob": 1.0,
+ "logP": 0.0,
+ "vs_gaussian": 0.07220134158373548,
+ "vs_gs": 0.9670470396737944,
+ "total_photons": 0.0,
+ "fired_modes": 0.0,
+ "max_pnr": 0.0,
+ "wigner_negvol": NaN,
+ "indep_fidelity": 1.0000000000000004,
+ "root": "experiments",
+ "run": "20260514-100523_p64_i2500",
+ "cell_idx": 250.0,
+ "target_alpha": "(1+0j)",
+ "target_beta": "(1+1j)"
+}

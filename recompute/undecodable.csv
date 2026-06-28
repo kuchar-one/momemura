@@ -1,0 +1,3 @@
+root,group,run,status,reason,n_cells
+output_oldold/experiments,00B_c30_a2p73_b1p41,20260628-092342_p32_i2500,unloadable,UnpicklingError:pickle data was truncated,0
+output_oldold/experiments,00B_c30_a2p73_b1p41,20260628-094401_p32_i2500,unloadable,UnpicklingError:pickle data was truncated,0
