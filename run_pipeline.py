@@ -207,6 +207,13 @@ def main():
           f"non-Gaussian reward {ng_max:.2f}->0)")
     print("=" * 60)
 
+    # PIPELINE_QDAX_FIRST=1 runs the exploratory QDAX MOME phase BEFORE the
+    # single-objective phase, so the single-obj runs seed from a diverse archive
+    # of firing structures the emitter found (instead of the single-obj -- which
+    # cannot explore firing at all -- going first from cold). Pair with
+    # STAGNATION_LIMIT=<large> / WATCHDOG_START_LONG=1 for restart-free exploration.
+    qdax_first = os.environ.get("PIPELINE_QDAX_FIRST", "0") == "1"
+
     for i, alpha_p in enumerate(alpha_probs):
         alpha_e = 1.0 - alpha_p
         alpha_ng = float(alpha_ngs[i])
@@ -214,74 +221,50 @@ def main():
         desc = f"Split {i + 1}/{STEPS}: Exp={alpha_e:.1f}, Prob={alpha_p:.1f}, NG={alpha_ng:.2f}"
         print(f"\n[Pipeline] === Starting {desc} ===\n")
 
-        # --- Phase 1: Single Objective (Parallel) ---
-        print(
-            f"[Pipeline] Launching {num_parallel} {'Parallel' if num_parallel > 1 else 'Single'} Single-Objective Run(s)..."
-        )
+        def run_single_phase():
+            print(
+                f"[Pipeline] Launching {num_parallel} "
+                f"{'Parallel' if num_parallel > 1 else 'Single'} Single-Objective Run(s)..."
+            )
+            single_obj_args = base_mome_args + [
+                "--mode", "single",
+                "--alpha-expectation", str(alpha_e),
+                "--alpha-probability", str(alpha_p),
+                "--alpha-nongauss", str(alpha_ng),
+                "--global-seed-scan",
+            ]
+            process_info_list = []
+            for k in range(num_parallel):
+                worker_seed = int(time.time()) + i * 100 + k
+                worker_args = list(single_obj_args)
+                if "--seed" in worker_args:
+                    try:
+                        idx = worker_args.index("--seed")
+                        worker_args.pop(idx); worker_args.pop(idx)
+                    except Exception:
+                        pass
+                worker_args.extend(["--seed", str(worker_seed)])
+                proc_tuple = run_watchdog_command(worker_args, f"step_{i}_single_{k}")
+                process_info_list.append(proc_tuple)
+                time.sleep(10)  # unique output-dir timestamps
+            print("[Pipeline] Streaming output for Single Objective runs...")
+            monitor_processes(process_info_list)
+            print("[Pipeline] Single Objective Phase Complete.")
 
-        current_processes = []
-        process_info_list = []
-        skip_requested = False
+        def run_qdax_phase():
+            print("\n[Pipeline] Launching QDAX MOME Run...")
+            qdax_args = base_mome_args + ["--mode", "qdax", "--global-seed-scan",
+                                          "--alpha-nongauss", str(alpha_ng)]
+            proc_tuple = run_watchdog_command(qdax_args, f"step_{i}_qdax")
+            monitor_processes([proc_tuple])
+            print("[Pipeline] QDAX Phase Complete.")
 
-        single_obj_args = base_mome_args + [
-            "--mode",
-            "single",
-            "--alpha-expectation",
-            str(alpha_e),
-            "--alpha-probability",
-            str(alpha_p),
-            "--alpha-nongauss",
-            str(alpha_ng),
-            "--global-seed-scan",
-        ]
-
-        for k in range(num_parallel):
-            # Unique Seed Logic
-            worker_seed = int(time.time()) + i * 100 + k
-            worker_args = list(single_obj_args)
-            if "--seed" in worker_args:
-                try:
-                    idx = worker_args.index("--seed")
-                    worker_args.pop(idx)
-                    worker_args.pop(idx)
-                except Exception:
-                    pass
-            worker_args.extend(["--seed", str(worker_seed)])
-
-            proc_tuple = run_watchdog_command(worker_args, f"step_{i}_single_{k}")
-            process_info_list.append(proc_tuple)
-            current_processes.append(proc_tuple[0])
-
-            # Add delay to ensure unique timestamps for output directories
-            time.sleep(10)
-
-        # Monitor Parallel Process
-        print("[Pipeline] Streaming output for Single Objective runs...")
-        monitor_processes(process_info_list)
-        print("[Pipeline] Single Objective Phase Complete.")
-
-        if skip_requested:
-            print("[Pipeline] Resume normal flow after skip.")
-            skip_requested = False
-
-        # --- Phase 2: QDAX MOME ---
-        print("\n[Pipeline] Launching QDAX MOME Run...")
-
-        qdax_args = base_mome_args + ["--mode", "qdax", "--global-seed-scan",
-                                      "--alpha-nongauss", str(alpha_ng)]
-
-        current_processes = []
-        proc_tuple = run_watchdog_command(qdax_args, f"step_{i}_qdax")
-        current_processes.append(proc_tuple[0])
-
-        # Monitor Sequential Process
-        monitor_processes([proc_tuple])
-
-        print("[Pipeline] QDAX Phase Complete.")
-
-        if skip_requested:
-            print("[Pipeline] Resume normal flow after skip.")
-            skip_requested = False
+        if qdax_first:
+            run_qdax_phase()
+            run_single_phase()
+        else:
+            run_single_phase()
+            run_qdax_phase()
 
     print("\n[Pipeline] All Steps Completed.")
 

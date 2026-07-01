@@ -7,10 +7,16 @@ import signal
 import fcntl
 import select
 
-# Logic Configuration
-STAGNATION_LIMIT = 500  # Iterations without improvement to trigger restart
+# Logic Configuration (env-overridable for exploratory long runs)
+#   STAGNATION_LIMIT: iters w/o improvement before a SHORT run is killed+restarted.
+#     Set very high (e.g. 100000) for restart-free long exploration -- exploitation
+#     via restart hurts when the goal is to explore the discrete firing space, and
+#     every restart also re-pays the ~3min depth-5 compile.
+#   WATCHDOG_START_LONG=1: begin in LONG mode (no stagnation kill) straight away.
+STAGNATION_LIMIT = int(os.environ.get("STAGNATION_LIMIT", 500))
 POLL_INTERVAL = 1.0  # Seconds
-CONSECUTIVE_NO_GAINS_LIMIT = 2  # Threshold to switch to Long Run
+CONSECUTIVE_NO_GAINS_LIMIT = int(os.environ.get("CONSECUTIVE_NO_GAINS_LIMIT", 2))
+START_LONG = os.environ.get("WATCHDOG_START_LONG", "0") == "1"
 
 
 def set_non_blocking(fd):
@@ -165,7 +171,8 @@ def main():
     while True:
         # Determine Run Type
         run_type = (
-            "LONG" if consecutive_no_gains >= CONSECUTIVE_NO_GAINS_LIMIT else "SHORT"
+            "LONG" if (START_LONG or consecutive_no_gains >= CONSECUTIVE_NO_GAINS_LIMIT)
+            else "SHORT"
         )
 
         print("\n" + "=" * 60)

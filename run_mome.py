@@ -85,6 +85,24 @@ try:
     # Limit memory growth to avoid OOM on large batches
     # os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
 
+    # PERSISTENT COMPILATION CACHE: the depth-5 moment scorer takes ~3 min to
+    # compile, and the watchdog spawns a FRESH process on every stagnation-restart
+    # -> that 3 min is paid again and again.  Cache compiled executables to disk so
+    # the first run compiles once and every restart / future run with the same
+    # shapes reuses it (the parallelism XLA flag can't help -- HLO passes are
+    # serial).  Dir overridable via JAX_COMPILATION_CACHE_DIR.
+    try:
+        _cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR",
+                                    os.path.join(os.getcwd(), ".jax_cache"))
+        os.makedirs(_cache_dir, exist_ok=True)
+        jax.config.update("jax_compilation_cache_dir", _cache_dir)
+        # cache even fast-to-compile modules; persist across processes
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+        print(f"JAX persistent compilation cache: {_cache_dir}")
+    except Exception as _e:
+        print(f"(compilation cache unavailable: {_e})")
+
     import jax.numpy as jnp
 except ImportError:
     jax = None
@@ -849,7 +867,7 @@ def run(
             genotype, depth=depth_val, config=genotype_config
         )
         if len(vacuum) == D:
-            genotypes = genotypes.at[0].set(vacuum)
+            genotypes = genotypes.at[0].set(jnp.asarray(vacuum, dtype=genotypes.dtype))
             print("  - Injected Vacuum State at index 0")
 
         # 2. Result Scanning
@@ -898,7 +916,8 @@ def run(
                             config=genotype_config,
                         )
                     if len(g_new) == D:
-                        genotypes = genotypes.at[idx].set(g_new)
+                        genotypes = genotypes.at[idx].set(
+                            jnp.asarray(g_new, dtype=genotypes.dtype))
                         idx += 1
                         injected_count += 1
                 except Exception:
@@ -1163,6 +1182,21 @@ def run(
             maxval=5.0,
             proportion_to_mutate=0.3,  # Mutate 30% of genes (was 0.9)
         )
+        # STRUCTURE-EXPLORATION mutation: big jumps that actually cross the decoder's
+        # round() thresholds on pnr / n_ctrl / active, so the exploration stream
+        # changes the DISCRETE firing pattern instead of only fine-tuning continuous
+        # params. The non-Gaussian advantage needs firing detections, and firing is a
+        # discrete choice with ZERO gradient -- so if the emitter never flips it, the
+        # search is frozen at the no-fire Gaussian (exactly the "stuck above the
+        # limit" symptom). Tunable via EXPLORE_ETA (lower = bigger jumps) / EXPLORE_PROP.
+        _expl_eta = float(os.environ.get("EXPLORE_ETA", 2.0))
+        _expl_prop = float(os.environ.get("EXPLORE_PROP", 0.6))
+        explore_mutation = partial(
+            polynomial_mutation, eta=_expl_eta, minval=-5.0, maxval=5.0,
+            proportion_to_mutate=_expl_prop,
+        )
+        print(f"  - Exploration mutation: eta={_expl_eta} prop={_expl_prop} "
+              f"(structure-flipping); elite mutation: eta=10.0 (fine)")
 
         # Grid-based Centroids MOVED TO SHARED INITIALIZATION
         # (Lines 919-985 migrated to lines 790+)
@@ -1199,9 +1233,9 @@ def run(
 
         elif emitter_type == "hybrid":
             print(f"  - Strategy: Hybrid (Uniform + Elite) | Ratio: {hybrid_ratio}")
-            # 1. Exploration (Standard)
+            # 1. Exploration (Standard) -- STRONG structure-flipping mutation
             exploration_emitter = MixingEmitter(
-                mutation_fn=mutation_function,
+                mutation_fn=explore_mutation,
                 variation_fn=crossover_function,
                 variation_percentage=0.5,
                 batch_size=emitter_batch_size,  # HybridEmitter will resize this
@@ -1243,9 +1277,9 @@ def run(
 
         elif emitter_type == "hybrid-gradient":
             print("  - Strategy: Hybrid Gradient (Standard + OMG-MEGA)")
-            # 1. Exploration (Standard)
+            # 1. Exploration (Standard) -- STRONG structure-flipping mutation
             exploration_emitter = MixingEmitter(
-                mutation_fn=mutation_function,
+                mutation_fn=explore_mutation,
                 variation_fn=crossover_function,
                 variation_percentage=0.5,
                 batch_size=emitter_batch_size,

@@ -168,19 +168,23 @@ def scan_results_for_seeds(
             remainder = top_k - n_pareto
 
             if remainder > 0:
+                # DIVERSE top-up: sample from a BROAD pool (default top 50%, env
+                # SEED_POOL_FRAC) instead of the top 10% by expectation. Seeding only
+                # from the very-lowest-<O> points concentrates the search on one
+                # (usually Gaussian) basin; a wide spread of "interesting" points
+                # gives the emitter varied firing structures to build on.
+                import os as _os
+                pool_frac = float(_os.environ.get("SEED_POOL_FRAC", 0.5))
                 print(
-                    f"Need {remainder} more seeds. Sampling from Top 10% (by Expectation)..."
+                    f"Need {remainder} more seeds. Sampling from top {pool_frac*100:.0f}% "
+                    f"(diverse, by Expectation)..."
                 )
-                # Sort ALL candidates by Expectation (fit0)
-                # Filter out those already in Pareto?
-                # (Simple check: compare object id or duplicate check? candidates dicts are unique objects)
                 pareto_ids = {id(c) for c in pareto_front}
                 non_pareto = [c for c in candidates if id(c) not in pareto_ids]
 
                 non_pareto.sort(key=lambda x: x["fit0"], reverse=True)
 
-                # Top 10%
-                limit_idx = max(int(len(non_pareto) * 0.1), remainder)
+                limit_idx = max(int(len(non_pareto) * pool_frac), remainder)
                 top_pool = non_pareto[:limit_idx]
 
                 if top_pool:
