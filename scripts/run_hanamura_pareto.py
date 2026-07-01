@@ -142,10 +142,15 @@ def main(argv=None):
     from frontend import gbs_optimizer as go
     from frontend.gbs_optimizer import reduced_herald, decompose_architecture
 
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    # robust loader that recovers QDax MOME repertoires without qdax (the
+    # 'NEWOBJ class argument must be a type, not function' UnpicklingError) via a
+    # generic-type unpickler -- the same one the rescore used, so every run in the
+    # Pareto fronts is loadable here too.
+    from rescore_all_experiments import load_run_arrays
     # reduced_full_state needs gbs_optimizer internals; import lazily from the
     # thesis regenerator if available, else fall back to the architecture rule.
     try:
-        sys.path.insert(0, os.path.join(REPO, "scripts"))
         from gen_hanamura_data import reduced_full_state
     except Exception:
         reduced_full_state = None
@@ -157,11 +162,17 @@ def main(argv=None):
         key = (root, group, run)
         if key not in rep_cache:
             base = os.path.join(REPO, root, group, run)
-            rep = pr.load_repertoire(os.path.join(base, "results.pkl"))
-            cfg = json.load(open(os.path.join(base, "config.json")))
-            gens = np.asarray(rep.genotypes).reshape(-1, np.asarray(rep.genotypes).shape[-1])
-            rep_cache[key] = (gens, cfg)
-        return rep_cache[key]
+            try:
+                gens, _fit, _des = load_run_arrays(os.path.join(base, "results.pkl"))
+                cfg = json.load(open(os.path.join(base, "config.json")))
+                gens = np.asarray(gens).reshape(-1, np.asarray(gens).shape[-1])
+                rep_cache[key] = (gens, cfg, None)
+            except Exception as e:          # cache the failure so duplicate rows don't retry
+                rep_cache[key] = (None, None, e)
+        gens, cfg, err = rep_cache[key]
+        if err is not None:
+            raise err
+        return gens, cfg
 
     summary = []
     n_done = n_fail = 0
@@ -170,6 +181,9 @@ def main(argv=None):
         if not fnmatch.fnmatch(group, args.groups):
             continue
         df = pd.read_csv(csvf)
+        # the rescore Pareto CSVs contain duplicate rows -- one physical state per
+        # (root,run,cell_idx); process each once.
+        df = df.drop_duplicates(subset=["root", "run", "cell_idx"]).reset_index(drop=True)
         if args.top:
             df = df.nsmallest(args.top, "exp_hi")
         gdir = os.path.join(args.out, group)
@@ -181,6 +195,8 @@ def main(argv=None):
             tag = f"{r['run']}_cell{int(r['cell_idx'])}"
             try:
                 gens, cfg = load_run(r["root"], r["group"], r["run"])
+                if int(cfg.get("modes") or 3) != 3:
+                    raise ValueError("modes!=3 (static/Hanamura path is 3-modes/leaf only)")
                 g = gens[int(r["cell_idx"])].astype(np.float32)
                 depth = int(cfg.get("depth") or 3)
                 cutoff = int(cfg.get("cutoff") or 30)
@@ -275,6 +291,11 @@ def main(argv=None):
                     "sqdb_before": float(arch_before["max_squeezing_db"]),
                     "sqdb_after": (float(arch_after["max_squeezing_db"]) if arch_after else np.nan),
                     "negvol_before": negb, "negvol_after": nega,
+                    # han_valid=False marks the ill-conditioned high-squeezing
+                    # generators (Nc->Nc' reduction hits sqrt(c*d-1)<0), where the
+                    # optimized prob is nan -- expected per the Hanamura runbook.
+                    "han_valid": bool(han.get("prob_after") is not None
+                                      and np.isfinite(han.get("prob_after") or np.nan)),
                     "after_source": after_src, "provenance": rec["provenance"],
                 })
                 n_done += 1
