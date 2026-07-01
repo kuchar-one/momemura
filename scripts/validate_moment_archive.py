@@ -58,7 +58,8 @@ def main():
     from src.genotypes.genotypes import get_genotype_decoder
     from src.utils.result_manager import SimpleRepertoire
     from src.simulation.jax.moment_scorer import (
-        moment_operator, jax_equivalent_gaussian_static, jax_reduced_herald_static)
+        moment_operator, jax_equivalent_gaussian_static, jax_reduced_herald_static,
+        _leaf_prob_product_static)
 
     if args.path:
         pkl = args.path
@@ -112,7 +113,15 @@ def main():
         cs, ms, ep, _ = jax_equivalent_gaussian_static(p, depth)
         return jax_reduced_herald_static(cs, ms, ep, L, BF, depth, maxf)
 
+    @functools.partial(jax.jit, static_argnums=(1,))
+    def leaf_prob(g, L):
+        # exact 'leaf' herald probability (recovers the real value when the run
+        # used --moment-fast, which stores a prob=1 placeholder in obj1).
+        return _leaf_prob_product_static(dec.decode(g, base), L, depth)
+
     new_fit = fit.copy()
+    has_prob = new_fit.shape[1] > 1
+    n_probfix = 0
     n_art = 0
     worst = []
     for k in valid:
@@ -124,6 +133,12 @@ def main():
         exp_hi = float(np.real(np.vdot(psi_hi, O_hi[:len(psi_hi), :len(psi_hi)] @ psi_hi)))
         d = abs(exp_hi - exp_lo)
         new_fit[k, 0] = -exp_hi                      # archive now holds the exact value
+        if has_prob:
+            P = float(np.real(leaf_prob(g, args.l_high)))
+            log10P = float(np.log10(np.clip(P, 1e-45, 1.0)))
+            if abs(log10P - new_fit[k, 1]) > 1e-6:
+                n_probfix += 1
+            new_fit[k, 1] = log10P                   # refresh exact probability (obj1=log10 P)
         if d > args.tol or norm_lo < 0.99:
             n_art += 1
             new_fit[k, 0] = -np.inf                   # drop the artifact
@@ -136,6 +151,9 @@ def main():
     best_hi = float(np.min(-new_fit[np.isfinite(new_fit[:, 0]), 0])) if np.any(np.isfinite(new_fit[:, 0])) else float('nan')
     print(f"\nchecked {len(valid)} | low-L artifacts (|Δ<O>|>{args.tol} or norm<0.99): {n_art} "
           f"({100*n_art/max(len(valid),1):.1f}%)")
+    if has_prob:
+        print(f"probability objective refreshed on {n_probfix}/{len(valid)} cells "
+              f"(recovers real prob where --moment-fast stored a prob=1 placeholder)")
     print(f"best exact <O> after dropping artifacts: {best_hi:.4f}")
 
     if args.write:

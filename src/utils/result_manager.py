@@ -54,11 +54,13 @@ class OptimizationResult:
 
         # 1. Save Config (JSON)
         with open(path / "config.json", "w") as f:
-            # Filter non-serializable items if any
+            # Coerce non-JSON-native values (e.g. complex target_beta) to str
+            # rather than DROPPING them -- silently dropping target_beta is what
+            # left runs unverifiable (frontend/validator then default beta=0).
             safe_config = {
-                k: v
+                k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None)))
+                    else str(v))
                 for k, v in self.config.items()
-                if isinstance(v, (int, float, str, bool, list, dict, type(None)))
             }
             json.dump(safe_config, f, indent=4)
 

@@ -671,6 +671,13 @@ def run_sweep(args):
 
         # --- resolve target ---
         a, b, tsrc, treason = resolve_target(cfg, group, beta_map, alpha_map)
+        # explicit override (e.g. recover the magic state a2p73 whose configs
+        # dropped beta and whose alpha wasn't in the learned map): --force-alpha
+        # / --force-beta apply to every run this invocation touches.
+        if getattr(args, "force_alpha", None) is not None:
+            a = as_complex(args.force_alpha); tsrc = (tsrc or "") + "+force_alpha"; treason = None
+        if getattr(args, "force_beta", None) is not None:
+            b = as_complex(args.force_beta); tsrc = (tsrc or "") + "+force_beta"; treason = None
         if a is None:
             _emit({**prov, "status": "undecodable", "reason": treason,
                    "n_cells": int(gen.shape[0])})
@@ -1223,6 +1230,10 @@ def build_argparser():
     ap.add_argument("--roots", nargs="+", default=DEFAULT_ROOTS,
                     help="run roots (each a <root>/<group>/<run>/results.pkl tree)")
     ap.add_argument("--groups", default="*", help="group-name glob filter (fnmatch)")
+    ap.add_argument("--force-alpha", default=None, dest="force_alpha",
+                    help="override resolved target alpha for ALL runs this invocation (e.g. 2.7320508)")
+    ap.add_argument("--force-beta", default=None, dest="force_beta",
+                    help="override resolved target beta for ALL runs this invocation (e.g. 1+1j)")
     ap.add_argument("--exclude-groups", nargs="+", default=[], dest="exclude_groups",
                     help="drop groups matching any of these fnmatch patterns")
     ap.add_argument("--l-search", type=int, default=50, dest="l_search")
