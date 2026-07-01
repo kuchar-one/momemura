@@ -1937,10 +1937,16 @@ def run(
 
         # Inject Global Best if available
         if global_best_genotype is not None:
-            # Explicitly re-evaluate global best to ensure correct matching data (deterministic)
+            # Re-evaluate the global best at the SAME batch width as the loop so we
+            # REUSE the already-compiled scoring graph. Scoring a lone (1, D) batch
+            # is a new shape -> a full depth-5 recompile (~3 min) on every save;
+            # on a watchdog interrupt that can exceed the 600s save timeout, the
+            # process is SIGKILLed before results.pkl is written, and the next run
+            # then finds "no candidates" to seed from. Padding to pop_size avoids it.
             gb_in = global_best_genotype[None, :]
-            gb_f, gb_d, _ = jax_scoring_fn_batch(
-                gb_in,
+            gb_pad = jnp.broadcast_to(gb_in, (pop_size, gb_in.shape[1]))
+            gb_f_all, gb_d_all, _ = jax_scoring_fn_batch(
+                gb_pad,
                 cutoff,
                 jnp.array(operator),
                 genotype_name=genotype,
@@ -1948,11 +1954,13 @@ def run(
                 correction_cutoff=correction_cutoff,
                 pnr_max=int(genotype_config.get("pnr_max", 3)),
             )
+            gb_f = np.array(gb_f_all[:1])
+            gb_d = np.array(gb_d_all[:1])
 
             # Append to results
             g_final = np.concatenate([g_final, np.array(gb_in)], axis=0)
-            f_final = np.concatenate([f_final, np.array(gb_f)], axis=0)
-            d_final = np.concatenate([d_final, np.array(gb_d)], axis=0)
+            f_final = np.concatenate([f_final, gb_f], axis=0)
+            d_final = np.concatenate([d_final, gb_d], axis=0)
             print(
                 f"Injected Global Best (Exp: {global_best_exp:.6f}) into final results."
             )
