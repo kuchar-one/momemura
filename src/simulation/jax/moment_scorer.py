@@ -1087,15 +1087,52 @@ def _effective_photons_static(cov_k, eff_pnr, eps, depth: int = 3):
     return n_eff, max_eff
 
 
+def _nongaussianity_delta(psi):
+    """Relative-entropy non-Gaussianity delta = g(nu) of a single-mode PURE state
+    ``psi`` (Fock amplitudes).  nu = sqrt(det(cov)) is the symplectic eigenvalue of
+    the state's 2x2 covariance (hbar=2 => vacuum cov = I, nu = 1).  A pure state is
+    Gaussian iff nu = 1 (delta = 0); non-Gaussian => nu > 1, delta = g(nu) > 0
+    (= S(rho_Gaussian-reference), since S(pure)=0).  Cheap (2nd moments only) and
+    DIFFERENTIABLE, so it can drive the gradient emitter.  This is a resource
+    proxy for exploration ONLY -- it never enters the stored fitness/<O>.
+
+      g(x) = ((x+1)/2) log2((x+1)/2) - ((x-1)/2) log2((x-1)/2)
+    """
+    L = psi.shape[0]
+    cdt = psi.dtype
+    p = jnp.abs(psi) ** 2
+    nbar = jnp.sum(jnp.arange(L).astype(jnp.float64) * p)              # <a†a>
+    sq1 = jnp.sqrt(jnp.arange(1, L).astype(jnp.float64)).astype(cdt)
+    mean_a = jnp.sum(jnp.conj(psi[:-1]) * psi[1:] * sq1)               # <a>
+    sq2 = jnp.sqrt((jnp.arange(1, L - 1) * jnp.arange(2, L)).astype(jnp.float64)).astype(cdt)
+    mean_a2 = jnp.sum(jnp.conj(psi[:-2]) * psi[2:] * sq2)              # <a^2>
+    re_a, im_a = jnp.real(mean_a), jnp.imag(mean_a)
+    re_a2, im_a2 = jnp.real(mean_a2), jnp.imag(mean_a2)
+    # x = a + a†, p = -i(a - a†); hbar=2 (vacuum <x^2>=<p^2>=1)
+    mean_x, mean_p = 2.0 * re_a, 2.0 * im_a
+    xx = 2.0 * re_a2 + 2.0 * nbar + 1.0
+    pp = -2.0 * re_a2 + 2.0 * nbar + 1.0
+    xp = 2.0 * im_a2                                                   # (1/2)<{x,p}>
+    sxx = xx - mean_x ** 2
+    spp = pp - mean_p ** 2
+    sxp = xp - mean_x * mean_p
+    det = sxx * spp - sxp ** 2
+    nu = jnp.sqrt(jnp.maximum(det, 1.0))          # uncertainty floor det>=1 (hbar=2)
+    a = (nu + 1.0) / 2.0
+    b = (nu - 1.0) / 2.0
+    return a * jnp.log2(a) - jnp.where(b > 1e-12, b * jnp.log2(jnp.maximum(b, 1e-300)), 0.0)
+
+
 @_partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
 def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
                           base_cutoff, L, floats):
     """ONE-compile vmap'd moment scorer over a population (no per-structure
     recompile).  Returns (fitnesses[N,4], descriptors[N,3], gradients[N,D],
     raw_exp[N], joint_prob[N])."""
-    gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps = floats
+    gs_eig, gaussian_limit, w_exp, w_prob, coupling_eps, w_ng = floats
     cfg = dict(config_hashable)
     depth = int(cfg.get("depth", 3))
+    ng_desc = bool(cfg.get("moment_ng_descriptor", False))  # non-Gaussianity as MAP-Elites axis
     maxf = int(cfg.get("moment_maxf", MOMENT_MAXF))     # in-graph fired-mode cap
     # gradient checkpointing (rematerialisation): recompute the per-genotype
     # forward during backward instead of storing it.  ~2x compute, big peak-VRAM
@@ -1151,18 +1188,29 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
         d_e = w_exp * jnp.abs(exp_val - (gs_eig - eps0))
         d_p = w_prob * jnp.abs(log_prob - (-eps0))
         loss_val = jnp.maximum(d_e, d_p) + 0.01 * (d_e + d_p)
+        # ANNEALED non-Gaussianity exploration reward: subtract w_ng*delta from the
+        # OPTIMIZATION objective only, so the gradient is pushed toward Wigner-
+        # negative (non-Gaussian) states and out of the Gaussian basin. w_ng is
+        # annealed to 0 by the pipeline. CRITICAL: this touches ONLY loss_opt (the
+        # gradient); final_exp/raw_exp/fit[:,0] remain the TRUE <O>, so the archive
+        # and every reported value are unaffected by the reward.
+        delta_ng = jnp.where(valid, _nongaussianity_delta(psi), 0.0)
+        loss_opt = loss_val - w_ng * delta_ng
         final_exp = jnp.where(valid, raw_exp, jnp.inf) + art
         aux = dict(final_exp=final_exp, log_prob=log_prob, active=active_modes,
-                   max_pnr=max_eff, photons=n_eff, raw_exp=raw_exp, joint_prob=joint_prob)
-        return jnp.real(loss_val), aux
+                   max_pnr=max_eff, photons=n_eff, raw_exp=raw_exp, joint_prob=joint_prob,
+                   delta_ng=delta_ng)
+        return jnp.real(loss_opt), aux
 
     loss_fn = jax.checkpoint(loss) if remat else loss
     (_lv, aux), grad = jax.vmap(jax.value_and_grad(loss_fn, has_aux=True))(genotypes)
-    ones = jnp.ones_like(aux["log_prob"])
     fit = jnp.stack([-aux["final_exp"], -aux["log_prob"],
                      -aux["active"], -aux["photons"]], axis=1)
-    desc = jnp.stack([aux["active"], aux["max_pnr"], aux["photons"]], axis=1)
-    return fit, desc, grad, aux["raw_exp"], aux["joint_prob"]
+    desc_axes = [aux["active"], aux["max_pnr"], aux["photons"]]
+    if ng_desc:                                   # optional 4th MAP-Elites axis
+        desc_axes.append(aux["delta_ng"])
+    desc = jnp.stack(desc_axes, axis=1)
+    return fit, desc, grad, aux["raw_exp"], aux["joint_prob"], aux["delta_ng"]
 
 
 def _default_moment_chunk(depth: int, npop: int) -> int:
@@ -1192,7 +1240,8 @@ def moment_score_population_static(genotypes, operator_L, genotype_name,
     w_exp = float(cfg.get("alpha_expectation", 1.0))
     w_prob = float(cfg.get("alpha_probability", 0.0))
     coupling_eps = float(cfg.get("coupling_eps", 0.05))
-    floats = (float(gs_eig), float(gaussian_limit), w_exp, w_prob, coupling_eps)
+    w_ng = float(cfg.get("alpha_nongauss", 0.0))    # annealed non-Gaussianity reward
+    floats = (float(gs_eig), float(gaussian_limit), w_exp, w_prob, coupling_eps, w_ng)
     g_all = jnp.asarray(genotypes)
     Npop = int(g_all.shape[0])
 
@@ -1206,27 +1255,30 @@ def moment_score_population_static(genotypes, operator_L, genotype_name,
                                      floats)
 
     if chunk >= Npop:
-        f, d, gr, re, jp = _run(g_all)
+        f, d, gr, re, jp, dng = _run(g_all)
     else:
         n_chunks = (Npop + chunk - 1) // chunk
         pad = n_chunks * chunk - Npop
         gp = g_all if pad == 0 else jnp.concatenate(
             [g_all, jnp.broadcast_to(g_all[-1:], (pad,) + g_all.shape[1:])], axis=0)
-        fs, ds, grs, res, jps = [], [], [], [], []
+        fs, ds, grs, res, jps, dngs = [], [], [], [], [], []
         for ci in range(n_chunks):
             sl = jax.lax.stop_gradient(gp[ci * chunk:(ci + 1) * chunk])
-            cf, cd, cgr, cre, cjp = _run(sl)
-            fs.append(cf); ds.append(cd); grs.append(cgr); res.append(cre); jps.append(cjp)
+            cf, cd, cgr, cre, cjp, cdng = _run(sl)
+            fs.append(cf); ds.append(cd); grs.append(cgr); res.append(cre)
+            jps.append(cjp); dngs.append(cdng)
         f = jnp.concatenate(fs, 0)[:Npop]
         d = jnp.concatenate(ds, 0)[:Npop]
         gr = jnp.concatenate(grs, 0)[:Npop]
         re = jnp.concatenate(res, 0)[:Npop]
         jp = jnp.concatenate(jps, 0)[:Npop]
+        dng = jnp.concatenate(dngs, 0)[:Npop]
 
     extras = {
         "gradients": gr,
         "raw_expectation": re,
         "joint_probability": jp,
+        "nongaussianity": dng,
         "leakage": jnp.zeros(Npop),
         "pnr_cost": d[:, 2],
         "final_state": jnp.zeros((Npop, base_cutoff), dtype=jnp.complex128),
@@ -1253,7 +1305,12 @@ def _revalidate_jit(genotypes, op_lo, op_hi, genotype_name, config_hashable,
         phi, _ = jax_reduced_herald_static(cs, ms, ep, L_hi, BF_hi, depth, maxf)
         elo = jnp.real(jnp.vdot(plo, op_lo[:plo.shape[0], :plo.shape[0]] @ plo))
         ehi = jnp.real(jnp.vdot(phi, op_hi[:phi.shape[0], :phi.shape[0]] @ phi))
-        return elo, ehi, jnp.sum(jnp.abs(plo) ** 2)
+        # exact 'leaf' herald probability (the search may have used --moment-fast,
+        # which stores a prob=1 PLACEHOLDER -- recompute it so the archive's
+        # probability objective is real). obj1 convention = log10(P) (<= 0).
+        P = jnp.real(_leaf_prob_product_static(p, L_hi, depth))
+        log10P = jnp.log10(jnp.clip(P, 1e-45, 1.0))
+        return elo, ehi, jnp.sum(jnp.abs(plo) ** 2), log10P
 
     return jax.vmap(one)(genotypes)
 
@@ -1277,20 +1334,26 @@ def clean_archive_moment(repertoire, genotype_name, config_hashable, base_cutoff
     a, b = cfg.get("target_alpha"), cfg.get("target_beta")
     op_lo = moment_operator(int(L_lo), a, b)
     op_hi = moment_operator(int(L_hi), a, b)
-    fit = np.asarray(repertoire.fitnesses)
+    # np.asarray() on a JAX array (QDax MOME repertoire.fitnesses) yields a
+    # READ-ONLY view -> the in-place refresh below raises "assignment destination
+    # is read-only". np.array(..., copy) forces a writable host copy.
+    fit = np.array(repertoire.fitnesses, dtype=float)
     shp = fit.shape
     fitf = fit.reshape(-1, shp[-1])
     gen = np.asarray(repertoire.genotypes).reshape(fitf.shape[0], -1)
     valid = np.where(np.isfinite(fitf[:, 0]) & (fitf[:, 0] > -1e9))[0]
     n_removed = 0
+    has_prob = fitf.shape[1] > 1                   # 2-objective archive (exp, prob)
     for s in range(0, len(valid), chunk):
         idx = valid[s:s + chunk]
-        elo, ehi, nlo = _revalidate_jit(
+        elo, ehi, nlo, lp = _revalidate_jit(
             jnp.asarray(gen[idx].astype(np.float64)), op_lo, op_hi,
             genotype_name, config_hashable, int(base_cutoff), int(L_lo), int(L_hi))
         elo = np.asarray(elo); ehi = np.asarray(ehi); nlo = np.asarray(nlo)
         art = (np.abs(ehi - elo) > tol) | (nlo < norm_tol)
         fitf[idx, 0] = -ehi                       # refresh to exact high-L <O>
+        if has_prob:
+            fitf[idx, 1] = np.asarray(lp)         # refresh exact probability (obj1=log10 P)
         fitf[idx[art], 0] = -np.inf               # drop the artifacts
         n_removed += int(art.sum())
     new = repertoire.replace(fitnesses=jnp.asarray(fitf.reshape(shp)))

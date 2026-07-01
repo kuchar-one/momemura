@@ -190,16 +190,28 @@ def main():
     print("Starting Optimization Pipeline")
     print(f"Pass-through Arguments: {' '.join(base_mome_args)}")
     print(f"Single-Objective Parallelism: {num_parallel}")
-    print(f"Steps: {STEPS} (Splits from 90-10 to 0-100)")
+    # --- Curriculum (exp-first) -------------------------------------------- #
+    # The non-Gaussian advantage lives in <O> (exp) at LOW probability; starting
+    # prob-heavy (the old 0.9->0.0 schedule) herds the early search into the
+    # Gaussian corner (prob->1) and it never escapes. So sweep the Pareto front
+    # from the <O> end: EXP-first (prob 0 early), ramping prob in later. Env
+    # overrides: ALPHA_PROB_START / ALPHA_PROB_END. And anneal a non-Gaussianity
+    # exploration reward (ALPHA_NONGAUSS_MAX -> 0) that bootstraps escape from the
+    # Gaussian basin early and vanishes so the final optimum stays honest.
+    p_start = float(os.environ.get("ALPHA_PROB_START", 0.0))
+    p_end = float(os.environ.get("ALPHA_PROB_END", 0.9))
+    ng_max = float(os.environ.get("ALPHA_NONGAUSS_MAX", 0.3))
+    alpha_probs = np.linspace(p_start, p_end, STEPS)
+    alpha_ngs = np.linspace(ng_max, 0.0, STEPS)
+    print(f"Steps: {STEPS} (exp-first: prob {p_start:.2f}->{p_end:.2f}; "
+          f"non-Gaussian reward {ng_max:.2f}->0)")
     print("=" * 60)
-
-    # 0.9 to 0.0 inclusive (Start: 90% Prob, End: Full Exp)
-    alpha_probs = np.linspace(0.9, 0.0, STEPS)
 
     for i, alpha_p in enumerate(alpha_probs):
         alpha_e = 1.0 - alpha_p
+        alpha_ng = float(alpha_ngs[i])
 
-        desc = f"Split {i + 1}/{STEPS}: Exp={alpha_e:.1f}, Prob={alpha_p:.1f}"
+        desc = f"Split {i + 1}/{STEPS}: Exp={alpha_e:.1f}, Prob={alpha_p:.1f}, NG={alpha_ng:.2f}"
         print(f"\n[Pipeline] === Starting {desc} ===\n")
 
         # --- Phase 1: Single Objective (Parallel) ---
@@ -218,6 +230,8 @@ def main():
             str(alpha_e),
             "--alpha-probability",
             str(alpha_p),
+            "--alpha-nongauss",
+            str(alpha_ng),
             "--global-seed-scan",
         ]
 
@@ -253,7 +267,8 @@ def main():
         # --- Phase 2: QDAX MOME ---
         print("\n[Pipeline] Launching QDAX MOME Run...")
 
-        qdax_args = base_mome_args + ["--mode", "qdax", "--global-seed-scan"]
+        qdax_args = base_mome_args + ["--mode", "qdax", "--global-seed-scan",
+                                      "--alpha-nongauss", str(alpha_ng)]
 
         current_processes = []
         proc_tuple = run_watchdog_command(qdax_args, f"step_{i}_qdax")

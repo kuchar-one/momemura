@@ -954,10 +954,27 @@ def run(
         n_bins_d3 = min(max_photons + 1, 10)
         d3 = jnp.linspace(0, max_photons, n_bins_d3)
 
-        print(
-            f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), D3(0-{max_photons})"
-        )
-        grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
+        # D4 (optional): relative-entropy non-Gaussianity descriptor. Only added
+        # when --moment-ng-descriptor is set (the scorer then emits a 4th desc
+        # axis); keeps the archive illuminating the non-Gaussian direction so the
+        # search doesn't collapse to the zero-negativity (Gaussian) corner. Coarse
+        # (few bins) to avoid exploding the coverage denominator.
+        _ng_desc = bool((genotype_config or {}).get("moment_ng_descriptor"))
+        ng_max = float((genotype_config or {}).get("ng_desc_max", 2.0))
+        n_bins_d4 = int((genotype_config or {}).get("ng_desc_bins", 5))
+        d4 = jnp.linspace(0, ng_max, n_bins_d4)
+
+        if _ng_desc:
+            print(
+                f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), "
+                f"D3(0-{max_photons}), D4 nonGauss(0-{ng_max})"
+            )
+            grid = jnp.meshgrid(d1, d2, d3, d4, indexing="ij")
+        else:
+            print(
+                f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), D3(0-{max_photons})"
+            )
+            grid = jnp.meshgrid(d1, d2, d3, indexing="ij")
         centroids = jnp.stack([g.flatten() for g in grid], axis=-1)
 
         # Count achievable bins for accurate coverage calculation
@@ -982,6 +999,12 @@ def run(
                         ):
                             n_achievable_bins += 1
 
+        # the non-Gaussianity axis is orthogonal to (active,pnr,photons): any
+        # achievable (D1,D2,D3) cell can occur at any non-Gaussianity level, so
+        # every D4 bin multiplies the achievable count.
+        if _ng_desc:
+            n_achievable_bins *= n_bins_d4
+
         print(f"Generated {centroids.shape[0]} centroids.")
         print(
             f"Achievable bins: {n_achievable_bins}/{centroids.shape[0]} ({100 * n_achievable_bins / centroids.shape[0]:.1f}%)"
@@ -997,6 +1020,16 @@ def run(
         # Print a rough peak estimate so the run can be sized to the 24GB GPUs.
         if (genotype_config or {}).get("scorer") == "moment":
             _print_moment_vram_estimate(genotype_config, pop_size, depth_val)
+            # moment_fast stores a prob=1 PLACEHOLDER (it skips the exact per-leaf
+            # probability). That's fine for a single-objective <O> search, but in
+            # MOME it FLATTENS the probability objective -> the whole prob axis is
+            # bogus and the Pareto front gets polluted with fake prob=1 cells. The
+            # periodic dual-L sweep now re-derives the true prob, but warn loudly.
+            if mode == "qdax" and (genotype_config or {}).get("moment_fast"):
+                print("  [WARN] --moment-fast in MOME/qdax mode flattens the "
+                      "probability objective (stores prob=1 placeholders). The "
+                      "periodic validation sweep re-derives true probs; for a "
+                      "clean prob axis from the start, drop --moment-fast.")
 
     if mode == "random":
         # Random search baseline
@@ -1966,6 +1999,16 @@ def run(
     # Explicitly store genotype name
     config["genotype"] = genotype
 
+    # Re-assert the TARGET as strings AFTER the merge.  genotype_config carries
+    # target_alpha as a float and target_beta as a complex (argparse type=complex);
+    # the merge above would otherwise leave a complex in the config, which
+    # OptimizationResult.save() silently drops (its safe_config keeps only
+    # int/float/str/bool/list/dict/None).  That is exactly how runs ended up with
+    # config.json missing 'target_beta' and storing 'target_alpha' as a number --
+    # breaking post-hoc validation and the frontend (which then defaults beta=0).
+    config["target_alpha"] = str(target_alpha)
+    config["target_beta"] = str(target_beta)
+
     # Create Result object
     # Pass history_fronts if available (only in qdax mode)
     h_fronts = locals().get("history_fronts", None)
@@ -2206,6 +2249,22 @@ def main():
         default=0.0,
         help="Weight for log-probability in single-objective loss (default: 0.0).",
     )
+    parser.add_argument(
+        "--alpha-nongauss",
+        type=float,
+        default=0.0,
+        help="Weight of the ANNEALED non-Gaussianity exploration reward (moment "
+             "scorer). Subtracted from the optimization objective only (pushes the "
+             "gradient toward Wigner-negative states); the stored/reported <O> is "
+             "unaffected. The pipeline anneals this high->0 across splits.",
+    )
+    parser.add_argument(
+        "--moment-ng-descriptor",
+        action="store_true",
+        help="Add relative-entropy non-Gaussianity as a 4th MAP-Elites descriptor "
+             "axis so the archive illuminates the non-Gaussian axis (QD diversity, "
+             "not an objective). Off by default (keeps the validated 3D grid).",
+    )
 
     parser.add_argument(
         "--resume",
@@ -2303,6 +2362,8 @@ def main():
         "modes": args.modes,
         "alpha_expectation": args.alpha_expectation,
         "alpha_probability": args.alpha_probability,
+        "alpha_nongauss": args.alpha_nongauss,
+        "moment_ng_descriptor": args.moment_ng_descriptor,
         # Moment-space scorer (exact, truncation-free); target (alpha,beta) are
         # needed here so the scorer can build its L-cutoff <O> operator.
         "scorer": args.scorer,
