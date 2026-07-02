@@ -1,6 +1,18 @@
+import jax
 import jax.numpy as jnp
 from typing import Dict, Any
 from abc import ABC, abstractmethod
+
+
+def _ste(int_val: jnp.ndarray, soft_val: jnp.ndarray) -> jnp.ndarray:
+    """Straight-through estimator: forward value == ``int_val`` EXACTLY (bit-
+    identical to the discrete decode), backward gradient == d(soft_val)/dx.
+    Lets gradient-based emitters/Adam see a slope through the round()/clip()
+    thresholds on detector counts.  NOTE: gradients only materialise where the
+    downstream computation uses the count SMOOTHLY; uses via integer indexing
+    or comparisons (e.g. the Hermite-box radii) remain gradient-free -- discrete
+    structure search stays the job of the macro-mutation / NG-elite streams."""
+    return soft_val + jax.lax.stop_gradient(int_val.astype(soft_val.dtype) - soft_val)
 
 # Defaults (can be overridden via config)
 DEFAULT_CONFIG = {
@@ -375,9 +387,17 @@ class DesignB3Genotype(BaseGenotype):
         pnr_raw = jnp.clip(unique_reshaped[:, 2:], 0, 1)
         leaf_pnr = jnp.round(pnr_raw * self.pnr_max).astype(jnp.int32)
 
+        # STE (straight-through) float twins: forward == int fields exactly,
+        # backward passes the soft-count gradient through round()/clip().
+        n_ctrl_soft = jnp.clip((n_ctrl_raw + 1.0) / 2.0 * self.n_control,
+                               0.0, float(self.n_control))
+        pnr_soft = pnr_raw * self.pnr_max
+
         leaf_params = {
             "n_ctrl": leaf_n_ctrl,
+            "n_ctrl_ste": _ste(leaf_n_ctrl, n_ctrl_soft),
             "pnr": leaf_pnr,
+            "pnr_ste": _ste(leaf_pnr, pnr_soft),
             "r": jnp.broadcast_to(gg["r"], (L, self.n_modes)),
             "phases": jnp.broadcast_to(gg["phases"], (L, self.n_modes**2)),
             "disp": jnp.broadcast_to(gg["disp"], (L, self.n_modes)),
@@ -493,6 +513,65 @@ class DesignB30BGenotype(DesignB30Genotype):
         mix_params = mix_params.at[:, 0].set(jnp.pi / 4)
         res["mix_params"] = mix_params
         return res
+
+
+class DesignB30FGenotype(DesignB30Genotype):
+    """Design B30F: B30 + FORCED HERALDING.  The Gaussian manifold is
+    unrepresentable by construction:
+
+      * leaf 0 is ALWAYS active,
+      * every active leaf has n_ctrl >= 1 (at least one real control detector),
+      * every active leaf's FIRST detector fires >= 1 photon
+        (pnr[0] in 1..pnr_max instead of 0..pnr_max).
+
+    Every decoded circuit therefore heralds at least one photon -- the search
+    starts (and stays) on the non-Gaussian side of the barrier instead of having
+    to cross it.  Genotype length and all continuous mappings are identical to
+    B30, so B30F genotypes convert losslessly to B30 (see
+    converter.convert_b30f_to_b30) for consolidation runs and Adam polish.
+    """
+
+    def decode(self, g: jnp.ndarray, cutoff: int) -> Dict[str, Any]:
+        base = super().decode(g, cutoff)
+
+        L = self.leaves
+        # unique block offset within the B30 layout:
+        #   [hom(nodes)] [shared(Sharedv)] [unique(L*Unique)] [mix] [final]
+        u0 = self.nodes + self.Sharedv
+        unique = g[u0:u0 + L * self.Unique].reshape(L, self.Unique)
+
+        # leaf 0 forced active
+        leaf_active = unique[:, 0] > 0.0
+        leaf_active = leaf_active.at[0].set(True)
+
+        # n_ctrl in 1..n_control
+        nc_free = max(self.n_control - 1, 0)
+        n_ctrl_raw = unique[:, 1]
+        n_ctrl_soft = 1.0 + jnp.clip((n_ctrl_raw + 1.0) / 2.0 * nc_free,
+                                     0.0, float(nc_free))
+        leaf_n_ctrl = jnp.clip(
+            1 + jnp.round(jnp.clip((n_ctrl_raw + 1.0) / 2.0, 0, 1) * nc_free
+                          ).astype(jnp.int32),
+            1, self.n_control)
+
+        # first detector in 1..pnr_max, remaining detectors free 0..pnr_max
+        pnr_raw = jnp.clip(unique[:, 2:], 0, 1)
+        pnr0_soft = 1.0 + pnr_raw[:, 0] * (self.pnr_max - 1)
+        pnr0 = 1 + jnp.round(pnr_raw[:, 0] * (self.pnr_max - 1)).astype(jnp.int32)
+        rest_soft = pnr_raw[:, 1:] * self.pnr_max
+        rest = jnp.round(rest_soft).astype(jnp.int32)
+        leaf_pnr = jnp.concatenate([pnr0[:, None], rest], axis=1)
+        pnr_soft = jnp.concatenate([pnr0_soft[:, None], rest_soft], axis=1)
+
+        lp = dict(base["leaf_params"])
+        lp["n_ctrl"] = leaf_n_ctrl
+        lp["n_ctrl_ste"] = _ste(leaf_n_ctrl, n_ctrl_soft)
+        lp["pnr"] = leaf_pnr
+        lp["pnr_ste"] = _ste(leaf_pnr, pnr_soft)
+
+        base["leaf_params"] = lp
+        base["leaf_active"] = leaf_active
+        return base
 
 
 # --- Design C Variants (Tied-All) ---
@@ -677,6 +756,7 @@ def get_genotype_decoder(
         "B2": DesignB2Genotype,
         "B3": DesignB3Genotype,
         "B30": DesignB30Genotype,
+        "B30F": DesignB30FGenotype,
         "B3B": DesignB3BGenotype,
         "B30B": DesignB30BGenotype,
         "C1": DesignC1Genotype,

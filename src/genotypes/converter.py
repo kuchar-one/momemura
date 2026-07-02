@@ -39,6 +39,18 @@ def _layer_node_offsets(depth: int):
 #   hom(nodes) | leaves(L * P_leaf_full) | mix(nodes * PN) | final(F)
 _PERNODE_HOM_DESIGNS = {"0", "design0", "00B"}
 
+# B30 family (semi-tied, per-node homodyne) shares the layout
+#   hom(nodes) | shared(Sharedv) | unique(L * Unique) | mix(nodes * PN) | final(F)
+_B30_FAMILY = {"B30", "B30B", "B30F"}
+
+# all designs upgrade_depth() can embed into a deeper tree of the same design
+_DEPTH_UPGRADE_DESIGNS = _PERNODE_HOM_DESIGNS | _B30_FAMILY
+
+
+def supports_depth_upgrade(genotype_name: str) -> bool:
+    """True if ``upgrade_depth`` can embed this design into a deeper tree."""
+    return genotype_name in _DEPTH_UPGRADE_DESIGNS
+
 
 def upgrade_depth(
     source_g: np.ndarray,
@@ -69,9 +81,12 @@ def upgrade_depth(
         raise ValueError(f"dst_depth {dst_depth} < src_depth {src_depth}")
     if dst_depth == src_depth:
         return np.asarray(source_g, dtype=np.float32).copy()
+    if genotype_name in _B30_FAMILY:
+        return _upgrade_depth_b30(source_g, genotype_name, src_depth, dst_depth,
+                                  config)
     if genotype_name not in _PERNODE_HOM_DESIGNS:
         raise NotImplementedError(
-            f"upgrade_depth supports {_PERNODE_HOM_DESIGNS}, not {genotype_name!r}")
+            f"upgrade_depth supports {_DEPTH_UPGRADE_DESIGNS}, not {genotype_name!r}")
 
     dec_s = get_genotype_decoder(genotype_name, src_depth, config)
     dec_t = get_genotype_decoder(genotype_name, dst_depth, config)
@@ -111,6 +126,110 @@ def upgrade_depth(
     return target_g
 
 
+def _upgrade_depth_b30(
+    source_g: np.ndarray,
+    genotype_name: str,
+    src_depth: int,
+    dst_depth: int,
+    config: dict = None,
+) -> np.ndarray:
+    """B30-family depth embedding (layout:
+    hom(nodes) | shared(Sharedv) | unique(L*Unique) | mix(nodes*PN) | final(F)).
+
+    The source's 2**src_depth leaves become the FIRST leaves of the deep tree;
+    the extra leaves are marked INACTIVE (unique col 0 = -1), so the masked
+    equivalent-Gaussian routes every mixing node touching a dead subtree to a
+    no-op (theta=0 identity BS + homodyne on decoupled vacuum) and the deep
+    genotype reproduces the shallow heralded state exactly (same <O>).
+    Live node layers (hom + mix) are mapped layer-by-layer; shared continuous
+    block and final Gaussian are copied verbatim."""
+    dec_s = get_genotype_decoder(genotype_name, src_depth, config)
+    dec_t = get_genotype_decoder(genotype_name, dst_depth, config)
+    Ls, Lt = 2 ** src_depth, 2 ** dst_depth
+    nodes_s, nodes_t = Ls - 1, Lt - 1
+    SH, U, PN, F = dec_s.Sharedv, dec_s.Unique, dec_s.PN, dec_s.F
+
+    g = np.asarray(source_g, dtype=np.float32)
+    exp_src = dec_s.get_length(src_depth)
+    if g.shape[0] != exp_src:
+        raise ValueError(
+            f"source length {g.shape[0]} != depth-{src_depth} length {exp_src}")
+
+    i = 0
+    hom_s = g[i:i + nodes_s]; i += nodes_s
+    shared = g[i:i + SH]; i += SH
+    unique_s = g[i:i + Ls * U].reshape(Ls, U); i += Ls * U
+    mix_s = g[i:i + nodes_s * PN].reshape(nodes_s, PN); i += nodes_s * PN
+    final_s = g[i:i + F]
+
+    hom_t = np.zeros(nodes_t, dtype=np.float32)
+    mix_t = np.zeros((nodes_t, PN), dtype=np.float32)
+    offs_s, offs_t = _layer_node_offsets(src_depth), _layer_node_offsets(dst_depth)
+    for k in range(1, src_depth + 1):           # map each live layer's node block
+        cnt = 2 ** (src_depth - k)
+        s0, t0 = offs_s[k - 1], offs_t[k - 1]
+        hom_t[t0:t0 + cnt] = hom_s[s0:s0 + cnt]
+        mix_t[t0:t0 + cnt] = mix_s[s0:s0 + cnt]
+
+    unique_t = np.zeros((Lt, U), dtype=np.float32)
+    unique_t[:Ls] = unique_s
+    unique_t[Ls:, 0] = -1.0                      # active flag (col 0) <= 0 => inactive
+
+    target_g = np.concatenate(
+        [hom_t, shared, unique_t.reshape(-1), mix_t.reshape(-1), final_s]
+    ).astype(np.float32)
+    exp_dst = dec_t.get_length(dst_depth)
+    if target_g.shape[0] != exp_dst:
+        raise ValueError(
+            f"built length {target_g.shape[0]} != depth-{dst_depth} length {exp_dst}")
+    return target_g
+
+
+def convert_b30f_to_b30(
+    source_g: np.ndarray,
+    depth: int = 3,
+    config: dict = None,
+) -> np.ndarray:
+    """Lossless B30F -> B30 conversion: re-encode the FORCED discrete genes so
+    the free B30 decode reproduces the exact same circuit.
+
+    B30F and B30 share length and every continuous mapping; only the discrete
+    decode differs:
+      * n_ctrl:  B30F 1 + round(clip((v+1)/2)*(nc-1))  vs  B30 round((v+1)/2*nc)
+      * pnr[0]:  B30F 1 + round(clip(v,0,1)*(pm-1))    vs  B30 round(clip(v)*pm)
+      * active:  B30F forces leaf 0 active regardless of raw sign.
+    We decode the B30F values and write raw values that hit the same integers
+    under the B30 mapping (bin centres, so they are robust to mutation jitter)."""
+    dec = get_genotype_decoder("B30F", depth, config)
+    Ls = 2 ** depth
+    nodes = Ls - 1
+    SH, U = dec.Sharedv, dec.Unique
+    nc = dec.n_control
+    pm = dec.pnr_max
+    g = np.asarray(source_g, dtype=np.float32).copy()
+    u0 = nodes + SH
+    unique = g[u0:u0 + Ls * U].reshape(Ls, U)
+
+    # active: leaf 0 forced -> make its raw explicitly positive
+    unique[0, 0] = abs(unique[0, 0]) if unique[0, 0] != 0.0 else 1.0
+
+    # n_ctrl: decode B30F value n in 1..nc, encode for B30 (round((w+1)/2*nc)=n)
+    nc_free = max(nc - 1, 0)
+    v = unique[:, 1]
+    n_val = 1 + np.round(np.clip((v + 1.0) / 2.0, 0, 1) * nc_free).astype(int)
+    n_val = np.clip(n_val, 1, nc)
+    unique[:, 1] = 2.0 * n_val / nc - 1.0        # exact bin centre for B30
+
+    # pnr[0]: decode B30F value k in 1..pm, encode for B30 (round(w*pm)=k)
+    v0 = np.clip(unique[:, 2], 0, 1)
+    k_val = 1 + np.round(v0 * (pm - 1)).astype(int)
+    unique[:, 2] = k_val / float(pm)
+    # remaining detectors share the same mapping in both designs -> unchanged
+
+    g[u0:u0 + Ls * U] = unique.reshape(-1)
+    return g
+
+
 def upgrade_genotype(
     source_g: np.ndarray,
     source_name: str,
@@ -126,6 +245,15 @@ def upgrade_genotype(
     """
     if source_name == target_name:
         return source_g.copy()
+
+    # B30F (forced heralding) -> B30: lossless discrete re-encoding
+    if source_name == "B30F" and target_name == "B30":
+        return convert_b30f_to_b30(source_g, depth, config)
+    # B30 -> B30F: same length; the forced decode reinterprets the discrete
+    # genes (nearest forced structure). Useful for re-seeding discovery runs
+    # from consolidation elites.
+    if source_name == "B30" and target_name == "B30F":
+        return np.asarray(source_g, dtype=np.float32).copy()
 
     # Try heuristic for legacy mismatch
     if "legacy" in source_name.lower():

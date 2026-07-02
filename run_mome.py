@@ -607,10 +607,14 @@ def plot_mome_results(repertoire, metrics, filename="mome_results.png"):
     # 1. Global Pareto Front (Expectation vs Log Prob)
     # Note: We want to minimize Expectation and minimize Log Prob (maximize Prob)
     ax = axes[0, 0]
+    # complexity (active leaves) as colour: objective 3 in legacy 4-obj archives,
+    # descriptor axis 0 in the new 2-objective (exp, prob) archives.
+    _color = (objectives[:, 2] if objectives.shape[1] > 2
+              else descriptors[:, 0])
     sc = ax.scatter(
         objectives[:, 1],
         objectives[:, 0],
-        c=objectives[:, 2],
+        c=_color,
         cmap="viridis",
         alpha=0.7,
     )
@@ -846,8 +850,15 @@ def run(
         # Seeding Strategy (Shared)
         from src.genotypes.converter import (
             create_vacuum_genotype, upgrade_genotype, upgrade_depth,
-            _PERNODE_HOM_DESIGNS)
+            supports_depth_upgrade)
         from src.utils.result_scanner import scan_results_for_seeds
+
+        seed_metric = (genotype_config or {}).get("seed_metric", "pareto")
+        seed_accept = [s for s in str(
+            (genotype_config or {}).get("seed_accept", "") or "").split(",") if s]
+        seed_fill = (genotype_config or {}).get("seed_fill", "topup")
+        seed_jitter = float((genotype_config or {}).get("seed_jitter", 0.05))
+        n_pnr_seeds = int((genotype_config or {}).get("pnr_seeds", 0))
 
         def _infer_src_depth(name, length):
             """Depth whose genotype length matches `length` for design `name`
@@ -862,11 +873,13 @@ def run(
         if "modes" not in genotype_config:
             genotype_config["modes"] = 2
 
-        # 1. Vacuum Seed
+        # 1. Vacuum Seed (skipped for forced-heralding designs: the Gaussian /
+        #    vacuum circuit is unrepresentable there BY DESIGN, and a zero
+        #    genotype would decode to a probability-0 herald)
         vacuum = create_vacuum_genotype(
             genotype, depth=depth_val, config=genotype_config
         )
-        if len(vacuum) == D:
+        if len(vacuum) == D and genotype != "B30F":
             genotypes = genotypes.at[0].set(jnp.asarray(vacuum, dtype=genotypes.dtype))
             print("  - Injected Vacuum State at index 0")
 
@@ -884,51 +897,97 @@ def run(
             seeds = scan_results_for_seeds(
                 seed_source_dir,
                 top_k=pop_size,
-                metric="pareto",
+                metric=seed_metric,
                 target_genotype=genotype,
+                accept_genotypes=seed_accept or None,
             )
 
-            idx = 1
-            injected_count = 0
+            # Convert every usable seed first (depth-embed shallower trees of
+            # any upgradable design, then cross-design conversion), THEN inject
+            # according to the fill mode.
+            converted = []
             embedded_count = 0
             for g_src, name_src, score in seeds:
-                if idx >= pop_size:
-                    break
                 try:
-                    # Same design but a SHALLOWER tree -> embed it as a subtree
-                    # and vacuum-pad the rest, so the deep genotype reproduces the
-                    # shallow heralded state exactly (same <O> at the start).
-                    src_d = None
-                    if (name_src == genotype
-                            and genotype in _PERNODE_HOM_DESIGNS
-                            and len(g_src) != D):
-                        src_d = _infer_src_depth(name_src, len(g_src))
-                    if src_d is not None and src_d < depth_val:
-                        g_new = upgrade_depth(
-                            g_src, genotype, src_d, depth_val, genotype_config)
-                        embedded_count += 1
-                    else:
+                    g_new = np.asarray(g_src, dtype=np.float32)
+                    # Same design family but a SHALLOWER tree -> embed it as a
+                    # subtree and vacuum-pad the rest, so the deep genotype
+                    # reproduces the shallow heralded state exactly (same <O>).
+                    if supports_depth_upgrade(name_src):
+                        src_len_target = get_genotype_decoder(
+                            name_src, depth=depth_val,
+                            config=genotype_config).get_length(depth_val)
+                        if len(g_new) != src_len_target:
+                            src_d = _infer_src_depth(name_src, len(g_new))
+                            if src_d is not None and src_d < depth_val:
+                                g_new = upgrade_depth(
+                                    g_new, name_src, src_d, depth_val,
+                                    genotype_config)
+                                embedded_count += 1
+                    if name_src != genotype:
                         g_new = upgrade_genotype(
-                            g_src,
-                            name_src,
-                            genotype,
-                            depth=depth_val,
-                            config=genotype_config,
-                        )
+                            g_new, name_src, genotype,
+                            depth=depth_val, config=genotype_config)
                     if len(g_new) == D:
+                        converted.append(np.asarray(g_new, dtype=np.float32))
+                except Exception:
+                    pass
+
+            injected_count = 0
+            if converted:
+                if seed_fill == "jitter":
+                    # EXPLOITATION fill: cycle the seeds over the whole
+                    # population with Gaussian jitter -- multi-start polish of
+                    # the Pareto set (Adam runs), not diverse re-exploration.
+                    rng_fill = np.random.default_rng(seed)
+                    for slot in range(1, pop_size):
+                        base_g = converted[(slot - 1) % len(converted)]
+                        jit = rng_fill.normal(
+                            0.0, seed_jitter, base_g.shape).astype(np.float32)
+                        # first copy of each seed goes in UNJITTERED
+                        if (slot - 1) < len(converted):
+                            jit = jit * 0.0
+                        genotypes = genotypes.at[slot].set(
+                            jnp.asarray(base_g + jit, dtype=genotypes.dtype))
+                        injected_count += 1
+                else:
+                    idx = 1
+                    for g_new in converted:
+                        if idx >= pop_size:
+                            break
                         genotypes = genotypes.at[idx].set(
                             jnp.asarray(g_new, dtype=genotypes.dtype))
                         idx += 1
                         injected_count += 1
-                except Exception:
-                    pass
 
             if injected_count > 0:
                 _emb = (f" ({embedded_count} depth-embedded from shallower runs)"
                         if embedded_count else "")
-                print(f"  - Injected {injected_count} seeds.{_emb}")
-            else:
-                pass
+                print(f"  - Injected {injected_count} seeds "
+                      f"(metric={seed_metric}, fill={seed_fill}).{_emb}")
+
+        # 3. PNR-pattern seeds (physics priors: canonical click combinations
+        #    with breeding-friendly continuous defaults).  Fill the tail of the
+        #    population so they never evict scanned seeds.
+        if n_pnr_seeds > 0:
+            try:
+                from src.genotypes.pnr_seeds import generate_pnr_pattern_seeds
+                rng_pnr = np.random.default_rng(seed + 777)
+                patt = generate_pnr_pattern_seeds(
+                    genotype, depth_val, genotype_config, n_pnr_seeds, rng_pnr)
+                start = max(1, pop_size - len(patt))
+                n_put = 0
+                for k, g_p in enumerate(patt):
+                    slot = start + k
+                    if slot >= pop_size:
+                        break
+                    genotypes = genotypes.at[slot].set(
+                        jnp.asarray(g_p, dtype=genotypes.dtype))
+                    n_put += 1
+                print(f"  - Injected {n_put} PNR-pattern seeds "
+                      f"(canonical click combinations, tail slots).")
+            except Exception as e:
+                print(f"  - PNR-pattern seeding failed (non-fatal): {e}")
 
         # --- GRID DEFINITION (Shared for QDax and Result Saving) ---
         # D1: Active Modes (Complexity): 0..2^depth (Inclusive, so +1 bin)
@@ -976,17 +1035,34 @@ def run(
         # D4 (optional): relative-entropy non-Gaussianity descriptor. Only added
         # when --moment-ng-descriptor is set (the scorer then emits a 4th desc
         # axis); keeps the archive illuminating the non-Gaussian direction so the
-        # search doesn't collapse to the zero-negativity (Gaussian) corner. Coarse
-        # (few bins) to avoid exploding the coverage denominator.
+        # search doesn't collapse to the zero-negativity (Gaussian) corner.
+        #
+        # LOG-SPACED by default: with linear bins the first cell spanned
+        # delta_ng in [0, ng_max/(2*(bins-1))) -- Gaussian states and every early
+        # barrier-crossing candidate shared ONE bin, where the Gaussian optimum
+        # always won on <O>.  The axis protected nothing exactly where protection
+        # was needed.  Log-spaced centroids resolve the small-delta region
+        # (stepping stones at delta ~ 0.02-0.3) while still covering the deep
+        # non-Gaussian end.  `ng_desc_scale: linear` restores the old grid.
         _ng_desc = bool((genotype_config or {}).get("moment_ng_descriptor"))
         ng_max = float((genotype_config or {}).get("ng_desc_max", 2.0))
-        n_bins_d4 = int((genotype_config or {}).get("ng_desc_bins", 5))
-        d4 = jnp.linspace(0, ng_max, n_bins_d4)
+        n_bins_d4 = int((genotype_config or {}).get("ng_desc_bins", 9))
+        _ng_scale = str((genotype_config or {}).get("ng_desc_scale", "log"))
+        if _ng_scale == "log" and n_bins_d4 > 2:
+            # centroid 0 for the Gaussian cell, then geometric from ng_min..ng_max
+            ng_min = float((genotype_config or {}).get("ng_desc_min", 0.02))
+            d4 = jnp.concatenate([
+                jnp.zeros(1),
+                jnp.geomspace(ng_min, ng_max, n_bins_d4 - 1),
+            ])
+        else:
+            d4 = jnp.linspace(0, ng_max, n_bins_d4)
 
         if _ng_desc:
+            _d4_str = ", ".join(f"{float(x):.3g}" for x in np.array(d4))
             print(
                 f"Grid Definition: D1(0-{max_active}), D2(0-{pnr_max_val}), "
-                f"D3(0-{max_photons}), D4 nonGauss(0-{ng_max})"
+                f"D3(0-{max_photons}), D4 nonGauss[{_ng_scale}]({_d4_str})"
             )
             grid = jnp.meshgrid(d1, d2, d3, d4, indexing="ij")
         else:
@@ -1198,6 +1274,24 @@ def run(
         print(f"  - Exploration mutation: eta={_expl_eta} prop={_expl_prop} "
               f"(structure-flipping); elite mutation: eta=10.0 (fine)")
 
+        # PHYSICS MACRO-MUTATIONS: with probability --macro-prob an exploration
+        # offspring takes one coordinated state-engineering move (photon-subtract
+        # leaf, symmetrize subtree, breeding merge, ...) instead of a polynomial
+        # perturbation.  Single-gene mutations essentially never assemble
+        # breeding structure; these jump straight onto the physical manifold.
+        _macro_prob = float((genotype_config or {}).get("macro_prob", 0.0))
+        if _macro_prob > 0.0 and genotype in {"B30", "B30B", "B30F"}:
+            try:
+                from src.optimization.macro_mutations import (
+                    make_macro_mutation, make_mixed_mutation)
+                _macro_fn = make_macro_mutation(genotype, depth_val, genotype_config)
+                explore_mutation = make_mixed_mutation(
+                    explore_mutation, _macro_fn, _macro_prob)
+                print(f"  - Physics macro-mutations: ON "
+                      f"(prob={_macro_prob}, {_macro_fn.n_ops} operators)")
+            except Exception as e:
+                print(f"  - Macro-mutations unavailable (non-fatal): {e}")
+
         # Grid-based Centroids MOVED TO SHARED INITIALIZATION
         # (Lines 919-985 migrated to lines 790+)
 
@@ -1261,6 +1355,60 @@ def run(
                 exploration_emitter=exploration_emitter,
                 intensification_emitter=intensification_emitter,
                 intensification_ratio=hybrid_ratio,
+                batch_size=emitter_batch_size,
+            )
+
+        elif emitter_type == "ng-hybrid":
+            # 3-way stream: exploration (macro+poly mutation, uniform parents)
+            # + fitness-elite (softmax on -<O>) + NG-elite (softmax on the
+            # non-Gaussianity descriptor).  The NG-elite stream gives barrier-
+            # crossing candidates dedicated offspring pressure even while their
+            # <O> is still worse than the Gaussian optimum -- the fitness-elite
+            # stream alone is a Gaussian-basin pump.
+            from src.optimization.emitters import NGBiasedMixingEmitter
+            _ng_ratio = float(os.environ.get("NG_ELITE_RATIO", 0.5))
+            print(f"  - Strategy: NG-Hybrid (Uniform + Fitness-Elite + NG-Elite)"
+                  f" | Elite Ratio: {hybrid_ratio}, NG share of elite: {_ng_ratio}")
+            if not (genotype_config or {}).get("moment_ng_descriptor"):
+                print("    [WARN] ng-hybrid without --moment-ng-descriptor: the "
+                      "NG stream will select on the last descriptor axis "
+                      "(photons) instead of non-Gaussianity!")
+
+            exploration_emitter = MixingEmitter(
+                mutation_fn=explore_mutation,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,
+            )
+            exp_elite = BiasedMixingEmitter(
+                mutation_fn=mutation_function,
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,
+                temperature=0.05,
+            )
+            ng_elite = NGBiasedMixingEmitter(
+                mutation_fn=explore_mutation,   # NG elites want structure moves
+                variation_fn=crossover_function,
+                variation_percentage=0.5,
+                batch_size=emitter_batch_size,
+                temperature=float(os.environ.get("NG_ELITE_TEMP", 0.2)),
+                ng_axis=3,
+            )
+            # nested Hybrid must be constructed at its FINAL batch size: it
+            # splits its children in __init__, and the outer wrapper's later
+            # _batch_size override does not re-split them.
+            _n_elite_pair = max(2, int(emitter_batch_size * hybrid_ratio))
+            elite_pair = HybridEmitter(
+                exploration_emitter=exp_elite,
+                intensification_emitter=ng_elite,
+                intensification_ratio=_ng_ratio,
+                batch_size=_n_elite_pair,
+            )
+            mixing_emitter = HybridEmitter(
+                exploration_emitter=exploration_emitter,
+                intensification_emitter=elite_pair,
+                intensification_ratio=_n_elite_pair / emitter_batch_size,
                 batch_size=emitter_batch_size,
             )
 
@@ -1509,6 +1657,34 @@ def run(
         gs_eig = float(jnp.linalg.eigvalsh(op_jax)[0])
         gaussian_limit = global_gaussian_limit
 
+        # Clamped-Gaussian reference G_N: the best value a Gaussian state can
+        # reach UNDER THE SEARCH'S SQUEEZING CLAMP.  "vs G" (the analytic
+        # r->inf infimum) overstates progress -- a run sitting exactly at the
+        # clamped Gaussian optimum shows "vs G: +0.07" and looks 'almost there'
+        # when the true remaining gap is structural.  "vs G_N" hits 0.0000 at
+        # the clamped optimum and goes NEGATIVE only with genuine non-Gaussian
+        # advantage (within the clamp).
+        g_n_ref = None
+        if (genotype_config or {}).get("scorer") == "moment":
+            try:
+                from src.utils.gaussian_reference import gaussian_reference_values
+                _L_ref = int(genotype_config.get(
+                    "moment_l_high",
+                    max(2 * int(genotype_config.get("moment_cutoff", 100)), 120)))
+                _rs = float(genotype_config.get("r_scale", 2.0))
+                _ds = float(genotype_config.get("d_scale", 3.0))
+                _t0 = time.time()
+                g_n_ref, g_n2_ref = gaussian_reference_values(
+                    str(genotype_config.get("target_alpha")),
+                    str(genotype_config.get("target_beta")),
+                    _L_ref, _rs, _ds)
+                print(f"Clamped-Gaussian reference ({time.time() - _t0:.1f}s): "
+                      f"G_N = {g_n_ref:.6f} (r<={_rs:.2f}), "
+                      f"G_N2 = {g_n2_ref:.6f} (r<={2 * _rs:.2f}); "
+                      f"analytic G = {gaussian_limit:.6f}")
+            except Exception as e:
+                print(f"Clamped-Gaussian reference unavailable (non-fatal): {e}")
+
         print(
             f"Starting optimization: {n_iters} iterations in {n_chunks} chunks (sizes={chunks}).\n"
             f"Target: GS Eig = {gs_eig:.6f}, Gaussian Limit = {gaussian_limit:.6f}"
@@ -1522,6 +1698,32 @@ def run(
         snapshot_interval = max(1, n_iters // 50)
 
         completed = completed_iters
+
+        # --- Moment sweep state (crossing trigger + incremental fingerprint) ---
+        _last_sweep_gen = completed_iters
+        _sweep_fp = None
+
+        def _run_moment_sweep(rep, gen_no, fp):
+            """Dual-L moment sweep: re-score at high L, drop L-truncation
+            artifacts (the cheap search-L <O> can be biased by the operator's
+            high-Fock tail even when the state looks complete).  Incremental:
+            only cells changed since the previous sweep are re-scored."""
+            try:
+                from src.simulation.jax.moment_scorer import clean_archive_moment
+                L_lo = int(genotype_config.get("moment_cutoff", 100))
+                L_hi = int(genotype_config.get("moment_l_high", max(2 * L_lo, 120)))
+                tol = float(genotype_config.get("moment_validate_tol", 0.02))
+                ch = tuple(sorted(genotype_config.items()))
+                mode_s = "incremental" if fp is not None else "full"
+                print(f"\n=== Moment Validation Sweep (gen {gen_no}, "
+                      f"L {L_lo}->{L_hi}, {mode_s}) ===")
+                rep, num_removed, fp = clean_archive_moment(
+                    rep, genotype, ch, cutoff, L_lo, L_hi, tol=tol, prev_fp=fp)
+                print(f"Removed {num_removed} L-truncation artifacts "
+                      f"(archive refreshed to exact L={L_hi} <O>).\n")
+            except Exception as e:
+                print(f"Moment validation sweep failed (non-fatal): {e}")
+            return rep, fp
 
         chunk_start_time = time.time()
 
@@ -1624,32 +1826,23 @@ def run(
                     print(f"Checkpoint prep failed: {e}")
 
                 # --- Periodic Archive Sweep (Option D) ---
-                # Validate archive every 250 generations to remove numerical artifacts
+                # TRIGGER FIX: the old `completed % every == 0` almost never
+                # fired: `completed` only takes chunk-boundary values (64, 128,
+                # ...) and no multiple of chunk_size below the final iteration is
+                # divisible by 250 -- so the archive stayed polluted (and the
+                # elite emitter fed on fake elites) for the ENTIRE run, cleaned
+                # exactly once at the very end.  Fire on every *crossing* of a
+                # multiple of `every` instead, and sweep incrementally.
                 sweep_interval = 250
                 _is_moment = (genotype_config or {}).get("scorer") == "moment"
                 _mom_every = int((genotype_config or {}).get("moment_validate_every", 250))
                 if (
                     _is_moment
-                    and completed % _mom_every == 0
-                    and completed > 0
+                    and completed // _mom_every > _last_sweep_gen // _mom_every
                 ):
-                    # Dual-L moment sweep: re-score at high L, drop L-truncation
-                    # artifacts (the cheap search-L <O> can be biased by the
-                    # operator's high-Fock tail even when the state looks complete).
-                    try:
-                        from src.simulation.jax.moment_scorer import clean_archive_moment
-                        L_lo = int(genotype_config.get("moment_cutoff", 100))
-                        L_hi = int(genotype_config.get("moment_l_high", max(2 * L_lo, 120)))
-                        tol = float(genotype_config.get("moment_validate_tol", 0.02))
-                        ch = tuple(sorted(genotype_config.items()))
-                        print(f"\n=== Moment Validation Sweep (gen {completed}, "
-                              f"L {L_lo}->{L_hi}) ===")
-                        repertoire, num_removed = clean_archive_moment(
-                            repertoire, genotype, ch, cutoff, L_lo, L_hi, tol=tol)
-                        print(f"Removed {num_removed} L-truncation artifacts "
-                              f"(archive refreshed to exact L={L_hi} <O>).\n")
-                    except Exception as e:
-                        print(f"Moment validation sweep failed (non-fatal): {e}")
+                    repertoire, _sweep_fp = _run_moment_sweep(
+                        repertoire, completed, _sweep_fp)
+                    _last_sweep_gen = completed
                 elif (
                     correction_cutoff is not None
                     and not _is_moment
@@ -1718,12 +1911,15 @@ def run(
                 filled = int(bar_len * progress)
                 bar = "=" * filled + "-" * (bar_len - filled)
 
+                _gn_str = (f", vs G_N: {best_exp - g_n_ref:+.4f}"
+                           if g_n_ref is not None else "")
                 print(
                     f"[{bar}] Iter {completed}/{n_iters} | "
                     f"Chunk: {time.time() - chunk_start_time:.1f}s | "
                     f"ETA: {etr_str} | "
                     f"Cov: {cov:.1f}% | "
-                    f"Exp: {best_exp:.4f} (vs GS: {best_exp - gs_eig:+.4f}, vs G: {best_exp - gaussian_limit:+.4f})",
+                    f"Exp: {best_exp:.4f} (vs GS: {best_exp - gs_eig:+.4f}, "
+                    f"vs G: {best_exp - gaussian_limit:+.4f}{_gn_str})",
                     end="\r",
                     flush=True,
                 )
@@ -1732,6 +1928,13 @@ def run(
 
         except KeyboardInterrupt:
             print("\n\nOptimization interrupted (SIGINT/SIGTERM). Saving progress...")
+
+        # FINAL sweep: guarantee the SAVED archive is exact-high-L validated even
+        # when the last iteration doesn't land on a sweep boundary (incremental,
+        # so this is cheap if a periodic sweep ran recently).
+        if (genotype_config or {}).get("scorer") == "moment" and completed > _last_sweep_gen:
+            repertoire, _sweep_fp = _run_moment_sweep(repertoire, completed, _sweep_fp)
+            _last_sweep_gen = completed
 
         print("QDax MOME finished.")
 
@@ -1767,7 +1970,7 @@ def run(
         # 2. Iterate optimization steps
         # 3. Use the computed gradients to update
 
-        learning_rate = 0.01  # Reduced from 0.05 for stability
+        learning_rate = float((genotype_config or {}).get("adam_lr", 0.01))
         # Use Chain: Clip -> Adam
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0), optax.adam(learning_rate)
@@ -2260,6 +2463,7 @@ def main():
             "standard",
             "biased",
             "hybrid",
+            "ng-hybrid",
             "gradient",
             "hybrid-gradient",
             "mega-hybrid",
@@ -2306,6 +2510,69 @@ def main():
         help="Add relative-entropy non-Gaussianity as a 4th MAP-Elites descriptor "
              "axis so the archive illuminates the non-Gaussian axis (QD diversity, "
              "not an objective). Off by default (keeps the validated 3D grid).",
+    )
+    parser.add_argument(
+        "--ng-desc-bins", type=int, default=9,
+        help="Number of D4 (non-Gaussianity) descriptor bins.",
+    )
+    parser.add_argument(
+        "--ng-desc-max", type=float, default=2.0,
+        help="Upper edge of the D4 (non-Gaussianity) descriptor axis.",
+    )
+    parser.add_argument(
+        "--ng-desc-scale", choices=["log", "linear"], default="log",
+        help="D4 centroid spacing. 'log' resolves the small-delta stepping-stone "
+             "region (0.02-0.4) that a linear grid lumps into the Gaussian bin.",
+    )
+    parser.add_argument(
+        "--ng-desc-min", type=float, default=0.02,
+        help="Smallest nonzero D4 centroid for --ng-desc-scale log.",
+    )
+    parser.add_argument(
+        "--moment-tail-tol", type=float, default=0.05,
+        help="In-loop truncation gate: reject states whose top-decile Fock bins "
+             "carry more than this fraction of (normalised) mass. Loose by design "
+             "(legit high-squeezing states have percent-level tails at L=50); the "
+             "dual-L sweep remains the exact judge.",
+    )
+    parser.add_argument(
+        "--seed-metric", default="pareto",
+        choices=["expectation", "probability", "pareto", "pareto_ng"],
+        help="Seed-scan selection metric. 'pareto_ng' stratifies by the "
+             "non-Gaussianity descriptor and round-robins across strata, so "
+             "restarts stop re-seeding only the Gaussian basin.",
+    )
+    parser.add_argument(
+        "--seed-accept", type=str, default="",
+        help="Comma-separated additional genotype designs accepted as seed "
+             "sources (converted via converter.upgrade_genotype), e.g. 'B30F' "
+             "when running B30.",
+    )
+    parser.add_argument(
+        "--seed-fill", choices=["topup", "jitter"], default="topup",
+        help="'topup': inject seeds then keep random init for the rest (explore). "
+             "'jitter': fill the WHOLE population with jittered copies of the "
+             "seeds (multi-start exploitation, for short Adam polish runs).",
+    )
+    parser.add_argument(
+        "--seed-jitter", type=float, default=0.05,
+        help="Gaussian sigma (raw genotype space) for --seed-fill jitter.",
+    )
+    parser.add_argument(
+        "--pnr-seeds", type=int, default=0,
+        help="Inject up to N canonical PNR-pattern seeds (combinations of "
+             "1..pnr_max clicks with breeding-friendly continuous defaults; "
+             "enumerated, then sampled). B30-family genotypes only.",
+    )
+    parser.add_argument(
+        "--macro-prob", type=float, default=0.0,
+        help="Probability an exploration offspring takes a physics macro-mutation "
+             "(photon-subtract leaf, symmetrize subtree, breeding merge, ...) "
+             "instead of a polynomial move. B30-family genotypes only.",
+    )
+    parser.add_argument(
+        "--adam-lr", type=float, default=0.01,
+        help="Learning rate for --mode single (Adam polish).",
     )
 
     parser.add_argument(
@@ -2406,6 +2673,18 @@ def main():
         "alpha_probability": args.alpha_probability,
         "alpha_nongauss": args.alpha_nongauss,
         "moment_ng_descriptor": args.moment_ng_descriptor,
+        "ng_desc_bins": args.ng_desc_bins,
+        "ng_desc_max": args.ng_desc_max,
+        "ng_desc_scale": args.ng_desc_scale,
+        "ng_desc_min": args.ng_desc_min,
+        "moment_tail_tol": args.moment_tail_tol,
+        "seed_metric": args.seed_metric,
+        "seed_accept": args.seed_accept,
+        "seed_fill": args.seed_fill,
+        "seed_jitter": args.seed_jitter,
+        "pnr_seeds": args.pnr_seeds,
+        "macro_prob": args.macro_prob,
+        "adam_lr": args.adam_lr,
         # Moment-space scorer (exact, truncation-free); target (alpha,beta) are
         # needed here so the scorer can build its L-cutoff <O> operator.
         "scorer": args.scorer,

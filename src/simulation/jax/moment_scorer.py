@@ -390,9 +390,13 @@ def jax_equivalent_gaussian_static(params: Dict[str, Any], depth: int = 3
 
     lp = params["leaf_params"]
     active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)   # (nleaves,)
-    n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)           # (nleaves,)
+    # Prefer the STE (straight-through) float variants when the decoder provides
+    # them: forward values are IDENTICAL to the int fields (exact round), but the
+    # backward pass sees d(round)/dx = 1, so any smooth downstream use of the
+    # detector counts carries gradient back to the genotype.
+    n_ctrl = jnp.asarray(lp.get("n_ctrl_ste", lp["n_ctrl"])).astype(jnp.float64)
     r = jnp.asarray(lp["r"]); ph = jnp.asarray(lp["phases"]); dv = jnp.asarray(lp["disp"])
-    pnr = jnp.asarray(lp["pnr"])                                     # (nleaves, >=2)
+    pnr = jnp.asarray(lp.get("pnr_ste", lp["pnr"]))                  # (nleaves, >=2)
 
     Vg = jnp.eye(2 * N)              # vacuum (hbar=2 => cov = I)
     mug = jnp.zeros(2 * N)
@@ -793,9 +797,9 @@ def _leaf_prob_product_static(params, L, depth: int = 3):
     nleaves = 2 ** int(depth)
     lp = params["leaf_params"]
     active = jnp.asarray(params["leaf_active"]).astype(jnp.float64)
-    n_ctrl = jnp.asarray(lp["n_ctrl"]).astype(jnp.float64)
+    n_ctrl = jnp.asarray(lp.get("n_ctrl_ste", lp["n_ctrl"])).astype(jnp.float64)
     r = jnp.asarray(lp["r"]); ph = jnp.asarray(lp["phases"]); dv = jnp.asarray(lp["disp"])
-    pnr = jnp.asarray(lp["pnr"])
+    pnr = jnp.asarray(lp.get("pnr_ste", lp["pnr"]))
     P = jnp.array(1.0)
     for i in range(nleaves):
         n_real = jnp.where(active[i] > 0.5, n_ctrl[i] + 1.0, 0.0)
@@ -1140,12 +1144,17 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
     # validated fast path identical).
     remat = bool(cfg.get("moment_remat", depth >= 4))
     BF = int(cfg.get("moment_bf", MOMENT_BF))           # fired-box buffer (perf knob)
-    # heralded-state norm tolerance: a state with too much mass beyond L has an
-    # UNRELIABLE renormalised <O>, so gradient descent can exploit the L-cutoff
-    # truncation (the moment-scorer analogue of the Fock artifact).  Require the
-    # signal state to be essentially complete within L (default 99%).  If too
-    # many states are rejected at a low L, RAISE --moment-cutoff.
-    norm_tol = float(cfg.get("moment_norm_tol", 0.99))
+    # IN-LOOP truncation gate: a state with too much mass near the TOP of the
+    # L-box has an unreliable renormalised <O> (the herald normalises within L,
+    # so mass beyond L is invisible), and gradient descent / the GA can exploit
+    # that truncation -- the moment-scorer analogue of the Fock artifact.  The
+    # honest criterion is the periodic dual-L sweep; this cheap gate kills the
+    # gross exploits AT INSERTION TIME so they never become elites: reject any
+    # state whose top-decile Fock bins carry more than ``moment_tail_tol`` of
+    # its (normalised) mass.  NOTE: the default must stay loose enough for
+    # legitimately photon-rich states (r~1.9 squeezing has percent-level tails
+    # at L=50); the dual-L sweep remains the exact judge.
+    tail_tol = float(cfg.get("moment_tail_tol", 0.05))
     # 'fast' search mode: skip the exact per-leaf probability (8 sub-heralds) when
     # probability isn't being optimised (w_prob~0) -> big speedup; periodic exact
     # re-validation recovers the true probability.  Default on when w_prob==0.
@@ -1173,7 +1182,12 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
         kf = jnp.sum(fired_mask.astype(jnp.float64))
         logprod = jnp.sum(jnp.where(fired_mask, jnp.log(eff_pnr + 1.0), 0.0))
         in_budget = (kf <= maxf) & (logprod <= jnp.log(float(BF)) + 1e-6)
-        valid = (joint_prob > 1e-40) & (herald_norm > 0.5) & in_budget
+        # truncation gate (see tail_tol above): psi is normalised within L, so
+        # heavy mass in the top decile of the box flags an L-truncation exploit.
+        n_tail = max(1, Lp // 10)
+        tail_mass = jnp.sum(jnp.abs(psi[Lp - n_tail:]) ** 2)
+        tail_ok = tail_mass < tail_tol
+        valid = (joint_prob > 1e-40) & (herald_norm > 0.5) & in_budget & tail_ok
         n_eff, max_eff = _effective_photons_static(cov_k, eff_pnr, coupling_eps, depth)
         active_modes = jnp.sum(jnp.asarray(params["leaf_active"]).astype(jnp.float64))
         exp_val = jnp.where(valid, raw_exp, 0.0)            # grad-safe placeholder
@@ -1204,8 +1218,12 @@ def _score_pop_static_jit(genotypes, operator_L, genotype_name, config_hashable,
 
     loss_fn = jax.checkpoint(loss) if remat else loss
     (_lv, aux), grad = jax.vmap(jax.value_and_grad(loss_fn, has_aux=True))(genotypes)
-    fit = jnp.stack([-aux["final_exp"], -aux["log_prob"],
-                     -aux["active"], -aux["photons"]], axis=1)
+    # 2-OBJECTIVE Pareto dominance: (exp, prob) ONLY.  The former objectives 3/4
+    # (-active, -photons) made every proto-non-Gaussian candidate Pareto-DOMINATED
+    # by the Gaussian corner (fewer photons/leaves always won inside a cell), so
+    # stepping stones toward breeding structure were deleted at insertion.
+    # Complexity/photons remain DESCRIPTOR axes (diversity), not objectives.
+    fit = jnp.stack([-aux["final_exp"], -aux["log_prob"]], axis=1)
     desc_axes = [aux["active"], aux["max_pnr"], aux["photons"]]
     if ng_desc:                                   # optional 4th MAP-Elites axis
         desc_axes.append(aux["delta_ng"])
@@ -1310,17 +1328,29 @@ def _revalidate_jit(genotypes, op_lo, op_hi, genotype_name, config_hashable,
         # probability objective is real). obj1 convention = log10(P) (<= 0).
         P = jnp.real(_leaf_prob_product_static(p, L_hi, depth))
         log10P = jnp.log10(jnp.clip(P, 1e-45, 1.0))
-        return elo, ehi, jnp.sum(jnp.abs(plo) ** 2), log10P
+        # tail mass of the HIGH-L state's top decile: plo/phi are normalised, so
+        # sum|plo|^2 == 1 always (the old "norm" check was a no-op); the honest
+        # truncation diagnostic at L_hi is heavy mass near the top of the box.
+        n_tail = max(1, int(L_hi) // 10)
+        tail_hi = jnp.sum(jnp.abs(phi[int(L_hi) - n_tail:]) ** 2)
+        return elo, ehi, tail_hi, log10P
 
     return jax.vmap(one)(genotypes)
 
 
 def clean_archive_moment(repertoire, genotype_name, config_hashable, base_cutoff,
-                         L_lo, L_hi, tol=0.02, norm_tol=0.99, chunk=None):
+                         L_lo, L_hi, tol=0.02, tail_tol=0.02, chunk=None,
+                         prev_fp=None):
     """Periodic dual-L sweep: re-score the archive at high L, refresh fitness[0]
     to the exact high-L <O>, and DROP any cell whose search-L <O> disagrees by
-    >tol (or whose search-L herald wasn't normalised) -- i.e. an L-truncation
-    artifact.  Returns (cleaned_repertoire, num_removed).
+    >tol (or whose HIGH-L state still has heavy top-decile tail mass) -- i.e. an
+    L-truncation artifact.  Returns (cleaned_repertoire, num_removed, fp).
+
+    INCREMENTAL MODE: pass ``prev_fp`` (the fingerprint array returned by the
+    previous sweep) and only cells whose fitness[0] changed since then (new or
+    replaced solutions) are re-scored; unchanged cells keep their validated
+    values.  This makes an every-250-generation cadence affordable at depth 5,
+    where a full-archive sweep costs tens of minutes.
 
     NB: this re-score runs at L_hi AND moment_bf_high (default 8192) -- a MUCH
     bigger Hermite box than the search -- so it is the heaviest VRAM moment of a
@@ -1341,23 +1371,31 @@ def clean_archive_moment(repertoire, genotype_name, config_hashable, base_cutoff
     shp = fit.shape
     fitf = fit.reshape(-1, shp[-1])
     gen = np.asarray(repertoire.genotypes).reshape(fitf.shape[0], -1)
-    valid = np.where(np.isfinite(fitf[:, 0]) & (fitf[:, 0] > -1e9))[0]
+    valid_mask = np.isfinite(fitf[:, 0]) & (fitf[:, 0] > -1e9)
+    if prev_fp is not None and prev_fp.shape[0] == fitf.shape[0]:
+        # only re-validate cells whose stored fitness changed since last sweep
+        changed = valid_mask & (fitf[:, 0] != prev_fp)
+    else:
+        changed = valid_mask
+    valid = np.where(changed)[0]
     n_removed = 0
-    has_prob = fitf.shape[1] > 1                   # 2-objective archive (exp, prob)
+    has_prob = fitf.shape[1] > 1                   # (exp, prob[, legacy extras])
     for s in range(0, len(valid), chunk):
         idx = valid[s:s + chunk]
-        elo, ehi, nlo, lp = _revalidate_jit(
+        elo, ehi, tail_hi, lp = _revalidate_jit(
             jnp.asarray(gen[idx].astype(np.float64)), op_lo, op_hi,
             genotype_name, config_hashable, int(base_cutoff), int(L_lo), int(L_hi))
-        elo = np.asarray(elo); ehi = np.asarray(ehi); nlo = np.asarray(nlo)
-        art = (np.abs(ehi - elo) > tol) | (nlo < norm_tol)
+        elo = np.asarray(elo); ehi = np.asarray(ehi)
+        tail_hi = np.asarray(tail_hi)
+        art = (np.abs(ehi - elo) > tol) | (tail_hi > tail_tol)
         fitf[idx, 0] = -ehi                       # refresh to exact high-L <O>
         if has_prob:
             fitf[idx, 1] = np.asarray(lp)         # refresh exact probability (obj1=log10 P)
         fitf[idx[art], 0] = -np.inf               # drop the artifacts
         n_removed += int(art.sum())
+    fp = fitf[:, 0].copy()                        # post-refresh fingerprint
     new = repertoire.replace(fitnesses=jnp.asarray(fitf.reshape(shp)))
-    return new, n_removed
+    return new, n_removed, fp
 
 
 def _numpy_leaf_prob_product(params, L):

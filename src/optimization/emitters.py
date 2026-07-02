@@ -136,6 +136,67 @@ class BiasedMixingEmitter(MixingEmitter):
         return x_new, emitter_state
 
 
+class NGBiasedMixingEmitter(BiasedMixingEmitter):
+    """Elite stream that softmax-selects parents by NON-GAUSSIANITY instead of
+    fitness: logits = descriptor[ng_axis] / T over valid cells.
+
+    Rationale: the standard elite stream (softmax on -<O>) is a Gaussian-basin
+    pump -- the best <O> lives at the Gaussian optimum, so 'intensification'
+    keeps re-breeding the same Gaussian genotypes.  This stream instead breeds
+    the most non-Gaussian archive members, giving the barrier-crossing
+    candidates dedicated offspring pressure even while their <O> is worse.
+    Requires the NG descriptor axis (--moment-ng-descriptor)."""
+
+    def __init__(self, *args, ng_axis: int = 3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ng_axis = ng_axis
+
+    def emit(self, repertoire, emitter_state, random_key):
+        flat_genotypes = repertoire.genotypes.reshape(
+            -1, repertoire.genotypes.shape[-1]
+        )
+        flat_fitnesses = repertoire.fitnesses.reshape(
+            -1, repertoire.fitnesses.shape[-1]
+        )
+        flat_desc = repertoire.descriptors.reshape(
+            -1, repertoire.descriptors.shape[-1]
+        )
+        valid_mask = flat_fitnesses[:, 0] > -jnp.inf
+
+        ax = min(self._ng_axis, flat_desc.shape[-1] - 1)
+        ng = flat_desc[:, ax]
+        logits = jnp.where(valid_mask, ng / self._temperature, -jnp.inf)
+
+        n_variation = int(self._batch_size * self._variation_percentage)
+        n_mutation = self._batch_size - n_variation
+        key_select, key_mut, key_cross = jax.random.split(random_key, 3)
+
+        if n_variation > 0:
+            key_select, subkey = jax.random.split(key_select)
+            idx_var = jax.random.categorical(subkey, logits, shape=(n_variation * 2,))
+            parents_var = flat_genotypes[idx_var]
+            x_variation = self._variation_fn(
+                parents_var[:n_variation], parents_var[n_variation:], key_cross
+            )
+        else:
+            x_variation = jnp.zeros((0, flat_genotypes.shape[1]))
+
+        if n_mutation > 0:
+            key_select, subkey = jax.random.split(key_select)
+            idx_mut = jax.random.categorical(subkey, logits, shape=(n_mutation,))
+            x_mutation = self._mutation_fn(flat_genotypes[idx_mut], key_mut)
+        else:
+            x_mutation = jnp.zeros((0, flat_genotypes.shape[1]))
+
+        if n_variation == 0:
+            x_new = x_mutation
+        elif n_mutation == 0:
+            x_new = x_variation
+        else:
+            x_new = jnp.concatenate([x_variation, x_mutation], axis=0)
+        return x_new, emitter_state
+
+
 class HybridEmitter(MixingEmitter):
     """
     Hybrid Emitter that delegates to two sub-emitters:
