@@ -216,7 +216,12 @@ def stable_control_probability(C, beta, n, hbar=2.0, budget=6e7):
     if cutoff ** (2 * len(nf)) > budget:        # tensor too large -> give up
         return None
     rho = density_matrix(bf, Cf, cutoff=cutoff, hbar=hbar, normalize=False)
-    return float(np.real(rho[tuple(nf) + tuple(nf)])) * p_vac
+    # thewalrus uses the Strawberry Fields (interleaved) index convention:
+    # rho[n0, m0, n1, m1, ...].  The <n|rho|n> diagonal is thus (n0,n0,n1,n1,...),
+    # NOT the block (n0,n1,...,n0,n1,...).  Clip tiny negative-from-below noise
+    # exactly as thewalrus.quantum.probabilities does.
+    idx = tuple(v for x in nf for v in (x, x))
+    return max(0.0, float(np.real(rho[idx]))) * p_vac
 
 
 def load_valid_rows(verdicts_path):
