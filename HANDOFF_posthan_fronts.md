@@ -85,14 +85,21 @@ for rf in 1p0 2p0 3p0 4p0; do rfv=${rf/p/.}; \
 
 ## What to check first (sanity, given the earlier bug)
 
-- In the smoke test, `exp_after` (frame-corrected) should now be **≤ ~G** for
-  factor 1.0 (exactly `exp_before`) and only mildly above for gentle factors —
-  NOT the 1.1–2.0 blow-ups seen with the stale-frame scoring. If `exp_after` is
-  still ≫ G at factor 1.0, the Gaussian alignment isn't doing its job — stop and
-  investigate `min_exp_over_gaussian` / `align_cut`.
-- `posthan_summary.md`: **PROMOTED count per target**. Given the diagnosis,
-  expect promotions to come mostly from the **factor-1.0 (damping-only)** points
-  (lossless P boost); factor ≥2 points should mostly sit at higher ⟨O⟩.
+- In the smoke test, `exp_after` (frame-corrected) should be **= `exp_before`**
+  at factor 1.0 (fidG 1.000) and only mildly above for gentle factors — NOT the
+  1.1–2.0 blow-ups of the stale-frame `exp_after_raw`. If `exp_after` is still
+  ≫ G at factor 1.0, the Gaussian alignment isn't working — stop and check
+  `min_exp_over_gaussian` / `--align-cut`.
+- **Factor-1.0 P boost**: with `stable_control_probability` wired in, rf1 should
+  now show P **> ×1** (the damping boost), not the old ×1.0 fallback, even for
+  20-photon states. `prob_after_stable` is recorded next to `prob_after`.
+- **Self-check**: the run auto-compares the stable density-matrix probability
+  against the loop hafnian on every ≤16-photon state and prints
+  `[WARN] stable P != hafnian P ...` on any >1% disagreement. **A clean run
+  should print no such warnings** — if it does, the stable path is off; stop.
+- `posthan_summary.md`: **PROMOTED count per target**. Expect promotions mostly
+  from **factor-1.0 (damping-only)** points (lossless P boost, ⟨O⟩ unchanged);
+  factor ≥2 points trade real ⟨O⟩ for larger P/lower photons.
 
 ## Notes
 

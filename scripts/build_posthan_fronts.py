@@ -229,8 +229,9 @@ def main(argv=None):
     out_df = pd.concat(all_rows, ignore_index=True)
     keep_cols = ["target", "group", "design", "depth", "run", "cell",
                  "reduction_factor", "exp_before", "exp_after", "exp_after_raw",
-                 "prob_before", "prob_after", "prob_after_herald",
-                 "prob_before_archive", "max_sq_before", "max_sq_after",
+                 "prob_before", "prob_after", "prob_after_stable",
+                 "prob_after_herald", "prob_before_archive",
+                 "max_sq_before", "max_sq_after",
                  "Nc_before", "Nc_after", "fidelity_after_before", "fidelity_raw",
                  "on_pre_front", "on_prob_front", "on_sq_front", "promoted"]
     out_df[[c for c in keep_cols if c in out_df.columns]].to_csv(

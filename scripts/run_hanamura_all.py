@@ -176,6 +176,49 @@ def min_exp_over_gaussian(psi, O, cut=48, seed=None):
     return float(best.fun), best.x, _apply_gaussian(best.x, psi)
 
 
+# --------------------------------------------------------------------------- #
+# Stable success probability of a (damped) control Gaussian state at high photon
+# number.  optimize_gbs_architecture computes P via a loop hafnian, guarded off
+# above 16 detected photons -- so the DAMPING probability boost is unknown for
+# our 20-photon champions (esp. reduction factor 1.0 = damping only).  This is
+# the reduced_herald recipe applied to the control marginal: (1) condition the
+# n=0 control modes analytically (Schur complement, vacuum covariance = I,
+# hbar=2 -- identical to reduced_herald), (2) build the fired-mode density matrix
+# with thewalrus' stable Hermite recurrence and read off the diagonal
+# <n|rho|n> = P(detect n).  Cost is set by the fired-mode cutoff, not the loop
+# hafnian, so it stays tractable where the hafnian does not.  HBAR=2.
+# --------------------------------------------------------------------------- #
+def stable_control_probability(C, beta, n, hbar=2.0, budget=6e7):
+    """P(detect pattern ``n``) of the control Gaussian state (C, beta), computed
+    stably.  Returns None if the fired-mode tensor would exceed ``budget``."""
+    from thewalrus.quantum import density_matrix
+    C = np.asarray(C, float); beta = np.asarray(beta, float)
+    n = [int(x) for x in n]
+    k = len(n)                                  # C is 2k x 2k, xp-ordered
+    fired = [i for i in range(k) if n[i] >= 1]
+    vac = [i for i in range(k) if n[i] == 0]
+    if vac:                                     # analytic vacuum conditioning
+        ki = fired + [i + k for i in fired]
+        vi = vac + [i + k for i in vac]
+        Vk = C[np.ix_(ki, ki)]; Vv = C[np.ix_(vi, vi)]; Vkv = C[np.ix_(ki, vi)]
+        M = Vv + np.eye(len(vi))
+        sol = np.linalg.solve(M, np.column_stack([Vkv.T, beta[vi]]))
+        Cf = Vk - Vkv @ sol[:, :-1]; Cf = 0.5 * (Cf + Cf.T)
+        bf = beta[ki] - Vkv @ sol[:, -1]
+        p_vac = float(2.0 ** len(vac) / np.sqrt(np.linalg.det(M))
+                      * np.exp(-0.5 * beta[vi] @ np.linalg.solve(M, beta[vi])))
+    else:
+        Cf, bf, p_vac = C, beta, 1.0
+    nf = [n[i] for i in fired]
+    if not nf:
+        return p_vac
+    cutoff = max(nf) + 1
+    if cutoff ** (2 * len(nf)) > budget:        # tensor too large -> give up
+        return None
+    rho = density_matrix(bf, Cf, cutoff=cutoff, hbar=hbar, normalize=False)
+    return float(np.real(rho[tuple(nf) + tuple(nf)])) * p_vac
+
+
 def load_valid_rows(verdicts_path):
     """Valid sub-Gaussian rows from verdicts.jsonl, deduped by 'key', sorted by
     run so the per-run repertoire cache hits."""
@@ -381,6 +424,27 @@ def main(argv=None):
                     arch_a = han.get("architecture") or {}
                     max_sq_after = float(arch_a.get("max_squeezing_db", float("nan")))
 
+                    # stable damping-boosted P (the loop-hafnian path in
+                    # optimize_gbs_architecture is guarded off above 16 detected
+                    # photons -> None for our 20-photon champions, esp. rf=1).
+                    p_opt = han.get("prob_after")
+                    p_stable = float("nan")
+                    try:
+                        cm = han.get("control_moments") or {}
+                        if cm.get("C2") is not None:
+                            ps = stable_control_probability(cm["C2"], cm["beta2"], n1)
+                            if ps is not None and np.isfinite(ps):
+                                p_stable = float(ps)
+                    except Exception as _e:
+                        if os.environ.get("HAN_DEBUG"):
+                            print(f"    stable-prob fail rf{rf:g}: {_e!r}", flush=True)
+                    # auto cross-check where both exist (<=16 photons): must agree
+                    if (p_opt is not None and np.isfinite(p_opt) and p_opt > 0
+                            and np.isfinite(p_stable)
+                            and abs(p_stable - p_opt) / p_opt > 1e-2):
+                        print(f"    [WARN] stable P {p_stable:.3e} != hafnian P "
+                              f"{p_opt:.3e} (rf{rf:g}, n1={n1})", flush=True)
+
                     exp_after_raw = exp_after_G = prob_a = float("nan")
                     fid_raw = fid_G = float("nan")
                     after_ok = False
@@ -427,15 +491,17 @@ def main(argv=None):
                         # diagnostic: the stale-frame value (old buggy scoring)
                         "exp_after_raw": exp_after_raw,
                         "prob_before": float(prob_b),
-                        # PRIMARY P after = the damping-optimized success prob
-                        # (Step 2 is where the boost lives); fall back to the
-                        # reduced-herald value only if the loop hafnian was
-                        # intractable (n1 too large, e.g. rf=1 high-photon).
-                        "prob_after": (float(han["prob_after"])
-                                       if han.get("prob_after") is not None
-                                       and np.isfinite(han["prob_after"])
-                                       else (float(prob_a)
-                                             if np.isfinite(prob_a) else None)),
+                        # PRIMARY P after = damping-optimized success prob (Step 2
+                        # is where the boost lives): exact loop-hafnian value when
+                        # tractable, else the stable density-matrix value, else
+                        # the undamped reduced-herald prob.
+                        "prob_after": (float(p_opt)
+                                       if p_opt is not None and np.isfinite(p_opt)
+                                       else (p_stable if np.isfinite(p_stable)
+                                             else (float(prob_a)
+                                                   if np.isfinite(prob_a) else None))),
+                        "prob_after_stable": (p_stable if np.isfinite(p_stable)
+                                              else None),
                         "prob_after_herald": (float(prob_a)
                                               if np.isfinite(prob_a) else None),
                         "prob_before_archive": float(10.0 ** float(r["logP"])),
