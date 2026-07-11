@@ -65,6 +65,15 @@ import time
 import argparse
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
+# This script is CPU-bound: JAX is only used for the tiny genotype decode and the
+# GKP operator build; all the heavy work (reduced_herald, optimize_gbs_architecture,
+# the scipy Gaussian alignment / damping, thewalrus density matrices) is numpy /
+# scipy / thewalrus on the CPU.  Left on the default GPU backend, JAX preallocates
+# ~75% of each card's VRAM and then sits at 0% util -- wasting VRAM and preventing
+# an 8-way fan-out from coexisting on the GPUs.  Pin to CPU (override by exporting
+# JAX_PLATFORMS=cuda if you ever want the GPU).
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
