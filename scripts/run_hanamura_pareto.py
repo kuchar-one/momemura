@@ -130,6 +130,13 @@ def main(argv=None):
     ap.add_argument("--wigner-ncut", type=int, default=60)
     ap.add_argument("--no-wigner", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="cap total states (smoke runs)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip states whose per-state JSON already exists and "
+                         "rebuild the summary from the incremental JSONL -- "
+                         "makes the sweep resumable after interruption")
+    ap.add_argument("--max-seconds", type=float, default=0,
+                    help="stop starting new states after this many seconds "
+                         "(finish + write the current one); 0 = no limit")
     args = ap.parse_args(argv)
 
     import jax
@@ -176,6 +183,15 @@ def main(argv=None):
 
     summary = []
     n_done = n_fail = 0
+    import time as _time
+    _t0 = _time.time()
+    _sum_jsonl = os.path.join(args.out, "hanamura_summary.jsonl")
+
+    def _append_summary(row):
+        with open(_sum_jsonl, "a") as _fh:
+            _fh.write(json.dumps({k: (None if isinstance(v, float) and not np.isfinite(v)
+                                      else v) for k, v in row.items()}) + "\n")
+
     for csvf in sorted(glob.glob(os.path.join(args.pareto_dir, "*.csv"))):
         group = os.path.basename(csvf)[:-4]
         if not fnmatch.fnmatch(group, args.groups):
@@ -193,6 +209,12 @@ def main(argv=None):
             if args.limit and n_done >= args.limit:
                 break
             tag = f"{r['run']}_cell{int(r['cell_idx'])}"
+            if args.skip_existing and os.path.exists(os.path.join(gdir, f"{tag}.json")):
+                continue
+            if args.max_seconds and _time.time() - _t0 > args.max_seconds:
+                print(f"[time-box] stopping after {n_done} states; rerun with "
+                      f"--skip-existing to continue", flush=True)
+                break
             try:
                 gens, cfg = load_run(r["root"], r["group"], r["run"])
                 if int(cfg.get("modes") or 3) != 3:
@@ -298,6 +320,7 @@ def main(argv=None):
                                       and np.isfinite(han.get("prob_after") or np.nan)),
                     "after_source": after_src, "provenance": rec["provenance"],
                 })
+                _append_summary(summary[-1])
                 n_done += 1
                 print(f"  [{n_done}] {tag}: Nc {sum(n0)}->{sum(n1)}  "
                       f"P {prob_b:.2e}->{(han.get('prob_after') or float('nan')):.2e}  "
@@ -313,10 +336,17 @@ def main(argv=None):
             break
 
     import pandas as pd
-    sdf = pd.DataFrame(summary)
+    if os.path.exists(_sum_jsonl):
+        # the JSONL accumulates across (resumed) invocations -- the CSV/report
+        # always reflect the union, deduped by provenance.
+        sdf = (pd.read_json(_sum_jsonl, lines=True)
+               .drop_duplicates(subset="provenance", keep="last"))
+    else:
+        sdf = pd.DataFrame(summary)
     sdf.to_csv(os.path.join(args.out, "hanamura_summary.csv"), index=False)
     _write_report(args.out, sdf, n_done, n_fail)
-    print(f"\nDONE: {n_done} states, {n_fail} skipped. -> {args.out}")
+    print(f"\nDONE: {n_done} states this run ({len(sdf)} total), "
+          f"{n_fail} skipped. -> {args.out}")
 
 
 def _save_wigner_png(path, xs, Wb, Wa, title, n0, n1):

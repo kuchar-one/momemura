@@ -152,10 +152,17 @@ def compute_equivalent_gaussian(params: Dict[str, Any], light: bool = False) -> 
     initial_modes = []
     blocks_V = []
     blocks_mu = []
-    
+
+    # Depth-general: the leaf count is carried by the decoded params
+    # (2**depth entries in leaf_active).  Historically this function was
+    # hard-coded to depth 3 (range(8), 7 homodyne nodes, 3 mixing layers),
+    # which silently TRUNCATED depth-4/5 genotypes to their first 8 leaves.
+    nleaves = int(len(leaf_active))
+    n_nodes = nleaves - 1
+
     total_initial_modes = 0
-    
-    for i in range(8):
+
+    for i in range(nleaves):
         if not bool(leaf_active[i]):
             continue
             
@@ -224,24 +231,31 @@ def compute_equivalent_gaussian(params: Dict[str, Any], light: bool = False) -> 
     if hasattr(hx_raw, "__len__") and not isinstance(hx_raw, str):
         hx_values = [float(x) for x in hx_raw]
     else:
-        hx_values = [float(hx_raw)] * 7
-    while len(hx_values) < 7:
+        hx_values = [float(hx_raw)] * n_nodes
+    while len(hx_values) < n_nodes:
         hx_values.append(0.0)
-    
-    # Layer 1: mix leaves (0,1), (2,3), (4,5), (6,7)
-    # Layer 2: mix layer1 outputs: pairs (0,1) and (2,3) -> mixing indices 4, 5
-    # Layer 3: mix layer2 outputs: pair (0,1) -> mixing index 6
-    
+
+    # Mixing layers in mix_params node order (matches _static_tree in the JAX
+    # moment scorer): layer 1 pairs (0,1),(2,3),... first, then layer 2, ...,
+    # root last.  depth=3 reproduces the original [(1,4),(2,2),(3,1)].
+
     # Track the active "root" leaf index that represents the signal mode traveling up the tree
     active_signals = []
-    for i in range(8):
+    for i in range(nleaves):
         if bool(leaf_active[i]):
             active_signals.append(i)
         else:
             active_signals.append(None)
-            
+
+    layers = []
+    _pairs, _layer = nleaves // 2, 1
+    while _pairs >= 1:
+        layers.append((_layer, _pairs))
+        _pairs //= 2
+        _layer += 1
+
     mix_node_idx = 0
-    for layer, num_pairs in [(1, 4), (2, 2), (3, 1)]:
+    for layer, num_pairs in layers:
         next_active_signals = []
         for j in range(num_pairs):
             theta = float(mix_params[mix_node_idx][0])
