@@ -114,6 +114,68 @@ def _fidelity(psi_a, psi_b):
     return float(np.abs(np.vdot(a[:L] / na, b[:L] / nb)) ** 2)
 
 
+# --------------------------------------------------------------------------- #
+# Score the reduced state UP TO A GAUSSIAN UNITARY.
+#
+# The Hanamura reduction preserves the heralded output only up to a Gaussian
+# unitary G (paper Eqs. 1/38; thesis 4chapter.tex l.315/335 defines the check as
+# F(psi_n, G psi_n')).  <O> is not Gaussian-invariant, so the reduced state must
+# be re-aligned by the optimal single-mode Gaussian before scoring -- exactly the
+# freedom the MOME final-Gaussian gene already used to obtain <O>_before.  Here we
+# minimize <O> over G = displace . rotate . squeeze (same parametrization as
+# gbs_optimizer.align_states), WARM-STARTED from the nearest already-solved
+# neighbour in objective space (neighbours share a similar optimal G, so a seed
+# start + one identity guard replaces a cold multi-start -- ~2.5x fewer evals).
+# --------------------------------------------------------------------------- #
+def _apply_gaussian(params, psi):
+    import scipy.linalg as sla
+    psi = np.asarray(psi, complex).ravel()
+    n = len(psi)
+    a = np.diag(np.sqrt(np.arange(1, n)), k=1); ad = a.T
+    dr, di, r, phi, varphi = params
+    v = sla.expm(0.5 * (r * np.exp(-2j * phi) * a @ a
+                        - r * np.exp(2j * phi) * ad @ ad)) @ psi
+    v = np.exp(1j * np.arange(n) * varphi) * v
+    disp = dr + 1j * di
+    v = sla.expm(disp * ad - np.conj(disp) * a) @ v
+    return v / (np.linalg.norm(v) + 1e-300)
+
+
+def min_exp_over_gaussian(psi, O, cut=48, seed=None):
+    """Return (min <O> over single-mode Gaussian G, best params, aligned psi at
+    full cutoff).  ``seed`` is a warm-start param vector from a neighbour."""
+    import scipy.linalg as sla
+    from scipy.optimize import minimize
+    psi = np.asarray(psi, complex).ravel()
+    c = int(min(cut, len(psi)))
+    p = psi[:c] / (np.linalg.norm(psi[:c]) + 1e-300)
+    Oc = np.asarray(O)[:c, :c]
+    a = np.diag(np.sqrt(np.arange(1, c)), k=1); ad = a.T
+    ph = np.arange(c)
+
+    def f(params):
+        dr, di, r, phi, varphi = params
+        v = sla.expm(0.5 * (r * np.exp(-2j * phi) * a @ a
+                            - r * np.exp(2j * phi) * ad @ ad)) @ p
+        v = np.exp(1j * ph * varphi) * v
+        disp = dr + 1j * di
+        v = sla.expm(disp * ad - np.conj(disp) * a) @ v
+        v = v / (np.linalg.norm(v) + 1e-300)
+        return float(np.real(np.vdot(v, Oc @ v)))
+
+    if seed is not None:                       # warm: neighbour seed + 1 guard
+        starts = [seed, (0.0, 0.0, 0.0, 0.0, 0.0)]
+    else:                                      # cold: robust multi-start
+        starts = [(0, 0, 0, 0, 0), (0, 0, 0.4, 0, 0), (0, 0, -0.4, 0, 0)]
+    best = None
+    for s in starts:
+        res = minimize(f, np.array(s, float), method="Nelder-Mead",
+                       options=dict(xatol=1e-4, fatol=1e-8, maxiter=1500))
+        if best is None or res.fun < best.fun:
+            best = res
+    return float(best.fun), best.x, _apply_gaussian(best.x, psi)
+
+
 def load_valid_rows(verdicts_path):
     """Valid sub-Gaussian rows from verdicts.jsonl, deduped by 'key', sorted by
     run so the per-run repertoire cache hits."""
@@ -131,8 +193,15 @@ def main(argv=None):
                     default=os.path.join(REPO, "recompute_ng", "verdicts.jsonl"))
     ap.add_argument("--out", default=os.path.join(REPO, "hanamura_all"),
                     help="output dir (one JSONL per shard lives here)")
-    ap.add_argument("--reduction-factors", default="2.0,3.0,4.0",
-                    help="comma list of reduction factors to sweep per state")
+    ap.add_argument("--reduction-factors", default="1.0,2.0,3.0,4.0",
+                    help="comma list of reduction factors to sweep per state "
+                         "(1.0 = damping-only: exactly output-preserving, the "
+                         "lossless probability-boost front)")
+    ap.add_argument("--align-cut", type=int, default=48,
+                    help="Fock cutoff for the min-<O>-over-Gaussian alignment")
+    ap.add_argument("--no-align", action="store_true",
+                    help="skip the Gaussian re-alignment (record raw stale-frame "
+                         "<O> only; for A/B comparison with the buggy scoring)")
     ap.add_argument("--herald-cap", type=int, default=60)
     ap.add_argument("--max-squeezing-db", type=float, default=0.0,
                     help="cap optimized squeezing (feasibility); 0 = uncapped so "
@@ -210,6 +279,23 @@ def main(argv=None):
 
     rep_cache = {}
     op_cache = {}
+    # warm-start seeds for the Gaussian re-alignment, keyed by (target, factor):
+    # each entry is a list of (exp_before, best_gaussian_params).  A new state
+    # seeds from the entry with the nearest exp_before -- neighbours in objective
+    # space share a similar optimal final Gaussian (user's observation).
+    g_seed_cache: dict = {}
+
+    def _nearest_seed(target, rf, exp_key):
+        entries = g_seed_cache.get((target, rf))
+        if not entries:
+            return None
+        return min(entries, key=lambda e: abs(e[0] - exp_key))[1]
+
+    def _store_seed(target, rf, exp_key, params):
+        lst = g_seed_cache.setdefault((target, rf), [])
+        lst.append((float(exp_key), np.asarray(params, float)))
+        if len(lst) > 64:                      # bound memory; keep most recent
+            del lst[0]
 
     def load_run(run_rel):
         if run_rel not in rep_cache:
@@ -295,14 +381,31 @@ def main(argv=None):
                     arch_a = han.get("architecture") or {}
                     max_sq_after = float(arch_a.get("max_squeezing_db", float("nan")))
 
-                    exp_after = prob_a = fid = float("nan")
+                    exp_after_raw = exp_after_G = prob_a = float("nan")
+                    fid_raw = fid_G = float("nan")
                     after_ok = False
                     negvol_a = None
                     try:
                         psi_a, prob_a = reduced_full_state(eq, n0, n1, hcut)
                         psi_a = np.asarray(psi_a).ravel()
-                        exp_after = _expval(psi_a, O)
-                        fid = _fidelity(psi_a, psi_b)
+                        # raw (stale-frame) numbers -- the buggy scoring, kept
+                        # for A/B contrast
+                        exp_after_raw = _expval(psi_a, O)
+                        fid_raw = _fidelity(psi_a, psi_b)
+                        # frame-corrected: <O> minimized over a single-mode
+                        # Gaussian (the reduction is only defined up to one),
+                        # warm-started from the nearest neighbour
+                        if args.no_align or rf == 1.0:
+                            # rf==1 is damping-only: reduced_full_state is the
+                            # identity on the state, so raw == corrected exactly
+                            exp_after_G = exp_after_raw
+                            fid_G = fid_raw
+                        else:
+                            seed = _nearest_seed(target, rf, float(r["exp_hi"]))
+                            exp_after_G, gpar, psi_a_al = min_exp_over_gaussian(
+                                psi_a, O, cut=args.align_cut, seed=seed)
+                            _store_seed(target, rf, float(r["exp_hi"]), gpar)
+                            fid_G = _fidelity(psi_a_al, psi_b)
                         after_ok = True
                         if args.wigner:
                             negvol_a = _negvol(psi_a)
@@ -318,19 +421,32 @@ def main(argv=None):
                         "design": cfg.get("genotype"), "depth": depth,
                         "exp_before": float(r["exp_hi"]),
                         "exp_before_recomp": exp_before_recomp,
-                        "exp_after": exp_after,
+                        # PRIMARY: <O>_after minimized over the final Gaussian
+                        # (the reduction is only defined up to one).
+                        "exp_after": exp_after_G,
+                        # diagnostic: the stale-frame value (old buggy scoring)
+                        "exp_after_raw": exp_after_raw,
                         "prob_before": float(prob_b),
-                        "prob_after": (float(prob_a) if np.isfinite(prob_a) else None),
+                        # PRIMARY P after = the damping-optimized success prob
+                        # (Step 2 is where the boost lives); fall back to the
+                        # reduced-herald value only if the loop hafnian was
+                        # intractable (n1 too large, e.g. rf=1 high-photon).
+                        "prob_after": (float(han["prob_after"])
+                                       if han.get("prob_after") is not None
+                                       and np.isfinite(han["prob_after"])
+                                       else (float(prob_a)
+                                             if np.isfinite(prob_a) else None)),
+                        "prob_after_herald": (float(prob_a)
+                                              if np.isfinite(prob_a) else None),
                         "prob_before_archive": float(10.0 ** float(r["logP"])),
-                        "prob_after_opt": (float(han["prob_after"])
-                                           if han.get("prob_after") is not None
-                                           and np.isfinite(han["prob_after"])
-                                           else None),
                         "max_sq_before": max_sq_before,
                         "max_sq_after": max_sq_after,
                         "Nc_before": total0, "Nc_after": int(sum(n1)),
                         "n0": n0, "n1": n1,
-                        "fidelity_after_before": fid,
+                        # fidelity up to a Gaussian unitary (thesis F metric);
+                        # fid_raw is the stale-frame overlap for contrast
+                        "fidelity_after_before": fid_G,
+                        "fidelity_raw": fid_raw,
                         "k_eff_before": int(sum(1 for x in n0 if x >= 1)),
                         "k_eff_after": int(sum(1 for x in n1 if x >= 1)),
                         "herald_cutoff": hcut, "after_ok": after_ok,
@@ -342,13 +458,14 @@ def main(argv=None):
                     fh.flush()
                     n_recs += 1
                     state_done = True
-                    gain = (prob_a / prob_b) if (np.isfinite(prob_a)
-                                                 and prob_b > 0) else float("nan")
+                    p_after = rec["prob_after"]
+                    gain = (p_after / prob_b) if (p_after and prob_b > 0) else float("nan")
                     print(f"  {group}/{r['cell']} rf{rf:g}: "
-                          f"O {r['exp_hi']:.4f}->{exp_after:.4f}  "
-                          f"Nc {total0}->{sum(n1)}  P {prob_b:.1e}->{prob_a:.1e} "
+                          f"O {r['exp_hi']:.4f}->{exp_after_G:.4f}"
+                          f"(raw {exp_after_raw:.4f})  Nc {total0}->{sum(n1)}  "
+                          f"P {prob_b:.1e}->{(p_after or float('nan')):.1e} "
                           f"(x{gain:.1f})  sqdB {max_sq_before:.1f}->{max_sq_after:.1f}"
-                          f"  fid {fid:.3f}", flush=True)
+                          f"  fidG {fid_G:.3f}", flush=True)
                 except Exception as ef:
                     n_fail += 1
                     print(f"  [skip] {group}/{r['cell']} rf{rf:g}: {ef!r}", flush=True)

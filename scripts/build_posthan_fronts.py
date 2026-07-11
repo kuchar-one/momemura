@@ -119,10 +119,14 @@ def main(argv=None):
     all_rows, promoted_total = [], 0
     md = ["# Post-Hanamura Pareto fronts (all validated states, factor sweep)\n",
           "Fronts built entirely from the recomputed POST-Hanamura values and "
-          "sorted by them. Every optimized point (state x reduction-factor) is a "
-          "candidate; the front picks each state's best factor. **PROMOTED** = "
-          "on the POST probability front but dominated before → states the "
-          "front-only run could not have found.\n"]
+          "sorted by them. `exp_after` is ⟨O⟩ **minimized over the final Gaussian "
+          "unitary** (the reduction is only defined up to one; `exp_after_raw` is "
+          "the stale-frame value for contrast). Reduction factor **1.0 = "
+          "damping-only**: exactly output-preserving (⟨O⟩ unchanged, fid≈1), so "
+          "those points are the *lossless* probability-boost front. Every "
+          "optimized point (state x factor) is a candidate; the front picks each "
+          "state's best factor. **PROMOTED** = on the POST probability front but "
+          "dominated before → states the front-only run could not have found.\n"]
 
     for target, sub in df.groupby("target"):
         sub = sub.reset_index(drop=True)
@@ -224,9 +228,10 @@ def main(argv=None):
 
     out_df = pd.concat(all_rows, ignore_index=True)
     keep_cols = ["target", "group", "design", "depth", "run", "cell",
-                 "reduction_factor", "exp_before", "exp_after", "prob_before",
-                 "prob_after", "prob_before_archive", "max_sq_before",
-                 "max_sq_after", "Nc_before", "Nc_after", "fidelity_after_before",
+                 "reduction_factor", "exp_before", "exp_after", "exp_after_raw",
+                 "prob_before", "prob_after", "prob_after_herald",
+                 "prob_before_archive", "max_sq_before", "max_sq_after",
+                 "Nc_before", "Nc_after", "fidelity_after_before", "fidelity_raw",
                  "on_pre_front", "on_prob_front", "on_sq_front", "promoted"]
     out_df[[c for c in keep_cols if c in out_df.columns]].to_csv(
         os.path.join(args.out, "all_points.csv"), index=False)
