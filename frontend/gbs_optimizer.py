@@ -244,6 +244,86 @@ def generator_max_squeezing_db(C: np.ndarray, beta: np.ndarray) -> float:
         return float("inf")
 
 
+def _condition_vacuum_modes(C, beta, n):
+    """Exactly condition the n=0 control modes on their vacuum outcome
+    (Schur complement; vacuum covariance = I, hbar=2).  Returns the fired-mode
+    moments (Cf, bf), the fired pattern nf, and the vacuum-outcome probability
+    factor p_vac, so that P(n | C, beta) = p_vac * P(nf | Cf, bf)."""
+    C = np.asarray(C, float); beta = np.asarray(beta, float)
+    n = [int(x) for x in n]
+    k = len(n)                                  # C is 2k x 2k, xp-ordered
+    fired = [i for i in range(k) if n[i] >= 1]
+    vac = [i for i in range(k) if n[i] == 0]
+    if not vac:
+        return C, beta, n, 1.0
+    ki = fired + [i + k for i in fired]
+    vi = vac + [i + k for i in vac]
+    Vk = C[np.ix_(ki, ki)]; Vv = C[np.ix_(vi, vi)]; Vkv = C[np.ix_(ki, vi)]
+    M = Vv + np.eye(len(vi))
+    sol = np.linalg.solve(M, np.column_stack([Vkv.T, beta[vi]]))
+    Cf = Vk - Vkv @ sol[:, :-1]; Cf = 0.5 * (Cf + Cf.T)
+    bf = beta[ki] - Vkv @ sol[:, -1]
+    p_vac = float(2.0 ** len(vac) / np.sqrt(np.linalg.det(M))
+                  * np.exp(-0.5 * beta[vi] @ np.linalg.solve(M, beta[vi])))
+    return Cf, bf, [n[i] for i in fired], p_vac
+
+
+def stable_control_probability(C, beta, n, hbar=2.0, budget=6e7):
+    """P(detect pattern ``n``) of the control Gaussian state (C, beta), computed
+    via analytic vacuum conditioning of the n=0 modes plus thewalrus' stable
+    Hermite density-matrix recurrence on the fired modes.  Polynomial in the
+    fired-mode tensor size.  Returns None if the fired-mode tensor would
+    exceed ``budget``."""
+    from thewalrus.quantum import density_matrix
+    Cf, bf, nf, p_vac = _condition_vacuum_modes(C, beta, n)
+    if not nf:
+        return p_vac
+    cutoff = max(nf) + 1
+    if cutoff ** (2 * len(nf)) > budget:        # tensor too large -> give up
+        return None
+    rho = density_matrix(bf, Cf, cutoff=cutoff, hbar=hbar, normalize=False)
+    # thewalrus uses the interleaved index convention rho[n0, m0, n1, m1, ...]
+    idx = tuple(v for x in nf for v in (x, x))
+    return max(0.0, float(np.real(rho[idx]))) * p_vac
+
+
+# hafnian ceiling for the FIRED pattern: with the vacuum modes conditioned out
+# analytically the loop-hafnian element is fast well beyond the old 16-photon
+# guard (n=0 modes were the real cost driver: thewalrus keeps them in the
+# reduction, and a 20-photon 6-mode pattern with three zeros took ~35 s where
+# the conditioned 3-mode call takes milliseconds).
+_MAX_FIRED_PHOTONS_FOR_HAFNIAN = 22
+
+
+def control_pattern_probability(C, beta, n,
+                                budget: float = 6e7) -> Optional[float]:
+    """Cost-aware P(pattern) on the control marginal.  The n=0 modes are
+    always conditioned out analytically (exact); the fired-mode element is
+    then the exact loop hafnian where cheap, else the stable density-matrix
+    recurrence, else None.  All estimators agree to float precision where
+    they overlap (cross-checked in run_hanamura_all)."""
+    try:
+        Cf, bf, nf, p_vac = _condition_vacuum_modes(C, beta, n)
+    except Exception:
+        return None
+    if not nf:
+        return p_vac
+    if sum(nf) <= _MAX_FIRED_PHOTONS_FOR_HAFNIAN:
+        try:
+            p = float(success_probability(Cf, bf, nf))
+            if np.isfinite(p):
+                return p * p_vac
+        except Exception:
+            pass
+    try:
+        p = stable_control_probability(Cf, bf, nf, budget=budget)
+        if p is not None and np.isfinite(p):
+            return float(p) * p_vac
+    except Exception:
+        pass
+    return None
+
+
 def _damping_prob(C, beta, t, n):
     """Returns (prob, valid, Cp, bp)."""
     try:
@@ -252,11 +332,8 @@ def _damping_prob(C, beta, t, n):
         return 0.0, False, None, None
     if not is_valid_covariance(Cp):
         return 0.0, False, Cp, bp
-    try:
-        p = success_probability(Cp, bp, n)
-    except Exception:
-        return 0.0, False, Cp, bp
-    if not np.isfinite(p) or p <= 0:
+    p = control_pattern_probability(Cp, bp, n)
+    if p is None or not np.isfinite(p) or p <= 0:
         return 0.0, False, Cp, bp
     return p, True, Cp, bp
 
@@ -318,13 +395,10 @@ def optimize_damping(C: np.ndarray, beta: np.ndarray, n: Sequence[int],
     # no-damping probability is just the herald probability of (C, beta).
     # (The previous revision evaluated t = coth(1e3) ~ 1, i.e. FULL damping,
     # and so compared against ~0 -- and its fallback then installed the
-    # vacuum-damped generator instead of the identity.)
-    try:
-        p_id = float(success_probability(C, beta, n))
-        if not np.isfinite(p_id) or p_id < 0:
-            p_id = 0.0
-    except Exception:
-        p_id = 0.0
+    # vacuum-damped generator instead of the identity.)  Cost-aware evaluator:
+    # the raw loop hafnian hangs for minutes-hours on wide 20-photon patterns.
+    p_id = control_pattern_probability(C, beta, n)
+    p_id = 0.0 if (p_id is None or not np.isfinite(p_id) or p_id < 0) else p_id
     sq_id = generator_max_squeezing_db(C, beta)
     # identity embedding for the fallback: t very large == no damping on fired
     # modes; vacuum modes still get their (always-beneficial) t=1 absorption.
@@ -775,14 +849,10 @@ _MAX_PHOTONS_FOR_PROB = 16
 
 
 def _safe_success_probability(C, beta, n) -> Optional[float]:
-    """success_probability, or None if the total photon count would make the
-    loop hafnian intractable."""
-    if sum(int(x) for x in n) > _MAX_PHOTONS_FOR_PROB:
-        return None
-    try:
-        return success_probability(C, beta, n)
-    except Exception:
-        return None
+    """Cost-aware success probability: exact loop hafnian where cheap, the
+    stable vacuum-conditioned density-matrix path otherwise (so high-photon
+    patterns get a value instead of None), or None if both are intractable."""
+    return control_pattern_probability(C, beta, n)
 
 
 def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,

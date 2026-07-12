@@ -93,6 +93,8 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [REPO, os.path.join(REPO, "scripts")]
 
+from frontend.gbs_optimizer import stable_control_probability  # noqa: E402 (re-export)
+
 # (alpha, beta) per target label, exactly as numpy_crosscheck_ng.py uses them.
 TARGETS = {
     "a1p00_b1p00": (1.0, 1 + 0j),
@@ -232,42 +234,6 @@ def min_exp_over_gaussian(psi, O, cut=48, seed=None):
 # <n|rho|n> = P(detect n).  Cost is set by the fired-mode cutoff, not the loop
 # hafnian, so it stays tractable where the hafnian does not.  HBAR=2.
 # --------------------------------------------------------------------------- #
-def stable_control_probability(C, beta, n, hbar=2.0, budget=6e7):
-    """P(detect pattern ``n``) of the control Gaussian state (C, beta), computed
-    stably.  Returns None if the fired-mode tensor would exceed ``budget``."""
-    from thewalrus.quantum import density_matrix
-    C = np.asarray(C, float); beta = np.asarray(beta, float)
-    n = [int(x) for x in n]
-    k = len(n)                                  # C is 2k x 2k, xp-ordered
-    fired = [i for i in range(k) if n[i] >= 1]
-    vac = [i for i in range(k) if n[i] == 0]
-    if vac:                                     # analytic vacuum conditioning
-        ki = fired + [i + k for i in fired]
-        vi = vac + [i + k for i in vac]
-        Vk = C[np.ix_(ki, ki)]; Vv = C[np.ix_(vi, vi)]; Vkv = C[np.ix_(ki, vi)]
-        M = Vv + np.eye(len(vi))
-        sol = np.linalg.solve(M, np.column_stack([Vkv.T, beta[vi]]))
-        Cf = Vk - Vkv @ sol[:, :-1]; Cf = 0.5 * (Cf + Cf.T)
-        bf = beta[ki] - Vkv @ sol[:, -1]
-        p_vac = float(2.0 ** len(vac) / np.sqrt(np.linalg.det(M))
-                      * np.exp(-0.5 * beta[vi] @ np.linalg.solve(M, beta[vi])))
-    else:
-        Cf, bf, p_vac = C, beta, 1.0
-    nf = [n[i] for i in fired]
-    if not nf:
-        return p_vac
-    cutoff = max(nf) + 1
-    if cutoff ** (2 * len(nf)) > budget:        # tensor too large -> give up
-        return None
-    rho = density_matrix(bf, Cf, cutoff=cutoff, hbar=hbar, normalize=False)
-    # thewalrus uses the Strawberry Fields (interleaved) index convention:
-    # rho[n0, m0, n1, m1, ...].  The <n|rho|n> diagonal is thus (n0,n0,n1,n1,...),
-    # NOT the block (n0,n1,...,n0,n1,...).  Clip tiny negative-from-below noise
-    # exactly as thewalrus.quantum.probabilities does.
-    idx = tuple(v for x in nf for v in (x, x))
-    return max(0.0, float(np.real(rho[idx]))) * p_vac
-
-
 def load_valid_rows(verdicts_path):
     """Valid sub-Gaussian rows from verdicts.jsonl, deduped by 'key', sorted by
     run so the per-run repertoire cache hits."""
@@ -327,7 +293,8 @@ def main(argv=None):
     from src.simulation.jax.moment_scorer import moment_operator
     from frontend.gaussian_decomposition import compute_equivalent_gaussian
     from frontend import gbs_optimizer as go
-    from frontend.gbs_optimizer import reduced_herald, decompose_architecture
+    from frontend.gbs_optimizer import (reduced_herald, decompose_architecture,
+                                        stable_control_probability)
     from gen_hanamura_data import reduced_full_state
 
     os.makedirs(args.out, exist_ok=True)
