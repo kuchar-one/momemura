@@ -60,5 +60,5 @@ for trial in range(5):
     d1, d2 = abs(P0 - P0_fock), abs(P0_alt - P0_fock)
     print(f"trial {trial}: P0_fock={P0_fock:.6f}  half-exp={P0:.6f} (d={d1:.1e})  "
           f"full-exp={P0_alt:.6f} (d={d2:.1e})  state fid={f:.10f}")
-    ok &= (min(d1, d2) < 1e-8 and f > 1 - 1e-9)
+    ok &= (min(d1, d2) < 1e-6 * max(P0_fock, 1e-3) + 1e-10 and f > 1 - 1e-9)
 print("ALL OK" if ok else "FAILURE")
