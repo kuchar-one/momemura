@@ -162,3 +162,15 @@ for i in $(seq 0 23); do OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THRE
   > hanamura_all2/shard$i.log 2>&1 & done; wait
 python scripts/build_posthan_fronts.py --sweep-dir hanamura_all2
 ```
+
+### 2026-07-12b: the shard-0 stall at 215 lines (commit follows ae6d1f8)
+
+Both the old and the fixed sweep hung at the same state
+(`B30_c30_a1p41_b1p41/20260708-000521` cell 15703, pattern `[8,0,10,0,0,2]`):
+thewalrus' loop hafnian does not eliminate n=0 modes from the reduction, so
+this 6-mode 20-photon pattern costs ~35 s *per damping evaluation* (the
+3-fired-mode call is instant).  `control_pattern_probability` now conditions
+the vacuum modes out analytically before any hafnian/stable evaluation --
+15703's full rf1 damping drops to 0.3 s.  Kill the stuck shards, `git pull`,
+and relaunch (resume with `--skip-existing` into the same out dir is safe:
+rec_ids are unchanged and completed records are kept).
