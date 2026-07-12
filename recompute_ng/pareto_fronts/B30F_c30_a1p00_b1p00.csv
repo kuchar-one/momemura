@@ -1,0 +1,2 @@
+root,group,run,cell_idx,exp_hi,logP,prob,total_photons,fired_modes,max_pnr,vs_gaussian,vs_gs,wigner_negvol,target_alpha,target_beta
+output/experiments,B30F_c30_a1p00_b1p00,20260705-164542_p64_i800,5666,0.6222316518303186,-2.622561114743654,0.0023847281883758605,11.999827923969175,,5.999913961984587,-0.04443534816968142,,,1.0,(1+0j)

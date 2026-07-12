@@ -1,0 +1,97 @@
+{
+  "group": "00B_c30_a1p00_b1p00",
+  "target_alpha": "(1+0j)",
+  "target_beta": "(1+0j)",
+  "design": "00B",
+  "depth": 3,
+  "provenance": "output_oldold/experiments/00B_c30_a1p00_b1p00/20260521-031239_p64_i2500#456",
+  "exp_O": 0.7230889202399489,
+  "vs_gaussian": 0.0564222535732819,
+  "before": {
+    "pnr_detections": [
+      14
+    ],
+    "total_photons": 14,
+    "prob": 0.05736382000815045,
+    "architecture": {
+      "squeezings_r": [
+        1.8638589233292473,
+        1.7452804161730493
+      ],
+      "squeezings_db": [
+        16.18927290896056,
+        15.159313082355323
+      ],
+      "max_squeezing_db": 16.18927290896056,
+      "displacements_xp": [
+        [
+          1.0165065220026452,
+          -0.002769689342258519
+        ],
+        [
+          4.000588527609956,
+          4.401099960315345
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            2.5546951128869546e-08,
+            -9.975420938511925e-09
+          ],
+          [
+            0.9999835421815755,
+            0.005737191472147927
+          ]
+        ],
+        [
+          [
+            -0.9270143380356004,
+            0.37502588854160185
+          ],
+          [
+            2.7424892596660498e-08,
+            -1.7607084650398647e-10
+          ]
+        ]
+      ]
+    },
+    "wigner_negvol": 0.5910469951521852
+  },
+  "after": {
+    "pnr_detections": [
+      6
+    ],
+    "total_photons": 6,
+    "prob": 0.0,
+    "prob_gain": 0.0,
+    "architecture": {
+      "squeezings_r": [
+        0.0
+      ],
+      "squeezings_db": [
+        0.0
+      ],
+      "max_squeezing_db": 0.0,
+      "displacements_xp": [
+        [
+          0.0,
+          0.0
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      ]
+    },
+    "state_source": "core_exact",
+    "wigner_negvol": 4.8373872463751315
+  },
+  "k_eff_before": 1,
+  "k_eff_after": 1,
+  "herald_cutoff": 36
+}

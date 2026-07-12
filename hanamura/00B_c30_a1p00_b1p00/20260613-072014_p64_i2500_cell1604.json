@@ -1,0 +1,97 @@
+{
+  "group": "00B_c30_a1p00_b1p00",
+  "target_alpha": "(1+0j)",
+  "target_beta": "(1+0j)",
+  "design": "00B",
+  "depth": 3,
+  "provenance": "experiments/00B_c30_a1p00_b1p00/20260613-072014_p64_i2500#1604",
+  "exp_O": 0.7263157694694397,
+  "vs_gaussian": 0.0596491028027726,
+  "before": {
+    "pnr_detections": [
+      11
+    ],
+    "total_photons": 11,
+    "prob": 0.06530633954075421,
+    "architecture": {
+      "squeezings_r": [
+        1.7071897863078729,
+        0.8055639542075512
+      ],
+      "squeezings_db": [
+        14.828462075102017,
+        6.997039602650067
+      ],
+      "max_squeezing_db": 14.828462075102017,
+      "displacements_xp": [
+        [
+          1.3448603493991684,
+          -0.011396154897941102
+        ],
+        [
+          -4.323881460444285,
+          -4.471330529193085
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            -0.9999919640091803,
+            0.004008758608315003
+          ],
+          [
+            -3.7011239834074694e-05,
+            2.004124189224203e-05
+          ]
+        ],
+        [
+          [
+            3.7799629330886356e-05,
+            1.8511382257582805e-05
+          ],
+          [
+            -0.999319827366673,
+            0.03687656248025123
+          ]
+        ]
+      ]
+    },
+    "wigner_negvol": 1.0971180393415703
+  },
+  "after": {
+    "pnr_detections": [
+      5
+    ],
+    "total_photons": 5,
+    "prob": 0.0,
+    "prob_gain": 0.0,
+    "architecture": {
+      "squeezings_r": [
+        0.0
+      ],
+      "squeezings_db": [
+        0.0
+      ],
+      "max_squeezing_db": 0.0,
+      "displacements_xp": [
+        [
+          -0.0,
+          -0.0
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      ]
+    },
+    "state_source": "core_exact",
+    "wigner_negvol": 5.9316788794411766
+  },
+  "k_eff_before": 1,
+  "k_eff_after": 1,
+  "herald_cutoff": 30
+}

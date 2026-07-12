@@ -1,0 +1,97 @@
+{
+  "group": "B30_c30_a1p00_b1p41",
+  "target_alpha": "(1+0j)",
+  "target_beta": "(1+1j)",
+  "design": "B30",
+  "depth": 3,
+  "provenance": "output_oldold/experiments/B30_c30_a1p00_b1p41/20260221-175753_p64_i2500#18",
+  "exp_O": 1.112000714255338,
+  "vs_gaussian": 0.112000714255338,
+  "before": {
+    "pnr_detections": [
+      0
+    ],
+    "total_photons": 0,
+    "prob": 0.978931035029474,
+    "architecture": {
+      "squeezings_r": [
+        1.3705148388341177,
+        0.07801237711301491
+      ],
+      "squeezings_db": [
+        11.904140637443636,
+        0.6776068980067582
+      ],
+      "max_squeezing_db": 11.904140637443636,
+      "displacements_xp": [
+        [
+          2.535387832925052,
+          0.10154982310141603
+        ],
+        [
+          -0.06925697100637526,
+          0.007356159370321617
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            -0.9998885968566393,
+            -0.013984541379955738
+          ],
+          [
+            -0.005141641809508775,
+            0.000888818291314627
+          ]
+        ],
+        [
+          [
+            0.00216963274676074,
+            -0.004745436986879879
+          ],
+          [
+            -0.24126105489070926,
+            0.9704462256686712
+          ]
+        ]
+      ]
+    },
+    "wigner_negvol": 0.9040527541558505
+  },
+  "after": {
+    "pnr_detections": [
+      0
+    ],
+    "total_photons": 0,
+    "prob": 1.0,
+    "prob_gain": 1.0042489904824012,
+    "architecture": {
+      "squeezings_r": [
+        0.0
+      ],
+      "squeezings_db": [
+        0.0
+      ],
+      "max_squeezing_db": 0.0,
+      "displacements_xp": [
+        [
+          0.0,
+          0.0
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      ]
+    },
+    "state_source": "architecture_rule",
+    "wigner_negvol": 0.9040527541558505
+  },
+  "k_eff_before": 0,
+  "k_eff_after": 0,
+  "herald_cutoff": 30
+}

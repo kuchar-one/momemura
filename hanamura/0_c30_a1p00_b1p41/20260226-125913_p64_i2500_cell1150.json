@@ -1,0 +1,97 @@
+{
+  "group": "0_c30_a1p00_b1p41",
+  "target_alpha": "(1+0j)",
+  "target_beta": "(1+1j)",
+  "design": "0",
+  "depth": 3,
+  "provenance": "experiments/0_c30_a1p00_b1p41/20260226-125913_p64_i2500#1150",
+  "exp_O": 1.0567984609733785,
+  "vs_gaussian": 0.0567984609733782,
+  "before": {
+    "pnr_detections": [
+      10
+    ],
+    "total_photons": 10,
+    "prob": 0.19770617360235282,
+    "architecture": {
+      "squeezings_r": [
+        1.6453529339328368,
+        1.205360248921348
+      ],
+      "squeezings_db": [
+        14.291353999807134,
+        10.469626096241429
+      ],
+      "max_squeezing_db": 14.291353999807134,
+      "displacements_xp": [
+        [
+          0.9201090900669411,
+          0.010211988768794256
+        ],
+        [
+          4.258805959439166,
+          -4.090365783672718
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            -0.9999919212906153,
+            -0.0037385442528295094
+          ],
+          [
+            0.00047723490697189493,
+            0.0013974574111117507
+          ]
+        ],
+        [
+          [
+            0.001258193892322071,
+            -0.0007730384865109037
+          ],
+          [
+            0.7731320589074021,
+            0.6342433593260772
+          ]
+        ]
+      ]
+    },
+    "wigner_negvol": 0.9785898900890406
+  },
+  "after": {
+    "pnr_detections": [
+      4
+    ],
+    "total_photons": 4,
+    "prob": NaN,
+    "prob_gain": NaN,
+    "architecture": {
+      "squeezings_r": [
+        0.0
+      ],
+      "squeezings_db": [
+        0.0
+      ],
+      "max_squeezing_db": 0.0,
+      "displacements_xp": [
+        [
+          NaN,
+          NaN
+        ]
+      ],
+      "U_passive_reim": [
+        [
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      ]
+    },
+    "state_source": "core_exact",
+    "wigner_negvol": 5.550842238006512
+  },
+  "k_eff_before": 1,
+  "k_eff_after": 1,
+  "herald_cutoff": 30
+}

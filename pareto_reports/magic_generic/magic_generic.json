@@ -1,0 +1,66 @@
+{
+  "target_u": [
+    0.6666666666666666,
+    0.6666666666666666,
+    -0.33333333333333337
+  ],
+  "B_G": 1.0,
+  "groups": [
+    "/sessions/busy-stoic-volta/mnt/momemura/experiments/00B_c30_a1p00_b1p41",
+    "/sessions/busy-stoic-volta/mnt/momemura/experiments/0_c30_a1p00_b1p41",
+    "/sessions/busy-stoic-volta/mnt/momemura/experiments/B30_c30_a1p00_b1p41"
+  ],
+  "records": [
+    {
+      "nls_db": 0.94,
+      "O": 0.8062,
+      "prob": 0.26941340861727964,
+      "Nc": 1,
+      "k_det": 3,
+      "leaves": 3,
+      "max_pnr": 1,
+      "gbs_sq_db": 8.26,
+      "geno": "00B",
+      "run": "20260211-102126_p128_i2500",
+      "cutoff": 30,
+      "han_Nc": 1,
+      "han_prob": 0.47532598440649804,
+      "han_gain": 1.7642996569696776,
+      "han_sq_db": 4.56
+    },
+    {
+      "nls_db": 2.82,
+      "O": 0.5218,
+      "prob": 0.003590843880475844,
+      "Nc": 2,
+      "k_det": 5,
+      "leaves": 5,
+      "max_pnr": 2,
+      "gbs_sq_db": 10.86,
+      "geno": "00B",
+      "run": "20260212-114248_p128_i2500",
+      "cutoff": 30,
+      "han_Nc": 2,
+      "han_prob": 0.08348502761326125,
+      "han_gain": 23.249417237877285,
+      "han_sq_db": 7.74
+    },
+    {
+      "nls_db": 3.9,
+      "O": 0.4077,
+      "prob": 1.3236807605923934e-05,
+      "Nc": 35,
+      "k_det": 4,
+      "leaves": 6,
+      "max_pnr": 15,
+      "gbs_sq_db": 8.57,
+      "geno": "00B",
+      "run": "20260212-160950_p128_i2500",
+      "cutoff": 30,
+      "han_Nc": 13,
+      "han_prob": 6.59189388227252e-05,
+      "han_gain": 4.979972572331124,
+      "han_sq_db": 12.17
+    }
+  ]
+}

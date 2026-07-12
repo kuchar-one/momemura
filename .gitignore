@@ -18,3 +18,7 @@ recompute/**/*.npy
 recompute*/_rows.jsonl
 recompute*/_runs.jsonl
 recompute_a2p73/
+*experiments*/
+experiments_old/*/*.pkl
+experiments_old/*/*.npy
+output_*/
