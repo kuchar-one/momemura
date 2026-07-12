@@ -174,3 +174,15 @@ the vacuum modes out analytically before any hafnian/stable evaluation --
 15703's full rf1 damping drops to 0.3 s.  Kill the stuck shards, `git pull`,
 and relaunch (resume with `--skip-existing` into the same out dir is safe:
 rec_ids are unchanged and completed records are kept).
+
+### 2026-07-12c: second stall class (many fired modes)
+
+13/24 shards finished; the rest sat on a2p73 states with 4-5 *fired* control
+modes: each damping evaluation is a ~0.25 s multimode hafnian and the
+unbounded 5-dim Nelder-Mead spends 30-60+ min per state.  `optimize_damping`
+now switches to bounded coordinate descent for >=4 fired modes (26 s cold /
+0.2 s warm on the worst observed state; identical gains on the benchmarks)
+and caps the NM budget otherwise.  The sweep also logs a `[state]` line
+before the heavy work, so any future slow state is identifiable immediately.
+Kill the stragglers, `git pull`, resume with the same commands (same out dir;
+completed records are kept).
