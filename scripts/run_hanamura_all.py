@@ -410,6 +410,10 @@ def main(argv=None):
             eq = compute_equivalent_gaussian(params)
             n0 = [int(x) for x in eq["pnr_outcomes"]]
             total0 = int(sum(n0))
+            # announce the state BEFORE the heavy work, so a slow/stuck state
+            # is identifiable from the log immediately
+            print(f"  [state] {group}/{run_tag}/{r['cell']}  n0={n0}  "
+                  f"Nc={total0}", flush=True)
             hcut = int(min(args.herald_cap, max(cutoff, 2 * total0 + 8)))
             O = get_operator(target, hcut)
 

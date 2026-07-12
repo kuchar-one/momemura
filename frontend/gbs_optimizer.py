@@ -432,12 +432,44 @@ def optimize_damping(C: np.ndarray, beta: np.ndarray, n: Sequence[int],
         s = np.asarray(seed_lam, float).ravel()
         if len(s) == kf and np.all(np.isfinite(s)):
             starts.insert(0, s)
-    best = None
-    for lam0 in starts:
-        res = minimize(objective, lam0, method="Nelder-Mead",
-                       options=dict(xatol=1e-4, fatol=1e-7, maxiter=2500))
-        if best is None or res.fun < best.fun:
-            best = res
+
+    if kf >= 4:
+        # Many fired modes: full Nelder-Mead needs O(1000) objective calls and
+        # each call is a multimode hafnian -- unbounded, this ran for the
+        # better part of an hour on 5-fired-mode states.  Use bounded
+        # coordinate descent instead: sweeps of 1-D Brent solves per mode.
+        # Any damping vector is EXACT physics (a suboptimal t just means a
+        # smaller probability boost, never a wrong generator), so trading a
+        # few percent of boost for a ~10-50x smaller evaluation budget is
+        # safe.
+        from scipy.optimize import minimize_scalar
+        lam = (starts[0].astype(float).copy() if seed_lam is not None
+               else np.full(kf, -0.05))
+        f_cur = objective(lam)
+        for _sweep in range(3):
+            improved = False
+            for j in range(kf):
+                def f1(x, j=j):
+                    v = lam.copy(); v[j] = x
+                    return objective(v)
+                r1 = minimize_scalar(f1, bounds=(-0.7, 0.7), method="bounded",
+                                     options=dict(xatol=5e-3, maxiter=18))
+                if r1.fun < f_cur - 1e-10:
+                    lam[j] = float(r1.x); f_cur = float(r1.fun)
+                    improved = True
+            if not improved:
+                break
+        class _R:  # minimal result shim
+            pass
+        best = _R(); best.x = lam; best.fun = f_cur
+    else:
+        best = None
+        for lam0 in starts:
+            res = minimize(objective, lam0, method="Nelder-Mead",
+                           options=dict(xatol=1e-4, fatol=1e-7, maxiter=2500,
+                                        maxfev=max(300, 150 * kf)))
+            if best is None or res.fun < best.fun:
+                best = res
 
     lam_star_f = best.x
     t_star = embed(lam_star_f)
