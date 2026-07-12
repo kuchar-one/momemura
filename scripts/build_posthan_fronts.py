@@ -111,9 +111,28 @@ def main(argv=None):
     print(f"loaded {len(df)} optimized points "
           f"({df['key'].nunique()} states x factors) from {args.sweep_dir}")
 
-    for c in ["exp_before", "exp_after", "prob_before", "prob_after",
-              "max_sq_before", "max_sq_after", "reduction_factor"]:
+    for c in ["exp_before", "exp_after", "exp_after_cal", "exp_before_recomp",
+              "prob_before", "prob_after", "max_sq_before", "max_sq_after",
+              "reduction_factor"]:
         df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    # archive-calibrated after-quality: exp_before and exp_after must share one
+    # yardstick (exp_before is the validated L=200 value; the raw exp_after is
+    # an hcut reconstruction with a per-state truncation bias of up to a few
+    # 1e-2).  Records from the fixed sweep carry exp_after_cal directly; for
+    # older records reconstruct it from exp_before + (exp_after -
+    # exp_before_recomp), which cancels the shared reconstruction bias.
+    cal_fallback = df["exp_before"] + (df["exp_after"] - df["exp_before_recomp"])
+    cal = df["exp_after_cal"].where(df["exp_after_cal"].notna(), cal_fallback)
+    df["exp_after"] = cal.where(cal.notna(), df["exp_after"])
+    # drop records the sweep itself flagged invalid (before-underflow states,
+    # failed after-reconstructions): their exp/prob values are meaningless and
+    # a garbage exp_after ~ 0 would rank as a perfect GKP state.  The sanity
+    # floor also catches older records whose reconstruction underflowed to
+    # exp_after ~ 0 before the sweep learned to flag them.
+    for flag in ("after_ok", "before_ok"):
+        if flag in df.columns:
+            df = df[df[flag].fillna(True).astype(bool)].reset_index(drop=True)
+    df = df[(df["exp_after"].isna()) | (df["exp_after"] > 0.05)].reset_index(drop=True)
     df["logP_after"] = np.log10(df["prob_after"].where(df["prob_after"] > 0))
 
     all_rows, promoted_total = [], 0

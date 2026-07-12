@@ -262,75 +262,135 @@ def _damping_prob(C, beta, t, n):
 
 
 def optimize_damping(C: np.ndarray, beta: np.ndarray, n: Sequence[int],
-                     max_squeezing_db: Optional[float] = None) -> Dict[str, Any]:
+                     max_squeezing_db: Optional[float] = None,
+                     seed_lam: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """Maximize the success probability over the damping freedom (Sec. VI B).
 
     Parametrized by lambda_m with t_m = coth(lambda_m): lambda > 0 is the
     attenuation branch (t > 1) and lambda < 0 the amplification branch
-    (t I < -C); lambda -> 0 is the identity (no damping).
+    (t I < -C); lambda -> 0 is the identity (t -> +/-inf, no damping) and
+    lambda -> +inf is full damping to vacuum (t -> 1).
+
+    Zero-herald control modes (n_m = 0) are handled ANALYTICALLY: t_m = 1
+    (full damping) is optimal for them -- P(0 on a vacuum mode) = 1 and the
+    limit reproduces the exact vacuum-projection absorption of the mode into
+    the Gaussian unitary -- so they are fixed at t=1 and excluded from the
+    numerical optimization, which then runs only over the fired modes.
 
     ``max_squeezing_db`` constrains the optimized generator's largest squeezing
     to stay at/below the cap (experimental-feasibility mode).  ``None`` is the
     paper-faithful "uncapped" mode, which still applies a generous numerical
     safety ceiling (``SAFETY_SQUEEZING_DB``) so the result stays realizable.
 
-    Returns the optimal t, the maximized probability, lambda, the no-damping
-    probability, the generator's max squeezing (dB) and whether the cap was met.
+    ``seed_lam`` warm-starts the fired-mode search (e.g. from the same state's
+    previous reduction factor).
+
+    Returns the optimal t, the maximized probability, lambda, the true
+    no-damping probability, the generator's max squeezing (dB) and whether the
+    cap was met.
     """
     from scipy.optimize import minimize
 
     k = C.shape[0] // 2
+    n = [int(x) for x in n]
     eff_cap = SAFETY_SQUEEZING_DB if max_squeezing_db is None else min(max_squeezing_db, SAFETY_SQUEEZING_DB)
 
     def coth(lam):
         return 1.0 / np.tanh(lam)
 
-    p_id, _, _, _ = _damping_prob(C, beta, coth(np.full(k, 1e3)), n)
-    sq_id = generator_max_squeezing_db(C, beta)
+    fired = [m for m in range(k) if n[m] >= 1]
+    vac = [m for m in range(k) if n[m] == 0]
+    kf = len(fired)
 
-    def objective(lam):
-        lam = np.where(np.abs(lam) < 1e-3, np.sign(lam + 1e-12) * 1e-3, lam)
-        p, valid, Cp, bp = _damping_prob(C, beta, coth(lam), n)
+    def embed(lam_f):
+        """Full t-vector: optimized fired modes + t=1 (full damp) on vacuum
+        modes.  lam is clamped away from 0 (|t| <= coth(1e-3) ~ 1000)."""
+        lam_f = np.where(np.abs(lam_f) < 1e-3,
+                         np.sign(lam_f + 1e-12) * 1e-3, lam_f)
+        t = np.empty(k)
+        for j, m in enumerate(fired):
+            t[m] = coth(lam_f[j])
+        for m in vac:
+            t[m] = 1.0
+        return t
+
+    # true identity reference: t -> inf leaves (C, beta) untouched, so the
+    # no-damping probability is just the herald probability of (C, beta).
+    # (The previous revision evaluated t = coth(1e3) ~ 1, i.e. FULL damping,
+    # and so compared against ~0 -- and its fallback then installed the
+    # vacuum-damped generator instead of the identity.)
+    try:
+        p_id = float(success_probability(C, beta, n))
+        if not np.isfinite(p_id) or p_id < 0:
+            p_id = 0.0
+    except Exception:
+        p_id = 0.0
+    sq_id = generator_max_squeezing_db(C, beta)
+    # identity embedding for the fallback: t very large == no damping on fired
+    # modes; vacuum modes still get their (always-beneficial) t=1 absorption.
+    t_identity = np.array([1.0 if m in vac else 1e9 for m in range(k)])
+
+    if kf == 0:                                # nothing to optimize
+        p_star, valid, Cs, bs = _damping_prob(C, beta, t_identity, n)
+        sq_star = generator_max_squeezing_db(Cs, bs) if valid else float("inf")
+        return dict(t=t_identity, prob=p_star, lam=np.full(k, np.nan),
+                    prob_no_damping=p_id, max_squeezing_db=sq_star,
+                    cap_met=(max_squeezing_db is None
+                             or sq_star <= max_squeezing_db + 1e-3),
+                    max_squeezing_cap=max_squeezing_db, vacuum_modes=vac)
+
+    def objective(lam_f):
+        p, valid, Cp, bp = _damping_prob(C, beta, embed(lam_f), n)
         if not valid:
-            return 120.0 + float(np.sum(lam ** 2))
+            return 120.0 + float(np.sum(lam_f ** 2))
         val = -np.log(p)
         sq = generator_max_squeezing_db(Cp, bp)
         if not np.isfinite(sq):
-            return 120.0 + float(np.sum(lam ** 2))
+            return 120.0 + float(np.sum(lam_f ** 2))
         if sq > eff_cap:                              # soft cap penalty (per dB)
             val += 5.0 * (sq - eff_cap)
         return val
 
-    best = None
-    starts = [np.full(k, -0.3), np.full(k, -0.5), np.full(k, -0.15), np.full(k, 0.3)]
+    starts = [np.full(kf, -0.05), np.full(kf, -0.3), np.full(kf, 0.3)]
     if max_squeezing_db is not None:
-        starts += [np.full(k, -0.05), np.full(k, -0.1)]
+        starts.append(np.full(kf, -0.1))
+    if seed_lam is not None:
+        s = np.asarray(seed_lam, float).ravel()
+        if len(s) == kf and np.all(np.isfinite(s)):
+            starts.insert(0, s)
+    best = None
     for lam0 in starts:
         res = minimize(objective, lam0, method="Nelder-Mead",
                        options=dict(xatol=1e-4, fatol=1e-7, maxiter=2500))
         if best is None or res.fun < best.fun:
             best = res
 
-    lam_star = best.x
-    t_star = coth(lam_star)
+    lam_star_f = best.x
+    t_star = embed(lam_star_f)
     p_star, valid, Cs, bs = _damping_prob(C, beta, t_star, n)
     sq_star = generator_max_squeezing_db(Cs, bs) if valid else float("inf")
-    cap_met = (sq_star <= eff_cap + 1e-3)
 
-    # fall back to no damping if the optimum is invalid, worse than identity,
-    # or violates the (effective) cap while identity satisfies it
-    use_identity = (not valid) or (p_star < p_id) or (sq_star > eff_cap + 1e-3 and sq_id <= eff_cap + 1e-3)
+    # fall back to the identity (plus vacuum-mode absorption) if the optimum is
+    # invalid, worse than no damping, or violates the (effective) cap while the
+    # identity satisfies it
+    use_identity = ((not valid) or (p_star < p_id)
+                    or (sq_star > eff_cap + 1e-3 and sq_id <= eff_cap + 1e-3))
     if use_identity:
-        t_star = coth(np.full(k, 1e3))
-        lam_star = np.full(k, 1e3)
-        p_star = p_id
-        sq_star = sq_id
-        cap_met = (sq_star <= eff_cap + 1e-3)
+        t_star = t_identity
+        p_star, valid, Cs, bs = _damping_prob(C, beta, t_star, n)
+        if not valid:
+            p_star = p_id
+        sq_star = generator_max_squeezing_db(Cs, bs) if valid else sq_id
+        lam_star_f = np.full(kf, 1e-9)
+
+    lam_full = np.full(k, np.nan)
+    for j, m in enumerate(fired):
+        lam_full[m] = lam_star_f[j]
 
     cap_met = (max_squeezing_db is None) or (sq_star <= max_squeezing_db + 1e-3)
-    return dict(t=t_star, prob=p_star, lam=lam_star, prob_no_damping=p_id,
-                max_squeezing_db=sq_star, cap_met=cap_met,
-                max_squeezing_cap=max_squeezing_db)
+    return dict(t=t_star, prob=p_star, lam=lam_full, lam_fired=lam_star_f,
+                prob_no_damping=p_id, max_squeezing_db=sq_star, cap_met=cap_met,
+                max_squeezing_cap=max_squeezing_db, vacuum_modes=vac)
 
 
 # =============================================================================
@@ -732,7 +792,8 @@ def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
                               max_squeezing_db: Optional[float] = None,
                               original_probability: Optional[float] = None,
                               verify: bool = True,
-                              herald_cutoff: Optional[int] = None) -> Dict[str, Any]:
+                              herald_cutoff: Optional[int] = None,
+                              damping_seed_lam: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """Run the Hanamura two-step optimization on a GBS generator.
 
     Parameters
@@ -792,7 +853,8 @@ def optimize_gbs_architecture(cov: np.ndarray, mu: np.ndarray, signal_idx: int,
     p1 = _safe_success_probability(C1, b1, n1)
 
     # --- Step 2: success-probability maximization --------------------------
-    damp = optimize_damping(C1, b1, n1, max_squeezing_db=max_squeezing_db)
+    damp = optimize_damping(C1, b1, n1, max_squeezing_db=max_squeezing_db,
+                            seed_lam=damping_seed_lam)
     C2, b2 = damping_transform_control(C1, b1, damp["t"])
     p2 = _safe_success_probability(C2, b2, n1)
 

@@ -25,7 +25,21 @@ low-photon after-herald repeat per factor.
 
   * BEFORE : `reduced_herald` on the equivalent-GBS generator, detecting n0
              -> psi_before + P_before ; max necessary squeezing from
-             `decompose_architecture`.
+             `decompose_architecture`.  States whose reconstruction underflows
+             (P=0 / empty psi / recomputed <O> far from the archive value) are
+             written as explicit before_ok=False records, never as NaN rows.
+  * rf=1 (damping-only) fast path: the heralded state is exactly psi_before,
+             so no reconstruction or Gaussian alignment runs; exp_after :=
+             exp_before_recomp (identical yardstick), fidelity := 1.  Zero-
+             herald control modes are damped to vacuum analytically inside
+             `optimize_damping` (t=1 is provably optimal for them), which
+             reproduces the exact vacuum-projection absorption of those modes.
+  * exp_after_cal = exp_hi + (exp_after - exp_before_recomp): the after-quality
+             calibrated to the archive (L=200) scale; both recomputed values
+             share the hcut-reconstruction estimator, so the common truncation
+             bias cancels.  `build_posthan_fronts.py` ranks on this.
+  * identical reduced patterns across factors (rf2/rf3 often coincide) are
+             computed once and copied (`dedup_of`).
   * Hanamura two-step : `gbs_optimizer.optimize_gbs_architecture` (verify=False,
              uncapped squeezing so the recorded max_sq is the *necessary* one).
   * AFTER  : `gen_hanamura_data.reduced_full_state` (architecture rule; SAME
@@ -136,40 +150,61 @@ def _fidelity(psi_a, psi_b):
 # neighbour in objective space (neighbours share a similar optimal G, so a seed
 # start + one identity guard replaces a cold multi-start -- ~2.5x fewer evals).
 # --------------------------------------------------------------------------- #
-def _apply_gaussian(params, psi):
-    import scipy.linalg as sla
+# Per-cutoff eigendecompositions of the squeeze and displacement generators.
+# K_sq = (a a - ad ad)/2 and K_d = (ad - a) are real antisymmetric, so
+# i K = H is Hermitian and expm(s K) = V exp(-i s w) V^dagger with (w, V) from
+# one eigh.  General phases enter by conjugation with the (diagonal) number
+# rotation: S(r, phi) = R(phi) S(r, 0) R(-phi), D(|d| e^{i th}) =
+# R(th) D(|d|) R(-th).  Each objective evaluation is then a handful of
+# matvecs instead of two dense scipy expm calls (~100x faster).
+_GAUSS_FACTORS: dict = {}
+
+
+def _gauss_factors(c):
+    if c not in _GAUSS_FACTORS:
+        a = np.diag(np.sqrt(np.arange(1, c)), k=1); ad = a.T
+        K_sq = 0.5 * (a @ a - ad @ ad)
+        K_d = ad - a
+        w_s, V_s = np.linalg.eigh(1j * K_sq)
+        w_d, V_d = np.linalg.eigh(1j * K_d)
+        _GAUSS_FACTORS[c] = (w_s, V_s, w_d, V_d, np.arange(c))
+    return _GAUSS_FACTORS[c]
+
+
+def _apply_gaussian_fast(params, psi):
+    """G(dr, di, r, phi, varphi) |psi> via precomputed eigenfactors; identical
+    to the expm implementation (unit-checked) but matvec-only."""
     psi = np.asarray(psi, complex).ravel()
-    n = len(psi)
-    a = np.diag(np.sqrt(np.arange(1, n)), k=1); ad = a.T
+    c = len(psi)
+    w_s, V_s, w_d, V_d, nvec = _gauss_factors(c)
     dr, di, r, phi, varphi = params
-    v = sla.expm(0.5 * (r * np.exp(-2j * phi) * a @ a
-                        - r * np.exp(2j * phi) * ad @ ad)) @ psi
-    v = np.exp(1j * np.arange(n) * varphi) * v
-    disp = dr + 1j * di
-    v = sla.expm(disp * ad - np.conj(disp) * a) @ v
+    # squeeze: S(r, phi) = R(-phi) S(r,0) R(phi) with R(t)=diag(e^{-i n t})
+    v = np.exp(-1j * nvec * phi) * psi
+    v = V_s @ ((np.exp(-1j * r * w_s)) * (V_s.conj().T @ v))
+    v = np.exp(1j * nvec * phi) * v
+    # number rotation
+    v = np.exp(1j * nvec * varphi) * v
+    # displacement: D(d) = R(th) D(|d|) R(-th), d = dr + i di, th = arg d
+    d = dr + 1j * di
+    if abs(d) > 0:
+        th = np.angle(d)
+        v = np.exp(-1j * nvec * th) * v
+        v = V_d @ ((np.exp(-1j * abs(d) * w_d)) * (V_d.conj().T @ v))
+        v = np.exp(1j * nvec * th) * v
     return v / (np.linalg.norm(v) + 1e-300)
 
 
 def min_exp_over_gaussian(psi, O, cut=48, seed=None):
     """Return (min <O> over single-mode Gaussian G, best params, aligned psi at
     full cutoff).  ``seed`` is a warm-start param vector from a neighbour."""
-    import scipy.linalg as sla
     from scipy.optimize import minimize
     psi = np.asarray(psi, complex).ravel()
     c = int(min(cut, len(psi)))
     p = psi[:c] / (np.linalg.norm(psi[:c]) + 1e-300)
     Oc = np.asarray(O)[:c, :c]
-    a = np.diag(np.sqrt(np.arange(1, c)), k=1); ad = a.T
-    ph = np.arange(c)
 
     def f(params):
-        dr, di, r, phi, varphi = params
-        v = sla.expm(0.5 * (r * np.exp(-2j * phi) * a @ a
-                            - r * np.exp(2j * phi) * ad @ ad)) @ p
-        v = np.exp(1j * ph * varphi) * v
-        disp = dr + 1j * di
-        v = sla.expm(disp * ad - np.conj(disp) * a) @ v
-        v = v / (np.linalg.norm(v) + 1e-300)
+        v = _apply_gaussian_fast(params, p)
         return float(np.real(np.vdot(v, Oc @ v)))
 
     if seed is not None:                       # warm: neighbour seed + 1 guard
@@ -182,7 +217,7 @@ def min_exp_over_gaussian(psi, O, cut=48, seed=None):
                        options=dict(xatol=1e-4, fatol=1e-8, maxiter=1500))
         if best is None or res.fun < best.fun:
             best = res
-    return float(best.fun), best.x, _apply_gaussian(best.x, psi)
+    return float(best.fun), best.x, _apply_gaussian_fast(best.x, psi)
 
 
 # --------------------------------------------------------------------------- #
@@ -393,6 +428,7 @@ def main(argv=None):
         run_rel = r["run"]
         group = os.path.basename(os.path.dirname(run_rel))
         root = os.path.dirname(os.path.dirname(run_rel))
+        run_tag = os.path.basename(run_rel).split("_")[0]  # e.g. 20260710-143857
         try:
             gens, cfg = load_run(run_rel)
             if int(cfg.get("modes") or 3) != 3:
@@ -426,15 +462,87 @@ def main(argv=None):
                 max_sq_before = float("nan")
             negvol_b = _negvol(psi_b) if args.wigner else None
 
+            # ---- validity gate on the before-state --------------------------
+            # A vanishing / non-finite reduced-herald probability or an empty
+            # reconstructed state means the generator is numerically outside
+            # what this pipeline can score (extreme squeezing).  Emit explicit
+            # invalid records instead of NaN/0.0 rows (which would poison the
+            # post-Hanamura fronts -- exp_after=0 would rank as a perfect GKP).
+            before_ok = (np.isfinite(prob_b) and prob_b > 0.0
+                         and np.isfinite(exp_before_recomp)
+                         and np.linalg.norm(psi_b) > 1e-6
+                         and abs(exp_before_recomp - float(r["exp_hi"])) < 0.25)
+            if not before_ok:
+                for rf in pending:
+                    fh.write(json.dumps({
+                        "rec_id": f"{r['key']}@rf{rf:g}", "key": r["key"],
+                        "reduction_factor": float(rf), "target": target,
+                        "group": group, "root": root, "run": run_rel,
+                        "cell": int(r["cell"]), "after_ok": False,
+                        "before_ok": False,
+                        "fail_reason": "before_underflow_or_mismatch",
+                        "exp_before": float(r["exp_hi"]),
+                        "exp_before_recomp": (None if not np.isfinite(exp_before_recomp)
+                                              else exp_before_recomp),
+                        "prob_before": (None if not np.isfinite(prob_b)
+                                        else float(prob_b)),
+                        "prob_before_archive": float(10.0 ** float(r["logP"])),
+                    }) + "\n")
+                fh.flush()
+                n_recs += len(pending)
+                n_states += 1
+                print(f"  [invalid-before] {group}/{run_tag}/{r['cell']}: "
+                      f"P_b={prob_b:.1e} <O>_recomp={exp_before_recomp:.4f} "
+                      f"(archive {float(r['exp_hi']):.4f})", flush=True)
+                continue
+
+            # consistent-yardstick before probability (same estimator family as
+            # the damped/after values): stable control-marginal probability
+            try:
+                _C0, _b0 = go.extract_control(np.asarray(eq["cov"], float),
+                                              np.asarray(eq["mu"], float),
+                                              [int(c) for c in eq["control_idx"]])
+                prob_b_stable = stable_control_probability(_C0, _b0, n0)
+            except Exception:
+                prob_b_stable = None
+
             maxsq = None if args.max_squeezing_db <= 0 else args.max_squeezing_db
             state_done = False
+            n1_cache = {}       # tuple(n1) -> record dict (dedupe across factors)
+            lam_seed = None     # warm-start damping from the previous factor
             for rf in pending:
                 try:
+                    # identical reduced patterns across factors produce identical
+                    # generators -- copy the previous record instead of redoing
+                    # the optimization (rf2/rf3 collide for roughly a third of
+                    # the states).
+                    n1_probe = [int(min(t, nn)) for t, nn in
+                                zip(go.default_targets(n0, factor=rf), n0)]
+                    if tuple(n1_probe) in n1_cache:
+                        rec = dict(n1_cache[tuple(n1_probe)])
+                        rec["rec_id"] = f"{r['key']}@rf{rf:g}"
+                        rec["reduction_factor"] = float(rf)
+                        rec["dedup_of"] = float(rec.get("dedup_of",
+                                                        rec["reduction_factor"]))
+                        fh.write(json.dumps({k: (None if isinstance(v, float)
+                                                 and not np.isfinite(v) else v)
+                                             for k, v in rec.items()}) + "\n")
+                        fh.flush()
+                        n_recs += 1
+                        state_done = True
+                        print(f"  {group}/{run_tag}/{r['cell']} rf{rf:g}: "
+                              f"= rf{rec['dedup_of']:g} (same reduced pattern "
+                              f"{n1_probe})", flush=True)
+                        continue
+
                     han = go.optimize_gbs_architecture(
                         eq["cov"], eq["mu"], eq["signal_idx"], eq["control_idx"],
                         n0, reduction_factor=rf, original_probability=float(prob_b),
-                        max_squeezing_db=maxsq, verify=False, herald_cutoff=hcut)
+                        max_squeezing_db=maxsq, verify=False, herald_cutoff=hcut,
+                        damping_seed_lam=lam_seed)
                     n1 = [int(x) for x in han["n_after"]]
+                    lam_seed = np.asarray(han.get("damping", {}).get("lam_fired",
+                                                                     None))
                     arch_a = han.get("architecture") or {}
                     max_sq_after = float(arch_a.get("max_squeezing_db", float("nan")))
 
@@ -452,9 +560,12 @@ def main(argv=None):
                     except Exception as _e:
                         if os.environ.get("HAN_DEBUG"):
                             print(f"    stable-prob fail rf{rf:g}: {_e!r}", flush=True)
-                    # auto cross-check where both exist (<=16 photons): must agree
-                    if (p_opt is not None and np.isfinite(p_opt) and p_opt > 0
-                            and np.isfinite(p_stable)
+                    # auto cross-check where both exist AND are above the
+                    # float-noise floor (below ~1e-13 both estimators run out
+                    # of double precision and disagreements are meaningless)
+                    if (p_opt is not None and np.isfinite(p_opt)
+                            and p_opt > 1e-13 and np.isfinite(p_stable)
+                            and p_stable > 1e-13
                             and abs(p_stable - p_opt) / p_opt > 1e-2):
                         print(f"    [WARN] stable P {p_stable:.3e} != hafnian P "
                               f"{p_opt:.3e} (rf{rf:g}, n1={n1})", flush=True)
@@ -464,47 +575,88 @@ def main(argv=None):
                     after_ok = False
                     negvol_a = None
                     try:
-                        psi_a, prob_a = reduced_full_state(eq, n0, n1, hcut)
-                        psi_a = np.asarray(psi_a).ravel()
-                        # raw (stale-frame) numbers -- the buggy scoring, kept
-                        # for A/B contrast
-                        exp_after_raw = _expval(psi_a, O)
-                        fid_raw = _fidelity(psi_a, psi_b)
-                        # frame-corrected: <O> minimized over a single-mode
-                        # Gaussian (the reduction is only defined up to one),
-                        # warm-started from the nearest neighbour
-                        if args.no_align or rf == 1.0:
-                            # rf==1 is damping-only: reduced_full_state is the
-                            # identity on the state, so raw == corrected exactly
-                            exp_after_G = exp_after_raw
-                            fid_G = fid_raw
+                        if rf == 1.0 or n1 == n0:
+                            # damping-only: the heralded state is EXACTLY the
+                            # before-state (damping preserves the output; only
+                            # P changes).  Skip the heavy reconstruction and
+                            # alignment; use the recomputed before-value so
+                            # the before/after yardstick is identical.
+                            psi_a, prob_a = psi_b, prob_b
+                            exp_after_raw = exp_after_G = exp_before_recomp
+                            fid_raw = fid_G = 1.0
+                            after_ok = True
                         else:
-                            seed = _nearest_seed(target, rf, float(r["exp_hi"]))
-                            exp_after_G, gpar, psi_a_al = min_exp_over_gaussian(
-                                psi_a, O, cut=args.align_cut, seed=seed)
-                            _store_seed(target, rf, float(r["exp_hi"]), gpar)
-                            fid_G = _fidelity(psi_a_al, psi_b)
-                        after_ok = True
-                        if args.wigner:
+                            psi_a, prob_a = reduced_full_state(eq, n0, n1, hcut)
+                            psi_a = np.asarray(psi_a).ravel()
+                            if (not np.isfinite(psi_a).all()
+                                    or np.linalg.norm(psi_a) < 1e-6):
+                                raise FloatingPointError(
+                                    "after-state reconstruction underflowed")
+                            # raw (stale-frame) numbers -- the buggy scoring,
+                            # kept for A/B contrast
+                            exp_after_raw = _expval(psi_a, O)
+                            fid_raw = _fidelity(psi_a, psi_b)
+                            if args.no_align:
+                                exp_after_G = exp_after_raw
+                                fid_G = fid_raw
+                            else:
+                                # frame-corrected: <O> minimized over a
+                                # single-mode Gaussian (the reduction is only
+                                # defined up to one), warm-started from the
+                                # nearest neighbour
+                                seed = _nearest_seed(target, rf, float(r["exp_hi"]))
+                                exp_after_G, gpar, psi_a_al = min_exp_over_gaussian(
+                                    psi_a, O, cut=args.align_cut, seed=seed)
+                                _store_seed(target, rf, float(r["exp_hi"]), gpar)
+                                fid_G = _fidelity(psi_a_al, psi_b)
+                            after_ok = (np.isfinite(exp_after_G)
+                                        and np.isfinite(fid_G)
+                                        and exp_after_G > 0.05)
+                        if args.wigner and after_ok:
                             negvol_a = _negvol(psi_a)
                     except Exception as ea:
                         if os.environ.get("HAN_DEBUG"):
                             print(f"    after-fail rf{rf:g}: {ea!r}", flush=True)
 
+                    # calibrated after-quality on the ARCHIVE (L=200) scale:
+                    # the recomputed before/after values share the estimator
+                    # (hcut reconstruction), so their difference applied to the
+                    # validated archive value cancels the common reconstruction
+                    # bias.  At rf=1 this is exactly exp_hi by construction.
+                    exp_after_cal = (float(r["exp_hi"])
+                                     + (exp_after_G - exp_before_recomp)
+                                     if (np.isfinite(exp_after_G)
+                                         and np.isfinite(exp_before_recomp))
+                                     else float("nan"))
+                    # damping gain as a same-estimator ratio (stable path for
+                    # both numerator and denominator; robust where absolute
+                    # values underflow)
+                    damp_gain = (p_stable / prob_b_stable
+                                 if (np.isfinite(p_stable) and prob_b_stable
+                                     and np.isfinite(prob_b_stable)
+                                     and prob_b_stable > 0)
+                                 else float("nan"))
                     rec = {
                         "rec_id": f"{r['key']}@rf{rf:g}", "key": r["key"],
                         "reduction_factor": float(rf),
                         "target": target, "group": group, "root": root,
                         "run": run_rel, "cell": int(r["cell"]),
                         "design": cfg.get("genotype"), "depth": depth,
+                        "before_ok": True,
                         "exp_before": float(r["exp_hi"]),
                         "exp_before_recomp": exp_before_recomp,
                         # PRIMARY: <O>_after minimized over the final Gaussian
                         # (the reduction is only defined up to one).
                         "exp_after": exp_after_G,
+                        # calibrated to the archive scale (USE THIS for fronts)
+                        "exp_after_cal": exp_after_cal,
                         # diagnostic: the stale-frame value (old buggy scoring)
                         "exp_after_raw": exp_after_raw,
                         "prob_before": float(prob_b),
+                        "prob_before_stable": (float(prob_b_stable)
+                                               if prob_b_stable else None),
+                        "damp_gain_stable": (float(damp_gain)
+                                             if np.isfinite(damp_gain) else None),
                         # PRIMARY P after = damping-optimized success prob (Step 2
                         # is where the boost lives): exact loop-hafnian value when
                         # tractable, else the stable density-matrix value, else
@@ -532,6 +684,7 @@ def main(argv=None):
                         "herald_cutoff": hcut, "after_ok": after_ok,
                         "negvol_before": negvol_b, "negvol_after": negvol_a,
                     }
+                    n1_cache[tuple(n1)] = dict(rec, dedup_of=float(rf))
                     fh.write(json.dumps({k: (None if isinstance(v, float)
                                              and not np.isfinite(v) else v)
                                          for k, v in rec.items()}) + "\n")
@@ -540,15 +693,18 @@ def main(argv=None):
                     state_done = True
                     p_after = rec["prob_after"]
                     gain = (p_after / prob_b) if (p_after and prob_b > 0) else float("nan")
-                    print(f"  {group}/{r['cell']} rf{rf:g}: "
-                          f"O {r['exp_hi']:.4f}->{exp_after_G:.4f}"
+                    print(f"  {group}/{run_tag}/{r['cell']} rf{rf:g}: "
+                          f"O {r['exp_hi']:.4f}->{exp_after_cal:.4f}"
                           f"(raw {exp_after_raw:.4f})  Nc {total0}->{sum(n1)}  "
                           f"P {prob_b:.1e}->{(p_after or float('nan')):.1e} "
-                          f"(x{gain:.1f})  sqdB {max_sq_before:.1f}->{max_sq_after:.1f}"
-                          f"  fidG {fid_G:.3f}", flush=True)
+                          f"(x{gain:.1f}, damp x{damp_gain:.1f})  "
+                          f"sqdB {max_sq_before:.1f}->{max_sq_after:.1f}"
+                          f"  fidG {fid_G:.3f}"
+                          f"{'' if after_ok else '  [AFTER-INVALID]'}", flush=True)
                 except Exception as ef:
                     n_fail += 1
-                    print(f"  [skip] {group}/{r['cell']} rf{rf:g}: {ef!r}", flush=True)
+                    print(f"  [skip] {group}/{run_tag}/{r['cell']} rf{rf:g}: {ef!r}",
+                          flush=True)
                     if os.environ.get("HAN_DEBUG"):
                         import traceback
                         traceback.print_exc()
