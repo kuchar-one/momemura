@@ -170,15 +170,19 @@ def main():
                             key=r["key"], run=r["run"], cell=r["cell"],
                             Nc=r["Nc_after"], rf=r["reduction_factor"]))
         plot_pts = [p for p in pts if p["P"] >= PLOT_P_FLOOR]
-        front = nondominated(plot_pts, "P", max_y=True)
-        tree_front = nondominated([p for p in plot_pts if p["recipe"] == "tree"],
+        # fronts are built over CERTIFIED non-Gaussian outputs only (exp below
+        # the Gaussian bound, i.e. xi > 0): a recipe whose output a Gaussian
+        # state can match is not a resource trade-off worth charting
+        cert_pts = [p for p in plot_pts if p["exp"] < GB[tgt]]
+        front = nondominated(cert_pts, "P", max_y=True)
+        tree_front = nondominated([p for p in cert_pts if p["recipe"] == "tree"],
                                   "P", max_y=True)
         tree_front_keys = set(p["key"] for p in tree_front)
         comp = collections.Counter(p["recipe"] for p in front)
         promoted = set(p["key"] for p in front) - tree_front_keys
 
-        # squeezing front (minimize both exp and sq)
-        sq_pts = [p for p in plot_pts if p.get("sq") is not None
+        # squeezing front (minimize both exp and sq), certified-only
+        sq_pts = [p for p in cert_pts if p.get("sq") is not None
                   and np.isfinite(p["sq"])]
         sq_front = nondominated(sq_pts, "sq", max_y=False)
         sq_comp = collections.Counter(p["recipe"] for p in sq_front)
