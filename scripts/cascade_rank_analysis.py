@@ -112,7 +112,12 @@ def build_O_GKP(N, u):
     I = np.eye(N)
     O1 = I - (Sx + Sy + Sz) / 3.0
     O = O1 + I - (ux * Ox + uy * Oy + uz * Oz)
-    return np.real((O + O.conj().T) / 2.0)
+    # Keep the COMPLEX Hermitian operator. Taking np.real() here would discard
+    # the imaginary off-diagonal matrix elements of O_y = cos(sqrt(pi)(x-p)),
+    # which is equivalent to symmetrising O under p -> -p and corrupts every
+    # target with u_y != 0 (H, T). O_x, O_z and the stabiliser terms are real,
+    # so u=(1,0,0) (plus) is unaffected -- which is why only H/T violated B_n.
+    return (O + O.conj().T) / 2.0
 
 
 def gaussian_bound(u):
@@ -134,21 +139,21 @@ def gaussian_unitary(p, a, ad, ndiag):
 
 
 # ---------------------------------------------------------------- rank bound B_n
-def Bn(O, n, ops, init=None, restarts=6, rmax=2.6, maxiter=400, rng=None):
+def Bn(O, n, ops, init=None, restarts=6, rmax=2.6, maxiter=400, rng=None,
+       polish=10):
+    """Rank-n lower bound = min over single-mode Gaussian G of the smallest
+    eigenvalue of the (n+1)x(n+1) core block of G^dag O G.
+
+    The magic targets (u_y != 0) do NOT optimise to a pure p-squeeze, so a
+    p-squeeze-only seeding badly overestimates B_n (that was the original bug's
+    partner effect).  We therefore SCREEN a structured grid over squeeze phase
+    phi and Fock rotation psi_rot (cheap: one eigval each), then POLISH only the
+    best `polish` basins with Nelder-Mead.  Warm-start `init` (previous n) and the
+    p-squeeze priors are always in the pool.  Cost scales ~ polish, not grid size.
+    """
     a, ad, ndiag = ops
     if rng is None:
         rng = np.random.default_rng(0)
-    seeds = []
-    if init is not None:
-        seeds.append(np.asarray(init, float))
-    # priors: strong p-squeeze (phi=pi) is the Gaussian optimum for these targets
-    seeds += [np.array([1.6, math.pi, 0.0, 0.0, 0.0]),
-              np.array([1.9, math.pi, 0.0, 0.0, 0.0]),
-              np.array([1.2, math.pi, 0.3, 0.0, 0.0])]
-    while len(seeds) < restarts:
-        seeds.append(np.array([0.4 * rng.standard_normal(), rng.random() * 2 * math.pi,
-                               0.4 * rng.standard_normal(), 0.4 * rng.standard_normal(),
-                               rng.random() * 2 * math.pi]))
 
     def obj(p):
         if abs(p[0]) > rmax:
@@ -159,8 +164,35 @@ def Bn(O, n, ops, init=None, restarts=6, rmax=2.6, maxiter=400, rng=None):
         Msub = (Msub + Msub.conj().T) / 2.0
         return float(np.linalg.eigvalsh(Msub)[0])
 
+    # ---- candidate pool ----
+    seeds = []
+    if init is not None:
+        seeds.append(np.asarray(init, float))
+    # strong-squeeze priors (were the whole story for plus)
+    seeds += [np.array([1.6, math.pi, 0.0, 0.0, 0.0]),
+              np.array([2.1, math.pi, 0.0, 0.0, 0.0]),
+              np.array([1.2, math.pi, 0.3, 0.0, 0.0])]
+    # structured grid: squeeze magnitude x squeeze phase x Fock rotation.
+    # The rotation psi_rot steers the core toward the magic (y) axis.
+    for r in (1.4, 1.9, 2.3):
+        for phi in (0.0, 0.5 * math.pi, math.pi, 1.5 * math.pi):
+            for psr in (0.0, math.pi / 3, 2 * math.pi / 3, math.pi,
+                        4 * math.pi / 3, 5 * math.pi / 3):
+                seeds.append(np.array([r, phi, 0.0, 0.0, psr]))
+    # a few displaced random restarts (magic cores can want a small displacement)
+    for _ in range(max(0, restarts)):
+        seeds.append(np.array([0.4 * rng.standard_normal() + 1.5,
+                               rng.random() * 2 * math.pi,
+                               0.4 * rng.standard_normal(),
+                               0.4 * rng.standard_normal(),
+                               rng.random() * 2 * math.pi]))
+
+    # ---- cheap screen, then polish the best `polish` basins ----
+    scored = sorted(((obj(s), s) for s in seeds), key=lambda t: t[0])
+    pool = [s for _, s in scored[:max(1, polish)]]
+
     best = (np.inf, None)
-    for x0 in seeds[:restarts]:
+    for x0 in pool:
         res = minimize(obj, x0, method="Nelder-Mead",
                        options={"xatol": 1e-3, "fatol": 2e-5, "maxiter": maxiter})
         if res.fun < best[0]:
@@ -175,7 +207,10 @@ def main(argv=None):
     ap.add_argument("--cutoff", type=int, default=160)
     ap.add_argument("--nmax", type=int, default=26)
     ap.add_argument("--nmin", type=int, default=0)
-    ap.add_argument("--restarts", type=int, default=8)
+    ap.add_argument("--restarts", type=int, default=8,
+                    help="random displaced restarts added to the structured seed grid")
+    ap.add_argument("--polish", type=int, default=10,
+                    help="how many of the best screened basins to Nelder-Mead polish")
     ap.add_argument("--maxiter", type=int, default=500)
     ap.add_argument("--only-target", default=None, help="plus|H|T (default: all)")
     ap.add_argument("--fronts", default=None, help="path to ng_results_data.json (optional)")
@@ -203,7 +238,9 @@ def main(argv=None):
 
     targets = [args.only_target] if args.only_target else ["plus", "H", "T"]
     result = {"meta": {"cutoff": N, "nmax": args.nmax, "restarts": args.restarts,
-                       "convention": "hbar=1, x=(a+adag)/sqrt2, O_GKP=O1+I-u.O"},
+                       "polish": args.polish,
+                       "convention": "hbar=1, x=(a+adag)/sqrt2, O_GKP=O1+I-u.O; "
+                                     "O complex-Hermitian (no np.real, see build_O_GKP)"},
               "targets": {}}
 
     for t in targets:
@@ -216,7 +253,7 @@ def main(argv=None):
         t0 = time.time()
         for n in range(args.nmin, args.nmax + 1):
             b, x = Bn(O, n, ops, init=init, restarts=args.restarts,
-                      maxiter=args.maxiter, rng=rng)
+                      maxiter=args.maxiter, rng=rng, polish=args.polish)
             init = x  # warm start next n from this optimum
             ns.append(n); Bs.append(b)
             print(f"  B_{n:2d} = {b:.4f}   ({time.time()-t0:5.0f}s)")
@@ -238,8 +275,12 @@ def main(argv=None):
                                 "front": fronts.get(t)}
         for p in picks:
             if p["B_Nc"] is not None:
+                flag = "  [BOUND VIOLATED]" if p["excess_over_bound"] < -1e-3 else ""
                 print(f"  [{p['label']:9s}] <O>={p['expO']:.4f} @ N_c={p['Nc']}: "
-                      f"B_{p['Nc']}={p['B_Nc']:.4f}, excess={p['excess_over_bound']:+.4f}")
+                      f"B_{p['Nc']}={p['B_Nc']:.4f}, excess={p['excess_over_bound']:+.4f}{flag}")
+        # A champion is itself a rank<=N_c state, so B_{N_c} <= <O>_champion by
+        # definition. A negative excess therefore means B_n is still an
+        # under-optimised (too-high) variational estimate -> raise --polish.
 
     outjson = os.path.join(args.out, "cascade_rank_bounds.json")
     json.dump(result, open(outjson, "w"), indent=1)
